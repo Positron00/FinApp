@@ -1,0 +1,78 @@
+[project]
+name = "payrun-workspace"
+version = "0.1.0"
+description = "PayRun: payroll for small and medium businesses (monorepo root)"
+requires-python = ">=3.14,<3.15"
+
+[tool.uv]
+package = false
+default-groups = ["dev"]
+
+[tool.uv.workspace]
+members = ["libs/*", "services/*"]
+
+[tool.uv.sources]
+pycommon = { workspace = true }
+
+[dependency-groups]
+# Versions: newest stable release published on or before 2026-10-27 (two-week rule).
+dev = [
+  "ruff>=0.17.2",
+  "mypy>=2.4.0",
+  "pytest>=9.1.1",
+  "pytest-asyncio>=1.4.1",
+  "pytest-cov>=7.1.0",
+  "pytest-socket>=0.8.1",
+  "pytest-timeout>=2.4.0",
+  "respx>=0.23.1",
+  "time-machine>=3.6.0",
+  "hypothesis>=6.170.12",
+  "polyfactory>=3.5.0",
+  "testcontainers[postgres,redis]>=4.15.0",
+  "schemathesis>=4.32.5",
+  "pip-audit>=2.10.1",
+  "check-jsonschema>=0.39.0",
+  "jsonschema>=4.26.0",
+  "pre-commit>=4.7.0",
+  "httpx>=0.28.1",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+extend-exclude = ["apps", "packages", "node_modules"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "S", "ASYNC", "RUF", "SIM", "PT", "N", "C4", "DTZ", "T20", "TID", "PL", "PERF"]
+ignore = ["PLR0913", "PLR2004"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S101", "S105", "S106", "PLR2004", "S311"]
+"scripts/**" = ["T20"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"requests".msg = "use httpx via pycommon.http"
+"datetime.datetime.utcnow".msg = "use datetime.now(UTC)"
+"logging.basicConfig".msg = "use pycommon.logging.setup_logging"
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+strict = true
+python_version = "3.14"
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["testcontainers.*", "schemathesis.*"]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+branch = true
+parallel = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "@overload"]

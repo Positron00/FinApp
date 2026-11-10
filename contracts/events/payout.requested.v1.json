@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://payrun.local/contracts/events/payout.requested.v1.json",
+  "title": "payout.requested v1",
+  "description": "Published by payroll through its outbox to stream:payout.requested; consumed by payout-worker (group payout-worker). Carries IDs and the amount only: no names, no bank details. The worker must use the amount from GET /v1/internal/payouts/{payout_id}/instruction, never this one; a mismatch is poison. The bank idempotency key is <payout_id>:<attempt>. Each re-publish of the same attempt has a fresh event_id and a higher republish_seq. Sources: plan §7, PAY-402, ADR 0003.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "type", "version", "occurred_at", "producer", "traceparent", "data"],
+  "properties": {
+    "event_id": {
+      "description": "UUIDv7, unique per publication (including each re-publish). Equals payroll.outbox.id.",
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "type": {
+      "const": "payout.requested"
+    },
+    "version": {
+      "const": 1
+    },
+    "occurred_at": {
+      "description": "UTC time the outbox row was written, RFC 3339 with a Z suffix.",
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?Z$"
+    },
+    "producer": {
+      "const": "payroll"
+    },
+    "traceparent": {
+      "description": "W3C trace context of the publishing span; the consumer starts its processing span as a child of it.",
+      "type": "string",
+      "pattern": "^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$"
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["payout_id", "pay_run_id", "company_id", "attempt", "amount_cents", "currency", "republish_seq"],
+      "properties": {
+        "payout_id": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "pay_run_id": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "company_id": {
+          "description": "The tenant. The worker puts it in its JWT cid claim when calling payroll.",
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "attempt": {
+          "description": "1-based attempt number (at most PAYOUT_MAX_ATTEMPTS, 5 by default, including the first).",
+          "type": "integer",
+          "minimum": 1
+        },
+        "amount_cents": {
+          "description": "Net pay in integer cents. Zero-net payouts are no_transfer and are never published. Capped at $10M (ADR 0006).",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000000
+        },
+        "currency": {
+          "const": "USD"
+        },
+        "republish_seq": {
+          "description": "0 for the first publication of an attempt (approve or retry); k for its k-th re-publish by payroll maintenance (PAY-407).",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "event_id": "0193f1d2-6c4a-7b1e-9a3f-2c5d8e9f0a1b",
+      "type": "payout.requested",
+      "version": 1,
+      "occurred_at": "2026-11-10T14:03:07.123Z",
+      "producer": "payroll",
+      "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+      "data": {
+        "payout_id": "0193f1d2-6c4a-7000-8000-000000000001",
+        "pay_run_id": "0193f1d2-6c4a-7000-8000-000000000002",
+        "company_id": "00000000-0000-4000-8000-000000000001",
+        "attempt": 1,
+        "amount_cents": 412345,
+        "currency": "USD",
+        "republish_seq": 0
+      }
+    }
+  ]
+}

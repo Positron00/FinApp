@@ -1,0 +1,9 @@
+pnpm-lock.yaml
+uv.lock
+**/openapi.json
+packages/api-client/src/generated/
+.next/
+coverage/
+playwright-report/
+test-results/
+docs/
