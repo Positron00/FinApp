@@ -69,6 +69,42 @@ export function toMe(u: SessionUser | UserMe): Me {
   };
 }
 
+/** identity `PendingInviteOut` (resend response; R17, C31): `expires_at` is null until sent. */
+export const PendingInvite = z.object({
+  id: Uuid,
+  expires_at: DateTime.nullable(),
+  email_status: z.enum(["pending", "sent", "failed", "cancelled"]).nullable(),
+});
+export type PendingInvite = z.infer<typeof PendingInvite>;
+
+/** identity `ResetConfirmOut` (R19): BFF only; drives the session revocation. */
+export const ResetConfirmResult = z.object({ user_id: Uuid, roles_version: z.number().int() });
+export type ResetConfirmResult = z.infer<typeof ResetConfirmResult>;
+
+/** identity `AuditEntryOut` (PAY-109). */
+export const AuthAuditEvent = z.object({
+  id: Uuid,
+  at: DateTime,
+  actor_user_id: Uuid.nullable(),
+  event: z.string(),
+  target_user_id: Uuid.nullable(),
+  ip_hash: z.string().nullable(),
+  details: z.record(z.string(), z.unknown()),
+});
+export type AuthAuditEvent = z.infer<typeof AuthAuditEvent>;
+
+/** payroll `AuditEventOut` (C5). */
+export const PayrollAuditEvent = z.object({
+  id: Uuid,
+  at: DateTime,
+  actor_id: z.string(),
+  event: z.string(),
+  entity_type: z.enum(["company_settings", "employee", "pay_run", "payout"]),
+  entity_id: Uuid,
+  details: z.record(z.string(), z.unknown()),
+});
+export type PayrollAuditEvent = z.infer<typeof PayrollAuditEvent>;
+
 /** payroll `CompanySettingsOut` (PAY-200). */
 export const Settings = z.object({
   name: z.string(),
@@ -163,6 +199,17 @@ export const PayRun = z.object({
   updated_at: DateTime,
 });
 export type PayRun = z.infer<typeof PayRun>;
+
+/** payroll `HoursEntry`. */
+export const HoursEntry = z.object({ employee_id: Uuid, hours_hundredths: z.number().int() });
+
+/** payroll `HoursOut` (C7): every hours row now stored for the run; the run is back in draft. */
+export const Hours = z.object({
+  pay_run_id: Uuid,
+  status: z.literal("draft"),
+  entries: z.array(HoursEntry),
+});
+export type Hours = z.infer<typeof Hours>;
 
 /** payroll `PayslipOut`: no `schedule`; amounts null while pending (C5). */
 export const Payslip = z.object({

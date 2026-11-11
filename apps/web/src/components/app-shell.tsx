@@ -15,6 +15,10 @@ export interface ShellUser {
 const NAV: { href: string; label: string; roles?: Role[] }[] = [
   { href: "/dashboard", label: "Dashboard" },
   { href: "/pay-runs", label: "Pay runs" },
+  { href: "/employees", label: "Employees" },
+  { href: "/settings", label: "Settings" },
+  { href: "/users", label: "Users", roles: ["admin"] },
+  { href: "/audit", label: "Audit", roles: ["admin"] },
 ];
 
 /** Layout, skip link, role-filtered navigation and sign-out (web LLD §1.4). */

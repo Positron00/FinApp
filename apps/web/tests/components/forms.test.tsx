@@ -129,7 +129,7 @@ describe("RunCreateForm", () => {
     renderWithClient(<RunCreateForm />);
     await userEvent.click(screen.getByRole("button", { name: "Create pay run" }));
     await waitFor(() => expect(push).toHaveBeenCalledWith(`/pay-runs/${RUN_ID}`));
-    expect(calls[0]!.body).toMatchObject({
+    expect(calls.find((c) => c.method === "POST")!.body).toMatchObject({
       schedule: "monthly",
       period_start: expect.stringMatching(/-01$/),
     });

@@ -1,6 +1,6 @@
 import type { ReactElement } from "react";
 
-import { RUN_ID } from "../helpers/fixtures";
+import { EMPLOYEE_ID, RUN_ID } from "../helpers/fixtures";
 
 /**
  * PAY-601: every server component under `(app)` gates itself with `requireSessionForPage`,
@@ -16,6 +16,15 @@ vi.mock("@/lib/require-session", () => ({
     gate.calls.push({ path, roles });
     return gate.result;
   }),
+}));
+const nav = vi.hoisted(() => ({
+  notFound: vi.fn(() => {
+    throw new Error("NEXT_NOT_FOUND");
+  }),
+}));
+vi.mock("next/navigation", async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
+  notFound: nav.notFound,
 }));
 vi.mock("next/headers", () => ({
   headers: async () => new Headers({ "x-pathname": "/pay-runs?tab=x" }),
@@ -40,6 +49,24 @@ const PAGES: [string, () => Promise<{ default: unknown }>, unknown, string, stri
     { params: Promise.resolve({ id: RUN_ID }) },
     `/pay-runs/${RUN_ID}`,
   ],
+  // F5 pages (PAY-109, PAY-200–203, PAY-101/102/108)
+  ["employees", () => import("@/app/(app)/employees/page"), {}, "/employees"],
+  [
+    "employees/new",
+    () => import("@/app/(app)/employees/new/page"),
+    {},
+    "/employees/new",
+    ["payroll_admin"],
+  ],
+  [
+    "employees/[id]",
+    () => import("@/app/(app)/employees/[id]/page"),
+    { params: Promise.resolve({ id: EMPLOYEE_ID }) },
+    `/employees/${EMPLOYEE_ID}`,
+  ],
+  ["settings", () => import("@/app/(app)/settings/page"), {}, "/settings"],
+  ["users", () => import("@/app/(app)/users/page"), {}, "/users", ["admin"]],
+  ["audit", () => import("@/app/(app)/audit/page"), {}, "/audit", ["admin"]],
 ];
 
 beforeEach(() => {
@@ -70,5 +97,17 @@ describe("(app) page gates", () => {
     const { default: Layout } = await import("@/app/(app)/layout");
     await Layout({ children: null });
     expect(gate.calls).toEqual([{ path: "/pay-runs?tab=x", roles: undefined }]);
+  });
+
+  // PAY-601: a malformed [id] is a 404 before any session work.
+  it.each([
+    ["pay-runs/[id]", () => import("@/app/(app)/pay-runs/[id]/page")],
+    ["employees/[id]", () => import("@/app/(app)/employees/[id]/page")],
+  ])("%s with a malformed id is notFound()", async (_n, load) => {
+    const Page = (await load()).default as Page;
+    await expect(Page({ params: Promise.resolve({ id: "not-a-uuid" }) } as never)).rejects.toThrow(
+      "NEXT_NOT_FOUND",
+    );
+    expect(gate.calls).toEqual([]);
   });
 });

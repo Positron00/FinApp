@@ -5,6 +5,9 @@ import { useState } from "react";
 
 import { announcement, RunDetail, RunTabs, who } from "@/components/runs/run-detail";
 
+const push = vi.fn();
+vi.mock("next/navigation", () => ({ useRouter: () => ({ push }) }));
+
 import { attempt, payout, payRun, payslip, RUN_ID } from "../helpers/fixtures";
 import { USER_ID } from "../helpers/request";
 import { apiError, renderWithClient, stubApi } from "../helpers/ui";
@@ -94,7 +97,7 @@ describe("RunDetail", () => {
     expect(
       calls.filter((c) => c.path.startsWith(`${runPath}/payouts`)).length,
     ).toBeGreaterThanOrEqual(2);
-    expect(screen.getByText("Ann Approver")).toBeTruthy();
+    expect(screen.getByText(/^Ann Approver, /)).toBeTruthy();
   });
 
   // PAY-413, R21: the banner comes from counts.awaiting_bank / counts.blocked with no payouts request.
@@ -192,7 +195,7 @@ describe("RunDetail", () => {
     });
     renderWithClient(<RunDetail runId={RUN_ID} me={ME} />);
     await screen.findByText("Ada Employee");
-    expect(screen.getByText("you")).toBeTruthy();
+    expect(screen.getByText(/^you, /)).toBeTruthy(); // calculated_by is me (§6.1)
     expect(screen.getAllByText("$18,750.00").length).toBeGreaterThanOrEqual(2); // net and funding
     expect(screen.getAllByText("—").length).toBeGreaterThanOrEqual(4); // pending amounts
     expect(screen.getByText("Dual approval")).toBeTruthy();

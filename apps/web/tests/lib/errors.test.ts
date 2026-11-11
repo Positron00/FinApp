@@ -172,6 +172,42 @@ describe("mapUpstreamError", () => {
     );
   });
 
+  // PAY-301, PAY-302, PAY-300, C15: the employee_ids codes count their IDs in the message.
+  it("counts employee_ids in the message", () => {
+    const ids = ["0193a000-0000-7000-8000-0000000000e1", "0193a000-0000-7000-8000-0000000000e2"];
+    const msg = (status: number, code: string) =>
+      errorBody(map(status, code, "/x", { employee_ids: ids }), "r").error;
+    expect(msg(422, "hours_missing")).toMatchObject({
+      message: "Enter hours for every hourly employee before calculating (2 missing).",
+      details: { employee_ids: ids },
+    });
+    expect(msg(409, "employee_in_overlapping_run").message).toBe(
+      "2 employee(s) are already in another run that covers these dates.",
+    );
+    expect(msg(422, "employee_not_in_run").message).toBe(
+      "2 employee(s) aren't in this run. Reload the run and try again.",
+    );
+    // a malformed details payload: no details, count 0
+    expect(errorBody(map(422, "hours_missing", "/x", { employee_ids: ["x"] }), "r").error).toEqual(
+      expect.not.objectContaining({ details: expect.anything() }),
+    );
+  });
+
+  // PAY-500, PAY-400: employee_bank_details_missing and approver_must_differ via mapUpstreamError.
+  it("maps the route-specific codes by route", () => {
+    const retryRoute = "/api/pay-runs/[id]/payouts/[payoutId]/retry";
+    const approveRoute = "/api/pay-runs/[id]/approve";
+    expect(
+      errorBody(map(409, "employee_bank_details_missing", retryRoute), "r").error.message,
+    ).toBe("This employee is inactive or has no bank details. Update the employee first.");
+    expect(
+      errorBody(map(409, "employee_bank_details_missing", approveRoute), "r").error.message,
+    ).toBe(
+      "Some employees in this run have no bank details. Add their bank details, then approve.",
+    );
+    expect(map(403, "approver_must_differ", retryRoute)).toMatchObject({ status: 403 });
+  });
+
   // PAY-602: a body that isn't an error envelope.
   it("handles a non-JSON error body", () => {
     expect(

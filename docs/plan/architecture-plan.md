@@ -654,6 +654,7 @@ the alert's `runbook_url`.
 | [0010](../adr/0010-alert-receivers.md) | Alert receivers: local webhook sink; real receivers later | accepted 2026-11-10 |
 | [0011](../adr/0011-egress.md) | Kubernetes egress: only payout-worker reaches the bank | accepted 2026-11-10 |
 | [0012](../adr/0012-slos.md) | SLO values | accepted 2026-11-10 (user chose the "Small SMB demo" scale at intake) |
+| [0013](../adr/0013-ui-primitives.md) | Local accessible UI primitives instead of shadcn/ui for 0.1.0 | accepted 2026-11-11 |
 
 ## 17. Files
 
