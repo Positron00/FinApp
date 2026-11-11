@@ -1,6 +1,6 @@
 # Tasks: PayRun 0.1.0
 
-Status (2026-11-11): S1–S9 done; S10 (first CI run on GitHub) in progress.
+Status (2026-11-11): walking skeleton S1–S10 done, CI green on main. Step 4 features on `release/0.1.0`: F1, F2, F4b next (parallel).
 hardening and release tasks (F*, H*, R1) run on `release/0.1.0`.
 
 **Rules for every task:**
@@ -49,7 +49,7 @@ The skeleton journey: sign in as the seeded owner → create a monthly run for s
 | S7 | web: Next.js app, session and requireSession, internal JWT, generated api-client, login page, a minimal run page (create, calculate, approve, status), proxy.ts with CSP, OTel and pino | PAY-104, PAY-106, PAY-600, PAY-601, PAY-604, PAY-413 | S4, S5 | S6 | Vitest passes; `next build` passes with no secrets; contract drift check passes | 6 h | done (2026-11-10; 93% line coverage; R36 spike resolved, C62) |
 | S8 | Compose (core, obs, test), `stack.sh`, Collector, Prometheus, Alertmanager and alert-sink, Tempo, Loki, Grafana (Service overview dashboard), `seed.py --skeleton` (5 salaried monthly employees, one calculated and one draft run, JSON summary), `mint_token.py`; tests at every layer: Schemathesis per service, one Playwright `@skeleton` journey (`skeleton.spec.ts`) with the trace assertion, k6 smoke, one Toxiproxy fault (slow DB) | PAY-609, PAY-NFR-09, PAY-NFR-13, PAY-NFR-15 | S6, S7 | — | `stack.sh up` is healthy; e2e trace spans web → payroll → worker → bank-stub; Loki logs link; k6 smoke meets thresholds | 8 h | done (2026-11-10; healthy stack, skeleton e2e with trace, Schemathesis all checks, k6 p95 ~30 ms, slow-DB fault test; C65) |
 | S9 | Kubernetes base and overlays (dev, uat, prod), Jobs, NetworkPolicies; CI `ci.yml` and `nightly.yml` calling `scripts/ci/*.sh`, with every gate at its final threshold | PAY-NFR-12, PAY-NFR-13 | S8 | — | kubeconform passes on every overlay; every `scripts/ci/*.sh` passes locally | 5 h | done (2026-11-11; k8s dev/uat/prod kubeconform-valid, all CI scripts pass locally, actionlint clean; C66) |
-| S10 | First push: secret scan; fold the checkpoints into one commit; push `main`; fix CI until green | PAY-NFR-12 | S9 | — | First CI run on `main` is green | 2 h | |
+| S10 | First push: secret scan; fold the checkpoints into one commit; push `main`; fix CI until green | PAY-NFR-12 | S9 | — | First CI run on `main` is green | 2 h | done (2026-11-11; first green CI run on main at c37e196, 12/12 jobs; checkpoints kept, not folded, per the user) |
 
 ## Features (Step 4, `release/0.1.0`)
 
