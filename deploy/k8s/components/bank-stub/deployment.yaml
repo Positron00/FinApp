@@ -1,0 +1,66 @@
+# bank-stub (bank-stub LLD; PAY-412): the persistent simulated bank ledger.
+# Pod security per platform LLD §9.2: non-root, read-only root filesystem, no capabilities,
+# RuntimeDefault seccomp, no service-account token, /tmp on an emptyDir.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bank-stub
+spec:
+  replicas: 1 # overlays set it
+  revisionHistoryLimit: 5
+  strategy: { type: RollingUpdate, rollingUpdate: { maxUnavailable: 0, maxSurge: 1 } }
+  selector:
+    matchLabels: { app.kubernetes.io/name: bank-stub }
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bank-stub
+        app.kubernetes.io/component: api
+        payrun.io/postgres-client: "true"
+        payrun.io/redis-client: "false"
+    spec:
+      serviceAccountName: bank-stub
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: bank-stub
+          image: payrun/bank-stub:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports: [{ name: http, containerPort: 8000 }]
+          envFrom:
+            - configMapRef: { name: payrun-env }
+            - configMapRef: { name: bank-stub-config }
+            - secretRef: { name: bank-stub-secrets }
+          env:
+            - { name: OTEL_SEMCONV_STABILITY_OPT_IN, value: http }
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector:4317" }
+            - { name: OTEL_TRACES_SAMPLER, value: parentbased_always_on } # C23, every overlay
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          startupProbe: # 30 s
+            httpGet: { path: /livez, port: http }
+            periodSeconds: 2
+            failureThreshold: 15
+          livenessProbe:
+            httpGet: { path: /livez, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 384Mi } # no CPU limit
+          volumeMounts: [{ name: tmp, mountPath: /tmp }]
+      volumes: [{ name: tmp, emptyDir: { sizeLimit: 64Mi } }]

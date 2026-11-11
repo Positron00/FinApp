@@ -1,0 +1,18 @@
+# dev: an active owner with SEED_OWNER_PASSWORD, like Compose (R16; --password-env is refused
+# unless ENV=dev). The owner email is SEED_OWNER_EMAIL's default.
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --password-env
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: SEED_OWNER_PASSWORD
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: DB_PASSWORD
+    valueFrom: { secretKeyRef: { name: payrun-dev-secrets, key: IDENTITY_DB_MIGRATOR_PASSWORD } }
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: SEED_OWNER_PASSWORD
+    valueFrom: { secretKeyRef: { name: payrun-dev-secrets, key: SEED_OWNER_PASSWORD } }

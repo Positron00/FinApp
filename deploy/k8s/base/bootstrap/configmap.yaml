@@ -1,0 +1,9 @@
+# Bootstrap settings that differ per overlay.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bootstrap-config
+data:
+  PGUSER: postgres # the bootstrap admin (Compose superuser; the managed admin in uat/prod)
+  OWNER_EMAIL: owner@payrun.example.com # SEED_OWNER_EMAIL in dev; overlays set the real one
+  SKIP_BANK_STUB: "0" # prod sets 1: no bank_stub schema (run-init.sh skips 40-bank-stub.sql)

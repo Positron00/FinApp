@@ -1,0 +1,200 @@
+# Nightly gates (platform LLD §11.2; PAY-NFR-02, 03, 05, 06, 12; C38). Each job tees its script's
+# output to ci-logs/<job>.log and uploads it. When a job fails, the `report` job (the only job with
+# `issues: write`) opens or updates the "Nightly failure: <job>" issue with the scrubbed log tail
+# (scripts/ci/report_failure.sh). A green night never closes an issue; a person does.
+# No repository secrets: scripts/dev-env.sh generates throwaway keys.
+name: nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *" # 03:17 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  UV_FROZEN: "1"
+  FORCE_COLOR: "1"
+  UV_VERSION: "0.12.13"
+  E2E_SUITE: skeleton # C51: until task F3
+
+defaults:
+  run:
+    shell: bash # -eo pipefail, so `script | tee` keeps the script's status
+
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv python install
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+      - uses: grafana/setup-k6-action@43b9fc21641a76002687994433dd586f56e791b1 # v1.2.2
+        with:
+          k6-version: "1.8.2"
+      - run: mkdir -p ci-logs && scripts/ci/nightly-load.sh 2>&1 | tee ci-logs/load.log
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: log-load
+          path: |
+            ci-logs/
+            load/results/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  resilience:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv python install
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+      - run: mkdir -p ci-logs && scripts/ci/nightly-resilience.sh 2>&1 | tee ci-logs/resilience.log
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: log-resilience
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  e2e-repeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      PLAYWRIGHT_SKIP_INSTALL: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv python install
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+      - uses: grafana/setup-k6-action@43b9fc21641a76002687994433dd586f56e791b1 # v1.2.2
+        with:
+          k6-version: "1.8.2"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter web exec playwright install --with-deps chromium
+      - run: mkdir -p ci-logs && scripts/ci/nightly-e2e.sh 2>&1 | tee ci-logs/e2e-repeat.log
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: log-e2e-repeat
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 30
+      - if: always()
+        run: scripts/stack.sh down -v || true
+
+  schemathesis-deep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv python install
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+      - run: mkdir -p ci-logs && scripts/ci/nightly-schemathesis.sh 2>&1 | tee ci-logs/schemathesis-deep.log
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: log-schemathesis-deep
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv python install
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+      - run: mkdir -p ci-logs && scripts/ci/nightly-audit.sh 2>&1 | tee ci-logs/audit.log
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: log-audit
+          path: ci-logs/audit.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+  report:
+    needs: [load, resilience, e2e-repeat, schemathesis-deep, audit]
+    if: ${{ !cancelled() && contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write # the only job that may write issues
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: log-*
+          path: nightly-logs
+      - name: Open or update the nightly-failure issue of each failed job
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          for job in load resilience e2e-repeat schemathesis-deep audit; do
+            result="$(jq -r --arg j "$job" '.[$j].result' <<<"$RESULTS")"
+            if [[ "$result" == failure ]]; then
+              scripts/ci/report_failure.sh "$job" "nightly-logs/log-$job/$job.log"
+            fi
+          done

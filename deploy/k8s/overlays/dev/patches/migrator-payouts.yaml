@@ -1,0 +1,6 @@
+# JSON patch, so it applies whatever the versioned Job name is (base/migrations nameSuffix).
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: DB_PASSWORD
+    valueFrom: { secretKeyRef: { name: payrun-dev-secrets, key: PAYOUTS_DB_MIGRATOR_PASSWORD } }

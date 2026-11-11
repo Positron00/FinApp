@@ -1,0 +1,35 @@
+# uat values (platform LLD §9.5). REPLACE marks the placeholders.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payrun-env
+data:
+  ENV: uat
+  APP_VERSION: 0.1.0
+  COMPANY_ID: REPLACE_ME # REPLACE: the environment's company UUID (settings refuse a non-UUID)
+  DB_HOST: postgres.payrun-uat.invalid # REPLACE: managed Postgres endpoint
+  REDIS_HOST: redis.payrun-uat.invalid # REPLACE: managed Redis endpoint
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-config
+data:
+  PUBLIC_BASE_URL: https://payrun-uat.example.com # REPLACE: host (matches the Ingress)
+  SESSION_COOKIE_NAME: __Host-sid
+  TRUSTED_PROXY_HOPS: "1" # the ingress controller (C62: uat and prod refuse < 1)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: identity-config
+data:
+  IDENTITY_PUBLIC_BASE_URL: https://payrun-uat.example.com # REPLACE: host
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bootstrap-config
+data:
+  PGUSER: postgres # REPLACE: managed admin user
+  OWNER_EMAIL: owner@payrun.example.com # REPLACE: the first owner (gets an invite email)

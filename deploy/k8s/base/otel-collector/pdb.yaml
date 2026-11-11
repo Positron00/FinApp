@@ -1,0 +1,9 @@
+# maxUnavailable 1 works with 1 replica (dev) and 2 (uat, prod) (platform LLD §9.2).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: otel-collector
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: otel-collector }

@@ -1,0 +1,12 @@
+# Versioned migration Jobs (platform LLD §9.3): a Job's pod template is immutable, so each release
+# gets new Job names. The release step bumps nameSuffix (and migrate-bank-stub's name in
+# components/bank-stub, which test_k8s_policy.py keeps in step). Deploy order (RUNBOOK):
+# db-bootstrap -> migrate-*-<version> (wait for complete) -> services -> web -> bootstrap-owner.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+nameSuffix: -0-1-0
+resources:
+  - job-migrate-identity.yaml
+  - job-migrate-payroll.yaml
+  - job-migrate-payouts.yaml
+  - networkpolicy.yaml

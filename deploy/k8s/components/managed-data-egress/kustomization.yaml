@@ -1,0 +1,7 @@
+# Managed Postgres and Redis egress (uat, prod; ADR 0007, ADR 0011). Standard NetworkPolicies can't
+# match hostnames, so egress is an ipBlock per data service. The CIDRs here are placeholders: each
+# overlay patches its provider subnets (`# REPLACE: provider subnet`).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - networkpolicy.yaml

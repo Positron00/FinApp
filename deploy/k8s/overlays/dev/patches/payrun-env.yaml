@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payrun-env
+data:
+  ENV: dev
+  APP_VERSION: dev

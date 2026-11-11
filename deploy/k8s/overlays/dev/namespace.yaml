@@ -1,0 +1,8 @@
+# Pod Security Admission "restricted" on the whole namespace: the pods already meet it (§9.2).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payrun-dev
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted

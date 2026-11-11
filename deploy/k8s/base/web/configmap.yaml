@@ -1,0 +1,21 @@
+# Web settings (web LLD §8; C4, C12, C62). Shared keys (ENV, COMPANY_ID, REDIS_HOST, ...) come from
+# payrun-env; this map is read after it. Overlays set the public origin, cookie name and proxy hops.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-config
+data:
+  NODE_ENV: production
+  PORT: "3000" # C4
+  PUBLIC_BASE_URL: http://127.0.0.1:4100 # dev: kubectl port-forward svc/web 4100:3000 (C12)
+  IDENTITY_BASE_URL: http://identity:8000
+  PAYROLL_BASE_URL: http://payroll:8000
+  REDIS_USERNAME: web # C1, C12: no REDIS_URL
+  SESSION_COOKIE_NAME: sid
+  TRUSTED_PROXY_HOPS: "0" # uat and prod refuse < 1 (C62)
+  BFF_RATE_LIMIT_SESSION: "120"
+  BFF_RATE_LIMIT_IP: "300"
+  SESSION_IDLE_TTL_S: "43200"
+  SESSION_ABS_TTL_S: "604800"
+  SESSION_ROLE_RECHECK_S: "60"
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf

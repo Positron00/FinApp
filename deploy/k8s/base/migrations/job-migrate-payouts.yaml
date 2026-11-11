@@ -1,0 +1,46 @@
+# migrate-payouts (platform LLD §9.3): alembic upgrade head as payouts_migrator (C2), with the C1 keys.
+# Expand-only migrations, so the previous release keeps working during the rollout.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate-payouts
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: payout-worker
+        app.kubernetes.io/component: migration
+        payrun.io/postgres-client: "true"
+    spec:
+      restartPolicy: Never
+      serviceAccountName: payrun-jobs
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: migrate
+          image: payrun/payout-worker:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["alembic", "-c", "/app/alembic.ini", "upgrade", "head"]
+          envFrom:
+            - configMapRef: { name: payrun-env }
+            - secretRef: { name: payouts-migrator }
+          env:
+            - { name: DB_USER, value: payouts_migrator }
+            - { name: DB_SCHEMA, value: payouts }
+            - { name: OTEL_TRACES_SAMPLER, value: parentbased_always_on } # C23
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 384Mi }
+          volumeMounts: [{ name: tmp, mountPath: /tmp }]
+      volumes: [{ name: tmp, emptyDir: { sizeLimit: 16Mi } }]

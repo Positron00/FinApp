@@ -1,0 +1,28 @@
+# Every payrun.io/postgres-client pod (identity, payroll, payout-worker, bank-stub in uat, the Jobs)
+# may reach the managed Postgres on 5432; every payrun.io/redis-client pod (web, identity, payroll,
+# payout-worker) the managed Redis on 6379.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-to-managed-postgres
+spec:
+  podSelector:
+    matchLabels: { payrun.io/postgres-client: "true" }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock: { cidr: 192.0.2.0/28 } # REPLACE: provider subnet (patched per overlay)
+      ports: [{ protocol: TCP, port: 5432 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-to-managed-redis
+spec:
+  podSelector:
+    matchLabels: { payrun.io/redis-client: "true" }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock: { cidr: 192.0.2.16/28 } # REPLACE: provider subnet (patched per overlay)
+      ports: [{ protocol: TCP, port: 6379 }]

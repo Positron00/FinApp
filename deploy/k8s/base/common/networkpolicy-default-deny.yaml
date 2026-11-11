@@ -1,0 +1,8 @@
+# Default deny for every pod in the namespace, both directions (platform LLD §9.4; ADR 0011).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]

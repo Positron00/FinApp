@@ -1,0 +1,70 @@
+# prod overlay (platform LLD §9.5): managed Postgres and Redis (ADR 0007), ExternalSecrets
+# (ADR 0008), TLS Ingress, ipBlock egress for the bank and SMTP providers (ADR 0011), the Collector's
+# tail_sampling config (R27, C23), zone spread. No bank-stub; payout-worker has 0 replicas until a
+# bank-provider ADR exists (R14, C32), so the placeholder BANK_BASE_URL can't crash-loop it.
+#
+# Cluster dependencies (not managed here): an ingress controller in `ingress-nginx`, the External
+# Secrets Operator with a ClusterSecretStore `payrun-secrets`, a Prometheus in `monitoring` that
+# scrapes the Collector, and kube-state-metrics, which the PodRestarts alert needs (R28;
+# deploy/k8s/observability/alerts-kubernetes.yml).
+#
+# Images: pinned by version here; the release step adds the digest (`newTag: 0.1.0@sha256:...`,
+# C65). Every REPLACE is a placeholder for the environment's owner.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: payrun-prod
+labels:
+  - pairs: { app.kubernetes.io/part-of: payrun }
+    includeSelectors: false
+    includeTemplates: true
+resources:
+  - namespace.yaml
+  - ../../base
+  - networkpolicy-collector-egress.yaml
+components:
+  - ../../components/managed-data-egress
+  - ../../components/bank-egress-ipblock
+  - ../../components/smtp-egress
+  - ../../components/external-secrets
+  - ../../components/ingress
+images: # REPLACE: registry (and the digest at release, C65)
+  - { name: payrun/web, newName: registry.example.com/payrun/web, newTag: 0.1.0 }
+  - { name: payrun/identity, newName: registry.example.com/payrun/identity, newTag: 0.1.0 }
+  - { name: payrun/payroll, newName: registry.example.com/payrun/payroll, newTag: 0.1.0 }
+  - {
+      name: payrun/payout-worker,
+      newName: registry.example.com/payrun/payout-worker,
+      newTag: 0.1.0,
+    }
+replicas:
+  - { name: web, count: 2 }
+  - { name: identity, count: 2 }
+  - { name: payroll, count: 2 }
+  - { name: payout-worker, count: 0 } # R14, C32: until a bank-provider ADR exists
+  - { name: otel-collector, count: 2 }
+# collector.prod.yaml is a synced copy of deploy/observability/collector.prod.yaml (R32).
+configMapGenerator:
+  - name: otel-collector-config
+    behavior: replace
+    files: [collector.yaml=collector.prod.yaml]
+patches:
+  - path: patches/config.yaml
+  - path: patches/resources.yaml
+  - path: patches/topology-spread.yaml
+    target: { kind: Deployment }
+  - path: patches/managed-data-cidrs.yaml
+    target: { kind: NetworkPolicy, name: egress-to-managed-postgres }
+  - path: patches/managed-redis-cidr.yaml
+    target: { kind: NetworkPolicy, name: egress-to-managed-redis }
+  - path: patches/smtp-cidr.yaml
+    target: { kind: NetworkPolicy, name: identity-to-smtp }
+  - path: patches/identity-smtp-externalsecret.yaml
+    target: { kind: ExternalSecret, name: identity-secrets }
+  - path: patches/ingress-host.yaml
+    target: { kind: Ingress, name: web }
+replacements:
+  - source: { kind: ConfigMap, name: payrun-env, fieldPath: data.ENV }
+    targets:
+      - select: { kind: ExternalSecret }
+        fieldPaths: [spec.data.*.remoteRef.key]
+        options: { delimiter: /, index: 1 }

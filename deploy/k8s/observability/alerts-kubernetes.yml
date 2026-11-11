@@ -1,0 +1,15 @@
+# Kubernetes-only alert rules (platform LLD §8.3; plan §11; R28). Load this file into the cluster's
+# Prometheus next to deploy/observability/prometheus/rules/*.yml. It needs kube-state-metrics, a
+# cluster dependency listed in the prod overlay; Compose has no pods, so it isn't loaded there.
+# scripts/ci/manifests.sh runs `promtool check rules` and `promtool test rules` on it.
+groups:
+  - name: payrun-kubernetes
+    rules:
+      - alert: PodRestarts
+        expr: 'increase(kube_pod_container_status_restarts_total{namespace=~"payrun-.*"}[15m]) > 2'
+        labels: { severity: warning }
+        annotations:
+          summary: "A PayRun container restarted more than twice in 15 minutes"
+          description: "{{ $labels.namespace }}/{{ $labels.pod }} ({{ $labels.container }}) restarted {{ $value | humanize }} times in 15 minutes. Check its logs and last termination reason (OOMKilled, failed probes, startup checks)."
+          runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PodRestarts.md"
+          dashboard_url: "http://127.0.0.1:4101/d/payrun-platform"

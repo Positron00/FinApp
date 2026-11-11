@@ -1,0 +1,27 @@
+# web (platform LLD §9.4): ingress from the ingress controller on 3000; egress to identity and
+# payroll on 8000 and to the Collector on 4318. Redis egress comes from the data component of the
+# overlay (in-cluster-data or managed-data-egress). The controller namespace label is per overlay.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: web }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: ingress-nginx }
+      ports: [{ protocol: TCP, port: 3000 }]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: identity }
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: payroll }
+      ports: [{ protocol: TCP, port: 8000 }]
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: otel-collector }
+      ports: [{ protocol: TCP, port: 4318 }]

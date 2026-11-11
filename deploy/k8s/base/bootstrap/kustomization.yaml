@@ -1,0 +1,24 @@
+# DB bootstrap and first owner (platform LLD §9.3; PAY-100, PAY-606, R16, C36, C50).
+# init/ is a synced copy of deploy/compose/init/ (scripts/sync-k8s-assets.sh; R32): never edit it
+# here. ConfigMap keys can't hold "/", so lib/ files get flat keys and the Job's volume maps them
+# back to lib/ (run-init.sh runs every NN-*.sql from the directory above lib/).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - serviceaccount.yaml
+  - secret.yaml
+  - configmap.yaml
+  - job-db-bootstrap.yaml
+  - job-bootstrap-owner.yaml
+  - networkpolicy.yaml
+configMapGenerator:
+  - name: db-init
+    files:
+      - init/00-database.sql
+      - init/10-identity.sql
+      - init/20-payroll.sql
+      - init/30-payouts.sql
+      - init/40-bank-stub.sql
+      - init/90-monitoring.sql
+      - lib.run-init.sh=init/lib/run-init.sh
+      - lib.service_schema.psql=init/lib/service_schema.psql

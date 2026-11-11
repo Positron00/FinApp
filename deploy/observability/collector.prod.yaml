@@ -1,0 +1,81 @@
+# OpenTelemetry Collector, prod (platform LLD §8.1, §9.5; R27, C23). Replaces the Collector
+# ConfigMap in the prod overlay (synced copy: deploy/k8s/overlays/prod/collector.prod.yaml, R32).
+# The apps send 100% of spans (parentbased_always_on, C23); this file's tail_sampling keeps every
+# error trace, every trace slower than 300 ms and 10% of the rest. Otherwise it matches
+# collector.yaml: same receivers, redaction and Prometheus exporter (scraped by the cluster's
+# Prometheus), but traces and logs go to the telemetry backend over TLS on 443 (the Collector's
+# ipBlock egress in the prod overlay). The endpoint is a placeholder for the backend ADR.
+extensions:
+  health_check: { endpoint: 0.0.0.0:13133 }
+
+receivers:
+  otlp:
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317 }
+      http: { endpoint: 0.0.0.0:4318, max_request_body_size: 4194304 }
+
+processors:
+  memory_limiter: { check_interval: 1s, limit_percentage: 80, spike_limit_percentage: 25 }
+  batch: { send_batch_size: 1024, timeout: 2s }
+  # Defence in depth for PAY-NFR-07: drop deny-listed attributes, mask token-looking query strings.
+  transform/redact:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - delete_matching_keys(attributes, "(?i).*(password|token|authorization|cookie|account|routing|api_key|secret|salary|amount).*")
+          - replace_pattern(attributes["url.full"], "([?&#](token|code|key)=)[^&#]*", "$$1[REDACTED]")
+          - delete_key(attributes, "url.query")
+    log_statements:
+      - context: log
+        statements:
+          - delete_matching_keys(attributes, "(?i).*(password|token|authorization|cookie|account|routing|api_key|secret|salary|amount).*")
+          - replace_pattern(body, "eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+", "[REDACTED]")
+  resource/env:
+    attributes:
+      - { key: deployment.environment.name, value: prod, action: insert } # only if the SDK didn't set it
+  # R27: keep errors, slow traces (> 300 ms) and a 10% baseline. A trace is kept if any policy matches.
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 50000
+    expected_new_traces_per_sec: 100
+    policies:
+      - { name: errors, type: status_code, status_code: { status_codes: [ERROR] } }
+      - { name: slow, type: latency, latency: { threshold_ms: 300 } }
+      - { name: baseline, type: probabilistic, probabilistic: { sampling_percentage: 10 } }
+
+exporters:
+  # REPLACE: telemetry backend endpoint (hosted LGTM or the Helm-installed stack's gateway).
+  otlp_grpc/backend: { endpoint: otlp.telemetry-backend.invalid:443 }
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    enable_open_metrics: true # exemplars
+    resource_constant_labels:
+      included: ["service.name", "deployment.environment.name"]
+    metric_expiration: 10m
+
+service:
+  extensions: [health_check]
+  telemetry:
+    metrics:
+      readers:
+        - pull: { exporter: { prometheus: { host: 0.0.0.0, port: 8888 } } }
+  pipelines:
+    traces:
+      {
+        receivers: [otlp],
+        processors: [memory_limiter, resource/env, transform/redact, tail_sampling, batch],
+        exporters: [otlp_grpc/backend],
+      }
+    metrics:
+      {
+        receivers: [otlp],
+        processors: [memory_limiter, resource/env, batch],
+        exporters: [prometheus],
+      }
+    logs:
+      {
+        receivers: [otlp],
+        processors: [memory_limiter, resource/env, transform/redact, batch],
+        exporters: [otlp_grpc/backend],
+      }

@@ -1,0 +1,33 @@
+# Settings shared by every Python workload and the web (Compose x-py-env; platform LLD §4, §7.3).
+# C1 names only: no DATABASE_URL or REDIS_URL. Each workload's own <svc>-config comes after this
+# one in envFrom, so its keys win (bank-stub's empty REDIS_HOST, the web's OTLP protocol).
+# Overlays patch ENV, APP_VERSION, COMPANY_ID and the data endpoints.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payrun-env
+data:
+  ENV: dev
+  APP_VERSION: 0.1.0
+  LOG_LEVEL: INFO # any case accepted (C24)
+  COMPANY_ID: 0193a000-0000-7000-8000-000000000001 # dev value (C28, C47)
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_NAME: payrun
+  DB_STATEMENT_TIMEOUT_MS: "2000"
+  DB_POOL_TIMEOUT_S: "2"
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_SOCKET_TIMEOUT_MS: "500"
+  SERVICE_RATE_LIMIT_USER: "600"
+  SERVICE_RATE_LIMIT_WORKER: "6000"
+  BREAKER_FAILURES: "5"
+  BREAKER_RESET_S: "30"
+  MAINTENANCE_INTERVAL_S: "60"
+  RETENTION_OUTBOX_DAYS: "7"
+  RETENTION_PROCESSED_EVENTS_DAYS: "30"
+  RETENTION_TOKENS_DAYS: "7"
+  RETENTION_BANK_DETAILS_DAYS: "30"
+  IDEMPOTENCY_TTL_H: "24"
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  OTEL_METRIC_EXPORT_INTERVAL: "15000"

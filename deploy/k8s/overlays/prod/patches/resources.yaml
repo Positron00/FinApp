@@ -1,0 +1,39 @@
+# prod sizing; revisit with the nightly load results (PAY-NFR-05). No CPU limits.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers:
+        - name: web
+          resources:
+            requests: { cpu: 500m, memory: 384Mi }
+            limits: { memory: 768Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: identity
+spec:
+  template:
+    spec:
+      containers:
+        - name: identity
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { memory: 768Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payroll
+spec:
+  template:
+    spec:
+      containers:
+        - name: payroll
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { memory: 512Mi }

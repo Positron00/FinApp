@@ -1,0 +1,6 @@
+# uat, prod: an Ingress for the web only, with TLS. /metrics and internal paths are never routed:
+# only the web Service is a backend. The host and TLS Secret are per overlay (placeholders).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - ingress.yaml

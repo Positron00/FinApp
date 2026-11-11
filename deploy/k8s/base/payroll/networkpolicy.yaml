@@ -1,0 +1,21 @@
+# payroll (platform LLD §9.4): ingress from web and payout-worker on 8000; egress to the Collector.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payroll
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: payroll }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: web }
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: payout-worker }
+      ports: [{ protocol: TCP, port: 8000 }]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: otel-collector }
+      ports: [{ protocol: TCP, port: 4317 }]

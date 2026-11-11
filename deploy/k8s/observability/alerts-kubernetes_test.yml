@@ -1,0 +1,35 @@
+# promtool test rules alerts-kubernetes_test.yml (platform LLD §8.3: +3 restarts in 15 m fires, +1
+# stays quiet). Run from this folder.
+rule_files: [alerts-kubernetes.yml]
+evaluation_interval: 30s
+tests:
+  - name: PodRestarts fires on 3 restarts in 15 minutes
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_restarts_total{namespace="payrun-prod", pod="payroll-abc", container="payroll"}'
+        values: "0 0 0 1 1 2 2 3 3 3 3 3 3 3 3 3"
+    alert_rule_test:
+      - alertname: PodRestarts
+        eval_time: 10m
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: payrun-prod
+              pod: payroll-abc
+              container: payroll
+            exp_annotations:
+              summary: "A PayRun container restarted more than twice in 15 minutes"
+              description: "payrun-prod/payroll-abc (payroll) restarted 3 times in 15 minutes. Check its logs and last termination reason (OOMKilled, failed probes, startup checks)."
+              runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PodRestarts.md"
+              dashboard_url: "http://127.0.0.1:4101/d/payrun-platform"
+  - name: PodRestarts stays quiet on 1 restart, and ignores other namespaces
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_restarts_total{namespace="payrun-prod", pod="web-abc", container="web"}'
+        values: "0 0 0 1 1 1 1 1 1 1 1 1"
+      - series: 'kube_pod_container_status_restarts_total{namespace="kube-system", pod="coredns-x", container="coredns"}'
+        values: "0 2 4 6 8 10 12 14 16 18 20 22"
+    alert_rule_test:
+      - alertname: PodRestarts
+        eval_time: 10m
+        exp_alerts: []

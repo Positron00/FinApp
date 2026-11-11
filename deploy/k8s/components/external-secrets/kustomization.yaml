@@ -1,0 +1,7 @@
+# uat, prod: ExternalSecret per Secret (ADR 0008, R29); deletes the placeholder Secrets.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - externalsecrets.yaml
+patches:
+  - path: delete-placeholders.yaml

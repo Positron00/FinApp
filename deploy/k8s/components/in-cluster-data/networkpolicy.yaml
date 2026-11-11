@@ -1,0 +1,59 @@
+# Data allows for dev (platform LLD §9.4): Postgres ingress from every payrun.io/postgres-client pod
+# (identity, payroll, payout-worker, bank-stub, the Jobs) on 5432; Redis ingress from every
+# payrun.io/redis-client pod (web, identity, payroll, payout-worker) on 6379; and the matching
+# egress allows on the clients.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: postgres }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { payrun.io/postgres-client: "true" }
+      ports: [{ protocol: TCP, port: 5432 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: redis }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { payrun.io/redis-client: "true" }
+      ports: [{ protocol: TCP, port: 6379 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-to-postgres
+spec:
+  podSelector:
+    matchLabels: { payrun.io/postgres-client: "true" }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: postgres }
+      ports: [{ protocol: TCP, port: 5432 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-to-redis
+spec:
+  podSelector:
+    matchLabels: { payrun.io/redis-client: "true" }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: redis }
+      ports: [{ protocol: TCP, port: 6379 }]

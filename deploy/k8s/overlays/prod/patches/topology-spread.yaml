@@ -1,0 +1,11 @@
+# Spread each Deployment's pods across zones (platform LLD §9.2). matchLabelKeys narrows the
+# selector to the pod's own app.kubernetes.io/name, so one patch fits every Deployment.
+- op: add
+  path: /spec/template/spec/topologySpreadConstraints
+  value:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels: { app.kubernetes.io/part-of: payrun }
+      matchLabelKeys: [app.kubernetes.io/name]

@@ -1,0 +1,57 @@
+# uat overlay (platform LLD §9.5): managed Postgres and Redis (ADR 0007), bank-stub and Mailpit,
+# ExternalSecrets (ADR 0008), TLS Ingress. Every value marked REPLACE is a placeholder that the
+# environment's owner fills in (hosts, registry, subnets, public keys, company id); a forgotten one
+# fails the startup checks or DNS loudly rather than running with a dev value.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: payrun-uat
+labels:
+  - pairs: { app.kubernetes.io/part-of: payrun }
+    includeSelectors: false
+    includeTemplates: true
+resources:
+  - namespace.yaml
+  - ../../base
+  - networkpolicy-collector-egress.yaml
+  - externalsecrets-bank-stub.yaml
+components:
+  - ../../components/bank-stub
+  - ../../components/mailpit
+  - ../../components/managed-data-egress
+  - ../../components/external-secrets
+  - ../../components/ingress
+images: # REPLACE: registry
+  - { name: payrun/web, newName: registry.example.com/payrun/web, newTag: 0.1.0 }
+  - { name: payrun/identity, newName: registry.example.com/payrun/identity, newTag: 0.1.0 }
+  - { name: payrun/payroll, newName: registry.example.com/payrun/payroll, newTag: 0.1.0 }
+  - {
+      name: payrun/payout-worker,
+      newName: registry.example.com/payrun/payout-worker,
+      newTag: 0.1.0,
+    }
+  - { name: payrun/bank-stub, newName: registry.example.com/payrun/bank-stub, newTag: 0.1.0 }
+replicas:
+  - { name: web, count: 2 }
+  - { name: identity, count: 2 }
+  - { name: payroll, count: 2 }
+  - { name: payout-worker, count: 2 }
+  - { name: bank-stub, count: 2 }
+  - { name: otel-collector, count: 2 }
+patches:
+  - path: patches/config.yaml
+  - path: patches/delete-bank-stub-placeholders.yaml
+  - path: patches/managed-data-cidrs.yaml
+    target: { kind: NetworkPolicy, name: egress-to-managed-postgres }
+  - path: patches/managed-redis-cidr.yaml
+    target: { kind: NetworkPolicy, name: egress-to-managed-redis }
+  - path: patches/db-bootstrap-externalsecret.yaml
+    target: { kind: ExternalSecret, name: db-bootstrap }
+  - path: patches/ingress-host.yaml
+    target: { kind: Ingress, name: web }
+# ExternalSecret remote keys are payrun/<env>/<NAME>: fill the <env> segment from ENV.
+replacements:
+  - source: { kind: ConfigMap, name: payrun-env, fieldPath: data.ENV }
+    targets:
+      - select: { kind: ExternalSecret }
+        fieldPaths: [spec.data.*.remoteRef.key]
+        options: { delimiter: /, index: 1 }

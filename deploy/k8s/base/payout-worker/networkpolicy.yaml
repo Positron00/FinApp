@@ -1,0 +1,19 @@
+# payout-worker (platform LLD §9.4): no ingress; egress to payroll on 8000 and the Collector.
+# The bank egress is per overlay: bank-stub (dev, uat; ADR 0011 option 1) or bank-egress-ipblock (prod).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payout-worker
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: payout-worker }
+  policyTypes: [Ingress, Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: payroll }
+      ports: [{ protocol: TCP, port: 8000 }]
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: otel-collector }
+      ports: [{ protocol: TCP, port: 4317 }]

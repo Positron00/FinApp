@@ -1,0 +1,68 @@
+# db-bootstrap (platform LLD §9.3; PAY-606, C50): the same SQL as Compose, run as the bootstrap
+# admin. Idempotent: run once per environment, and again to rotate passwords. The Job's pod template
+# is immutable, so delete the finished Job (or wait for its TTL) before re-applying.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-bootstrap
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: db-bootstrap
+        app.kubernetes.io/component: bootstrap
+        payrun.io/postgres-client: "true"
+    spec:
+      restartPolicy: Never
+      serviceAccountName: payrun-jobs
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70 # postgres in the alpine image
+        runAsGroup: 70
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: db-bootstrap
+          image: postgres:16.14-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "/init/lib/run-init.sh"]
+          envFrom:
+            - configMapRef: { name: bootstrap-config }
+            - secretRef: { name: db-bootstrap }
+          env:
+            - name: PGHOST
+              valueFrom: { configMapKeyRef: { name: payrun-env, key: DB_HOST } }
+            - name: PGPORT
+              valueFrom: { configMapKeyRef: { name: payrun-env, key: DB_PORT } }
+            - name: PGDATABASE
+              valueFrom: { configMapKeyRef: { name: payrun-env, key: DB_NAME } }
+            - name: PGPASSWORD
+              valueFrom: { secretKeyRef: { name: db-bootstrap, key: POSTGRES_PASSWORD } }
+            - { name: PGCONNECT_TIMEOUT, value: "10" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 128Mi }
+          volumeMounts:
+            - { name: init, mountPath: /init, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: init
+          configMap:
+            name: db-init
+            items:
+              - { key: 00-database.sql, path: 00-database.sql }
+              - { key: 10-identity.sql, path: 10-identity.sql }
+              - { key: 20-payroll.sql, path: 20-payroll.sql }
+              - { key: 30-payouts.sql, path: 30-payouts.sql }
+              - { key: 40-bank-stub.sql, path: 40-bank-stub.sql }
+              - { key: 90-monitoring.sql, path: 90-monitoring.sql }
+              - { key: lib.run-init.sh, path: lib/run-init.sh }
+              - { key: lib.service_schema.psql, path: lib/service_schema.psql }
+        - { name: tmp, emptyDir: { sizeLimit: 16Mi } }

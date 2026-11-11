@@ -1,0 +1,11 @@
+# bank-stub settings (bank-stub LLD §4; C47). No Redis and no JWT keyset.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bank-stub-config
+data:
+  DB_USER: bank_stub_app
+  DB_SCHEMA: bank_stub
+  REDIS_HOST: "" # overrides payrun-env (use_redis off)
+  BANK_STUB_FAILURE_RATE: "0.05"
+  BANK_STUB_LATENCY_MS: "20"

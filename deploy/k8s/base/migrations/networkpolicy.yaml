@@ -1,0 +1,9 @@
+# Migration Jobs (platform LLD §9.4): no ingress; egress only to Postgres (from the data component).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: migrations
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/component: migration }
+  policyTypes: [Ingress, Egress]

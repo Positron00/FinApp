@@ -33,7 +33,13 @@ LABEL org.opencontainers.image.title="payrun-${PACKAGE}" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${GIT_SHA}" \
       org.opencontainers.image.source="https://github.com/Positron00/FinApp"
-RUN useradd --system --uid 10001 --gid 0 --no-create-home app
+# Apply Debian security updates and drop pip from the runtime image: the app never installs at
+# runtime, and pip's vendored urllib3/msgpack/setuptools carry fixable CVEs (Trivy gate, S9).
+RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
+ && rm -rf /var/lib/apt/lists/* \
+ && python -m pip uninstall --yes --no-input pip \
+ && useradd --system --uid 10001 --gid 0 --no-create-home app
 WORKDIR /app
 # Same path as the build stage, so the venv's console scripts (alembic) keep working.
 COPY --from=build /app/.venv /app/.venv

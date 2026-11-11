@@ -1,0 +1,18 @@
+# payout-worker settings (worker LLD §4; C46, C47). No PAYOUT_MAX_ATTEMPTS: that is payroll's (C46).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payout-worker-config
+data:
+  DB_USER: payouts_app
+  DB_SCHEMA: payouts
+  REDIS_USERNAME: payout-worker
+  PAYOUT_CONCURRENCY: "16"
+  PAYOUT_XREAD_BLOCK_MS: "5000"
+  PAYOUT_CONSUMER_GC_IDLE_S: "3600"
+  PAYOUT_PAYROLL_BASE_URL: http://payroll:8000 # C46
+  PAYOUT_PAYROLL_CONNECT_TIMEOUT_S: "1"
+  PAYOUT_PAYROLL_READ_TIMEOUT_S: "2"
+  PAYOUT_PAYROLL_MAX_RETRIES: "3"
+  BANK_BASE_URL: http://bank-stub:8000 # dev, uat; prod sets the provider placeholder (R14)
+  BANK_KEY_SAFE_WINDOW_S: "86400"

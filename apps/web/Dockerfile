@@ -29,7 +29,14 @@ LABEL org.opencontainers.image.title="payrun-web" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${GIT_SHA}" \
       org.opencontainers.image.source="https://github.com/Positron00/FinApp"
-RUN useradd --system --uid 10001 --gid 0 --no-create-home app
+# Apply Debian security updates and drop npm/corepack from the runtime image: the standalone
+# server needs only node, and npm's bundled undici/brace-expansion carry fixable CVEs (S9).
+RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
+ && rm -rf /var/lib/apt/lists/* \
+ && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+           /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
+ && useradd --system --uid 10001 --gid 0 --no-create-home app
 WORKDIR /app
 COPY --from=build --chown=10001:0 /repo/apps/web/.next/standalone ./
 COPY --from=build --chown=10001:0 /repo/apps/web/.next/static ./apps/web/.next/static

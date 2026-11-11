@@ -1,0 +1,23 @@
+# otel-collector (platform LLD §9.4): OTLP ingress from every payrun pod on 4317/4318; the cluster's
+# Prometheus (namespace `monitoring`) scrapes 8888/8889. Egress to the telemetry backend is per overlay.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: otel-collector
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: otel-collector }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/part-of: payrun }
+      ports:
+        - { protocol: TCP, port: 4317 }
+        - { protocol: TCP, port: 4318 }
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+      ports:
+        - { protocol: TCP, port: 8888 }
+        - { protocol: TCP, port: 8889 }

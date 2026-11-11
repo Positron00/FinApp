@@ -1,0 +1,56 @@
+# dev overlay (platform LLD §9.5): a local cluster (kind or similar) with in-cluster Postgres and
+# Redis, bank-stub and Mailpit. Images are built locally and loaded (`kind load docker-image
+# payrun/<svc>:dev`). No Ingress: `kubectl -n payrun-dev port-forward svc/web 4100:3000`.
+#
+# Secrets: secrets.env is git-ignored and written by `scripts/dev-env.sh --k8s-dev` with the .env
+# names (scripts/ci/manifests.sh writes dummy values when it is absent). The patches map each
+# process name to its .env name with secretKeyRef (C1), over the base placeholders.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: payrun-dev
+labels:
+  - pairs: { app.kubernetes.io/part-of: payrun }
+    includeSelectors: false
+    includeTemplates: true
+resources:
+  - namespace.yaml
+  - ../../base
+  - networkpolicy-collector-egress.yaml
+components:
+  - ../../components/bank-stub
+  - ../../components/in-cluster-data
+  - ../../components/mailpit
+secretGenerator:
+  - name: payrun-dev-secrets
+    envs: [secrets.env]
+images:
+  - { name: payrun/web, newTag: dev }
+  - { name: payrun/identity, newTag: dev }
+  - { name: payrun/payroll, newTag: dev }
+  - { name: payrun/payout-worker, newTag: dev }
+  - { name: payrun/bank-stub, newTag: dev }
+replicas:
+  - { name: web, count: 1 }
+  - { name: identity, count: 1 }
+  - { name: payroll, count: 1 }
+  - { name: payout-worker, count: 1 }
+  - { name: bank-stub, count: 1 }
+  - { name: otel-collector, count: 1 }
+patches:
+  - path: patches/payrun-env.yaml
+  - path: patches/secrets-web.yaml
+  - path: patches/secrets-identity.yaml
+  - path: patches/secrets-payroll.yaml
+  - path: patches/secrets-payout-worker.yaml
+  - path: patches/secrets-bank-stub.yaml
+  - path: patches/secrets-db-bootstrap.yaml
+  - path: patches/bootstrap-owner.yaml
+    target: { kind: Job, name: bootstrap-owner }
+  - path: patches/migrator-identity.yaml
+    target: { kind: Job, name: "migrate-identity-.*" } # any version suffix
+  - path: patches/migrator-payroll.yaml
+    target: { kind: Job, name: "migrate-payroll-.*" } # any version suffix
+  - path: patches/migrator-payouts.yaml
+    target: { kind: Job, name: "migrate-payouts-.*" } # any version suffix
+  - path: patches/migrator-bank-stub.yaml
+    target: { kind: Job, name: "migrate-bank-stub-.*" } # any version suffix

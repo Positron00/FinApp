@@ -1,0 +1,19 @@
+# identity settings (identity LLD §4; C1, C2, C49). INTERNAL_JWT_PUBLIC_KEYS holds the web's public
+# key only (plan §8: "ConfigMap per service (public keys)"); the release step sets it in uat and prod.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: identity-config
+data:
+  DB_USER: identity_app
+  DB_SCHEMA: identity
+  REDIS_USERNAME: identity
+  INTERNAL_JWT_PUBLIC_KEYS: REPLACE_ME # dev maps IDENTITY_INTERNAL_JWT_PUBLIC_KEYS over it
+  SMTP_HOST: mailpit # unprefixed infrastructure keys (C49); prod takes them from its secret
+  SMTP_PORT: "1025"
+  AUTH_LOGIN_LIMIT_ACCOUNT: "5"
+  AUTH_LOGIN_LIMIT_IP: "20"
+  INVITE_TTL_H: "72"
+  RESET_TTL_H: "1"
+  EMAIL_MAX_ATTEMPTS: "10"
+  IDENTITY_PUBLIC_BASE_URL: http://127.0.0.1:4100 # invite and reset links (C12)

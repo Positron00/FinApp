@@ -1,0 +1,57 @@
+# bootstrap-owner (platform LLD §9.3; PAY-100, R16): runs once, after identity's migration, as
+# identity_migrator. --if-empty exits 0 when users exist, so the Job can be re-applied. uat and prod
+# create a pending owner and email the invite; the dev overlay adds --password-env (ENV=dev only).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bootstrap-owner
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bootstrap-owner
+        app.kubernetes.io/component: bootstrap
+        payrun.io/postgres-client: "true"
+    spec:
+      restartPolicy: Never
+      serviceAccountName: payrun-jobs
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: bootstrap-owner
+          image: payrun/identity:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "identity.bootstrap_owner"]
+          args:
+            - --if-empty
+            - --email
+            - $(OWNER_EMAIL)
+            - --company-id
+            - $(COMPANY_ID)
+          envFrom:
+            - configMapRef: { name: payrun-env }
+            - secretRef: { name: identity-migrator }
+          env:
+            - { name: DB_USER, value: identity_migrator }
+            - { name: DB_SCHEMA, value: identity }
+            - name: COMPANY_ID
+              valueFrom: { configMapKeyRef: { name: payrun-env, key: COMPANY_ID } }
+            - name: OWNER_EMAIL
+              valueFrom: { configMapKeyRef: { name: bootstrap-config, key: OWNER_EMAIL } }
+            - { name: OTEL_TRACES_SAMPLER, value: parentbased_always_on } # C23
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 100m, memory: 192Mi }
+            limits: { memory: 512Mi } # argon2 (identity LLD §4.2)
+          volumeMounts: [{ name: tmp, mountPath: /tmp }]
+      volumes: [{ name: tmp, emptyDir: { sizeLimit: 16Mi } }]

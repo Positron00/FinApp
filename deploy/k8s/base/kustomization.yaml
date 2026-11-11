@@ -1,0 +1,49 @@
+# PayRun Kustomize base (platform LLD §9; PAY-NFR-13, ADR 0008, 0011). Never applied directly:
+# overlays/{dev,uat,prod} add the namespace, components, images, replicas and environment values.
+# Base values are the dev ones. Secrets here are placeholders (REPLACE_ME), which the startup checks
+# refuse in uat and prod; dev maps its generated secrets over them, uat and prod replace them with
+# ExternalSecrets (components/external-secrets).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+labels:
+  - pairs: { app.kubernetes.io/part-of: payrun }
+    includeSelectors: false
+    includeTemplates: true
+resources:
+  - common/networkpolicy-default-deny.yaml
+  - common/networkpolicy-allow-dns.yaml
+  - common/configmap-payrun-env.yaml
+  - common/configmap-payout-timing.yaml
+  - web/serviceaccount.yaml
+  - web/configmap.yaml
+  - web/secret.yaml
+  - web/deployment.yaml
+  - web/service.yaml
+  - web/pdb.yaml
+  - web/networkpolicy.yaml
+  - identity/serviceaccount.yaml
+  - identity/configmap.yaml
+  - identity/secret.yaml
+  - identity/secret-migrator.yaml
+  - identity/deployment.yaml
+  - identity/service.yaml
+  - identity/pdb.yaml
+  - identity/networkpolicy.yaml
+  - payroll/serviceaccount.yaml
+  - payroll/configmap.yaml
+  - payroll/secret.yaml
+  - payroll/secret-migrator.yaml
+  - payroll/deployment.yaml
+  - payroll/service.yaml
+  - payroll/pdb.yaml
+  - payroll/networkpolicy.yaml
+  - payout-worker/serviceaccount.yaml
+  - payout-worker/configmap.yaml
+  - payout-worker/secret.yaml
+  - payout-worker/secret-migrator.yaml
+  - payout-worker/deployment.yaml
+  - payout-worker/pdb.yaml
+  - payout-worker/networkpolicy.yaml
+  - otel-collector
+  - bootstrap
+  - migrations

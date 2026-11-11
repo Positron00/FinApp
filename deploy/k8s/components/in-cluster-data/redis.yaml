@@ -1,0 +1,97 @@
+# Redis 7.4 (ADR 0007) with the PayRun ACL users (PAY-607): entrypoint.sh writes the hashed ACL
+# file to a memory-backed emptyDir. Runs as the image's redis user (999:1000), so the image's
+# entrypoint starts redis-server directly instead of dropping privileges.
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: redis }
+  ports: [{ name: redis, port: 6379, targetPort: redis, protocol: TCP }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: redis }
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/component: queue
+    spec:
+      serviceAccountName: payrun-data
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: redis
+          image: redis:7.4.11-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/usr/local/etc/redis/entrypoint.sh"]
+          ports: [{ name: redis, containerPort: 6379 }]
+          env:
+            - name: REDIS_ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: payrun-dev-secrets, key: REDIS_ADMIN_PASSWORD } }
+            - name: REDIS_WEB_PASSWORD
+              valueFrom: { secretKeyRef: { name: payrun-dev-secrets, key: REDIS_WEB_PASSWORD } }
+            - name: REDIS_IDENTITY_PASSWORD
+              valueFrom:
+                { secretKeyRef: { name: payrun-dev-secrets, key: REDIS_IDENTITY_PASSWORD } }
+            - name: REDIS_PAYROLL_PASSWORD
+              valueFrom: { secretKeyRef: { name: payrun-dev-secrets, key: REDIS_PAYROLL_PASSWORD } }
+            - name: REDIS_PAYOUT_WORKER_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: payrun-dev-secrets, key: REDIS_PAYOUT_WORKER_PASSWORD }
+            - name: REDIS_EXPORTER_PASSWORD
+              valueFrom:
+                { secretKeyRef: { name: payrun-dev-secrets, key: REDIS_EXPORTER_PASSWORD } }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          startupProbe:
+            exec:
+              command:
+                ["sh", "-c", 'REDISCLI_AUTH="$REDIS_ADMIN_PASSWORD" redis-cli ping | grep -q PONG']
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command:
+                ["sh", "-c", 'REDISCLI_AUTH="$REDIS_ADMIN_PASSWORD" redis-cli ping | grep -q PONG']
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            exec:
+              command:
+                ["sh", "-c", 'REDISCLI_AUTH="$REDIS_ADMIN_PASSWORD" redis-cli ping | grep -q PONG']
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 384Mi } # maxmemory 256mb plus overhead
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: files, mountPath: /usr/local/etc/redis, readOnly: true }
+            - { name: acl, mountPath: /run/redis }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: files
+          configMap: { name: redis-files }
+        - { name: acl, emptyDir: { medium: Memory, sizeLimit: 1Mi } }
+        - { name: tmp, emptyDir: { sizeLimit: 16Mi } }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 1Gi } }

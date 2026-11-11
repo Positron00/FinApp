@@ -1,0 +1,48 @@
+# The base placeholders, replaced by the ExternalSecrets of the same names.
+$patch: delete
+apiVersion: v1
+kind: Secret
+metadata:
+  name: web-secrets
+---
+$patch: delete
+apiVersion: v1
+kind: Secret
+metadata:
+  name: identity-secrets
+---
+$patch: delete
+apiVersion: v1
+kind: Secret
+metadata:
+  name: payroll-secrets
+---
+$patch: delete
+apiVersion: v1
+kind: Secret
+metadata:
+  name: payout-worker-secrets
+---
+$patch: delete
+apiVersion: v1
+kind: Secret
+metadata:
+  name: identity-migrator
+---
+$patch: delete
+apiVersion: v1
+kind: Secret
+metadata:
+  name: payroll-migrator
+---
+$patch: delete
+apiVersion: v1
+kind: Secret
+metadata:
+  name: payouts-migrator
+---
+$patch: delete
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-bootstrap

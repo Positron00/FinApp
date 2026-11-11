@@ -1,0 +1,13 @@
+# bank-stub (dev, uat only; bank-stub LLD, ADR 0011 option 1): the simulated bank, its migration
+# Job, and the worker -> bank-stub egress. prod has no bank-stub (R14).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - serviceaccount.yaml
+  - configmap.yaml
+  - secret.yaml
+  - deployment.yaml
+  - service.yaml
+  - pdb.yaml
+  - networkpolicy.yaml
+  - job-migrate-bank-stub.yaml

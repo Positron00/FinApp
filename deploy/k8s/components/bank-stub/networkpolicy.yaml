@@ -1,0 +1,34 @@
+# bank-stub (platform LLD §9.4): ingress only from payout-worker on 8000; egress to the Collector.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bank-stub
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: bank-stub }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: payout-worker }
+      ports: [{ protocol: TCP, port: 8000 }]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: otel-collector }
+      ports: [{ protocol: TCP, port: 4317 }]
+---
+# The worker's bank egress in dev and uat: bank-stub only (ADR 0011 option 1).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payout-worker-to-bank-stub
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: payout-worker }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: bank-stub }
+      ports: [{ protocol: TCP, port: 8000 }]

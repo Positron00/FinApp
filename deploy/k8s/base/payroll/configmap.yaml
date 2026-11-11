@@ -1,0 +1,14 @@
+# payroll settings (payroll LLD §4; C1, C2, C46). INTERNAL_JWT_PUBLIC_KEYS holds the web and worker
+# public keys (plan §8); the release step sets it in uat and prod.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payroll-config
+data:
+  DB_USER: payroll_app
+  DB_SCHEMA: payroll
+  REDIS_USERNAME: payroll
+  INTERNAL_JWT_PUBLIC_KEYS: REPLACE_ME # dev maps PAYROLL_INTERNAL_JWT_PUBLIC_KEYS over it
+  STREAM_MAXLEN: "100000"
+  PAYOUT_STUCK_AFTER_S: "600"
+  PAYOUT_MAX_ATTEMPTS: "5" # payroll's key (C46)

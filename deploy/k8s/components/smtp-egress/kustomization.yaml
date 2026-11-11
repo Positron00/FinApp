@@ -1,0 +1,6 @@
+# prod: identity's egress to the SMTP provider on 587 (STARTTLS). CIDR placeholder patched by the
+# prod overlay (`# REPLACE: provider subnet`).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - networkpolicy.yaml

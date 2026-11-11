@@ -1,0 +1,50 @@
+# prod values (platform LLD §9.5). REPLACE marks the placeholders.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payrun-env
+data:
+  ENV: prod
+  APP_VERSION: 0.1.0
+  COMPANY_ID: REPLACE_ME # REPLACE: the environment's company UUID (settings refuse a non-UUID)
+  DB_HOST: postgres.payrun-prod.invalid # REPLACE: managed Postgres endpoint
+  REDIS_HOST: redis.payrun-prod.invalid # REPLACE: managed Redis endpoint
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-config
+data:
+  PUBLIC_BASE_URL: https://payrun.example.com # REPLACE: host (matches the Ingress); HSTS at the BFF
+  SESSION_COOKIE_NAME: __Host-sid
+  TRUSTED_PROXY_HOPS: "1" # the ingress controller (C62: uat and prod refuse < 1)
+---
+# SMTP comes from the provider (C49): host and credentials from identity-secrets, so the Mailpit
+# default is removed here (a Secret key would win anyway, envFrom order).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: identity-config
+data:
+  IDENTITY_PUBLIC_BASE_URL: https://payrun.example.com # REPLACE: host
+  SMTP_HOST: null
+  SMTP_PORT: "587"
+  SMTP_STARTTLS: "true"
+---
+# R14: a provider placeholder that the prod startup check refuses until a real adapter exists.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payout-worker-config
+data:
+  BANK_BASE_URL: https://bank-provider.invalid # REPLACE: bank provider (needs its ADR first)
+  BANK_KEY_SAFE_WINDOW_S: "86400" # REPLACE: the provider's idempotency-key retention
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bootstrap-config
+data:
+  PGUSER: postgres # REPLACE: managed admin user
+  OWNER_EMAIL: owner@payrun.example.com # REPLACE: the first owner (gets an invite email)
+  SKIP_BANK_STUB: "1" # no bank_stub schema in prod

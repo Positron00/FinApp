@@ -1,0 +1,75 @@
+# Postgres 16 (ADR 0007), as the image's postgres user (70) with a read-only root filesystem.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: postgres }
+  ports: [{ name: postgres, port: 5432, targetPort: postgres, protocol: TCP }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: postgres }
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/component: database
+    spec:
+      serviceAccountName: payrun-data
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: postgres
+          image: postgres:16.14-alpine
+          imagePullPolicy: IfNotPresent
+          ports: [{ name: postgres, containerPort: 5432 }]
+          env:
+            - { name: POSTGRES_DB, value: payrun }
+            - { name: POSTGRES_USER, value: postgres }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: payrun-dev-secrets, key: POSTGRES_PASSWORD } }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          startupProbe:
+            exec: { command: ["pg_isready", "-U", "postgres", "-d", "payrun"] }
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            exec: { command: ["pg_isready", "-U", "postgres", "-d", "payrun"] }
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "postgres", "-d", "payrun"] }
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: run, mountPath: /var/run/postgresql }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: run, emptyDir: {} }
+        - { name: tmp, emptyDir: { sizeLimit: 64Mi } }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 2Gi } }

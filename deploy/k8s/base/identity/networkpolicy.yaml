@@ -1,0 +1,20 @@
+# identity (platform LLD §9.4): ingress from web on 8000; egress to the Collector on 4317.
+# Postgres, Redis and SMTP egress come from the overlay's components.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: identity
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: identity }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: web }
+      ports: [{ protocol: TCP, port: 8000 }]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: otel-collector }
+      ports: [{ protocol: TCP, port: 4317 }]

@@ -1,0 +1,24 @@
+# Trivy findings accepted for the image gate (platform LLD §12; testing.md §2; C38).
+# Format, enforced by scripts/ci/images.sh (one finding per line):
+#   <CVE-or-GHSA-id> # reason: <why it is acceptable>; owner: <github handle>; exp:YYYY-MM-DD
+# Every entry is also recorded in SECURITY_DEPENDENCIES.md. Trivy stops honouring an entry after
+# its exp: date, and the policy check fails on it, so an acceptance is always re-reviewed.
+# Accepted 2026-11-10 (S9): Debian base-image packages with no fixed version (status affected,
+# fix_deferred or will_not_fix); the fixable findings are removed in the Dockerfiles instead.
+CVE-2023-45853 # reason: no Debian 12 fix: node statically links its own zlib, so the web server never loads system zlib1g (fixed in Debian 13: move the web image to a trixie base); owner: @Positron00; exp:2026-12-10
+CVE-2025-69720 # reason: no Debian fix yet: terminal library of the base image, unused by a non-interactive server; owner: @Positron00; exp:2027-01-10
+CVE-2026-119373 # reason: no Debian 13 fix yet: the services never import sqlite3 and use neither FTS5 nor session changesets; owner: @Positron00; exp:2027-01-10
+CVE-2026-119374 # reason: no Debian 13 fix yet: the services never import sqlite3 and use neither FTS5 nor session changesets; owner: @Positron00; exp:2027-01-10
+CVE-2026-119379 # reason: no Debian 13 fix yet: the services never import sqlite3 and use neither FTS5 nor session changesets; owner: @Positron00; exp:2027-01-10
+CVE-2026-16742 # reason: no Debian fix yet: systemd-homed is not present or run in the container, only the client libraries are installed; owner: @Positron00; exp:2027-01-10
+CVE-2026-41992 # reason: Debian fix deferred: the gzip binary is never run by the web server; owner: @Positron00; exp:2027-01-10
+CVE-2026-53613 # reason: no Debian fix yet: mount and nsenter tools need privileges the pods drop (non-root, no capabilities) and are never run; owner: @Positron00; exp:2027-01-10
+CVE-2026-53615 # reason: no Debian fix yet: mount and nsenter tools need privileges the pods drop (non-root, no capabilities) and are never run; owner: @Positron00; exp:2027-01-10
+CVE-2026-54369 # reason: no Debian fix yet: libacl is not used by the services, which run non-root on a read-only root filesystem; owner: @Positron00; exp:2027-01-10
+CVE-2026-76642 # reason: no Debian fix yet: mount and nsenter tools need privileges the pods drop (non-root, no capabilities) and are never run; owner: @Positron00; exp:2027-01-10
+CVE-2026-76844 # reason: no Debian 12 fix: node statically links its own zlib, so the web server never loads system zlib1g (fixed in Debian 13: move the web image to a trixie base); owner: @Positron00; exp:2026-12-10
+CVE-2026-78408 # reason: no Debian fix yet: mount and nsenter tools need privileges the pods drop (non-root, no capabilities) and are never run; owner: @Positron00; exp:2027-01-10
+CVE-2026-78409 # reason: no Debian fix yet: mount and nsenter tools need privileges the pods drop (non-root, no capabilities) and are never run; owner: @Positron00; exp:2027-01-10
+CVE-2026-78410 # reason: no Debian fix yet: mount and nsenter tools need privileges the pods drop (non-root, no capabilities) and are never run; owner: @Positron00; exp:2027-01-10
+CVE-2026-85091 # reason: no Debian 12 fix: node statically links its own zlib, so the web server never loads system zlib1g (fixed in Debian 13: move the web image to a trixie base); owner: @Positron00; exp:2026-12-10
+CVE-2026-9538 # reason: Debian fix deferred: perl Archive::Tar is never run in the containers; owner: @Positron00; exp:2027-01-10

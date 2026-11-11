@@ -1,0 +1,6 @@
+# Mailpit SMTP capture (dev, uat): identity sends invite and reset mail to mailpit:1025; the web UI
+# and API on 8025 are reached with kubectl port-forward (seed.py reads invites from it in dev).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - mailpit.yaml

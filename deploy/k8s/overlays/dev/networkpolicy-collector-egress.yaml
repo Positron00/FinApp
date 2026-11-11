@@ -1,0 +1,16 @@
+# dev: the Collector exports to an LGTM stack installed in the `observability` namespace (Helm).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: otel-collector-egress
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: otel-collector }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: observability }
+      ports:
+        - { protocol: TCP, port: 4317 } # Tempo OTLP
+        - { protocol: TCP, port: 3100 } # Loki OTLP

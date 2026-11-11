@@ -1,0 +1,12 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: identity-to-smtp
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: identity }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock: { cidr: 192.0.2.32/28 } # REPLACE: provider subnet (patched per overlay)
+      ports: [{ protocol: TCP, port: 587 }]

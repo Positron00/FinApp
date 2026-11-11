@@ -1,0 +1,14 @@
+# OTel Collector (platform LLD §8.1, §9.1). collector.yaml is a synced copy of
+# deploy/observability/collector.yaml (scripts/sync-k8s-assets.sh; R32): never edit it here.
+# The prod overlay replaces the generated ConfigMap with collector.prod.yaml (tail_sampling, C23).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - serviceaccount.yaml
+  - deployment.yaml
+  - service.yaml
+  - pdb.yaml
+  - networkpolicy.yaml
+configMapGenerator:
+  - name: otel-collector-config
+    files: [collector.yaml]
