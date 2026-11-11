@@ -1,0 +1,48 @@
+-- Included by NN-<service>.sql. Variables: schema, migrator, runtime, migrator_env, runtime_env.
+-- Passwords come from the environment via \getenv and are quoted by format(%L) inside Postgres,
+-- so no password ever appears in SQL text or in the output (only env var NAMES are echoed).
+\getenv migrator_pw :migrator_env
+\getenv runtime_pw :runtime_env
+\if :{?migrator_pw}
+\else
+  \echo 'bootstrap: missing env' :migrator_env
+  DO $$ BEGIN RAISE EXCEPTION 'bootstrap: required password env var is not set'; END $$;
+\endif
+\if :{?runtime_pw}
+\else
+  \echo 'bootstrap: missing env' :runtime_env
+  DO $$ BEGIN RAISE EXCEPTION 'bootstrap: required password env var is not set'; END $$;
+\endif
+
+SELECT format('CREATE ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT', :'migrator')
+ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'migrator') \gexec
+SELECT format('CREATE ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT CONNECTION LIMIT 60', :'runtime')
+ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'runtime') \gexec
+SELECT format('ALTER ROLE %I PASSWORD %L', :'migrator', :'migrator_pw') \gexec
+SELECT format('ALTER ROLE %I PASSWORD %L', :'runtime', :'runtime_pw') \gexec
+
+-- Managed Postgres: a non-superuser CREATEROLE admin needs SET on the migrator for
+-- CREATE SCHEMA ... AUTHORIZATION and ALTER DEFAULT PRIVILEGES FOR ROLE.
+SELECT NOT rolsuper AS need_set_grant FROM pg_roles WHERE rolname = current_user \gset
+\if :need_set_grant
+  SELECT format('GRANT %I TO current_user WITH SET TRUE, INHERIT FALSE', :'migrator') \gexec
+\endif
+
+SELECT format('GRANT CONNECT ON DATABASE payrun TO %I, %I', :'migrator', :'runtime') \gexec
+SELECT format('CREATE SCHEMA IF NOT EXISTS %I AUTHORIZATION %I', :'schema', :'migrator') \gexec
+SELECT format('ALTER SCHEMA %I OWNER TO %I', :'schema', :'migrator') \gexec
+SELECT format('REVOKE ALL ON SCHEMA %I FROM PUBLIC', :'schema') \gexec
+SELECT format('GRANT USAGE ON SCHEMA %I TO %I', :'schema', :'runtime') \gexec
+
+SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I',
+              :'migrator', :'schema', :'runtime') \gexec
+SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT USAGE, SELECT ON SEQUENCES TO %I',
+              :'migrator', :'schema', :'runtime') \gexec
+SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT EXECUTE ON FUNCTIONS TO %I',
+              :'migrator', :'schema', :'runtime') \gexec
+-- Tables that already exist (a re-run after migrations) get the same grants.
+SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %I TO %I', :'schema', :'runtime') \gexec
+SELECT format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %I TO %I', :'schema', :'runtime') \gexec
+
+SELECT format('ALTER ROLE %I SET search_path = %I', :'migrator', :'schema') \gexec
+SELECT format('ALTER ROLE %I SET search_path = %I', :'runtime', :'schema') \gexec

@@ -57,7 +57,7 @@ FinApp/
       init/
         00-database.sql  10-identity.sql  20-payroll.sql  30-payouts.sql  40-bank-stub.sql  90-monitoring.sql
         lib/service_schema.psql
-        run-init.sh           # loop used by the Kubernetes Job (§9.3)
+        lib/run-init.sh       # loop used by the Kubernetes Job (§9.3); in lib/ because the Postgres entrypoint runs any *.sh in initdb.d
       redis/redis.conf  redis/entrypoint.sh
     observability/
       collector.yaml  collector.prod.yaml
@@ -349,7 +349,7 @@ environment with `\getenv` (psql ≥ 15; every psql here is 16) and builds the D
   With `\getenv`, `%L` does the quoting inside Postgres, and the same `.sql` files run unchanged in:
   1. Compose: mounted at `/docker-entrypoint-initdb.d` (the entrypoint runs `*.sql` with psql and ignores the `lib/` directory);
   2. Testcontainers: `pycommon.testing` mounts the same directory into `postgres:16-alpine` with the passwords as container env;
-  3. the Kubernetes `db-bootstrap` Job: `run-init.sh` loops over the files with `psql -v ON_ERROR_STOP=1 -f`. Kustomize can't read files outside its root, so `scripts/sync-k8s-assets.sh` copies the directory byte for byte to `deploy/k8s/base/bootstrap/init/` and CI fails on any difference (R32, C36). `deploy/compose/init/` stays the only source that is edited.
+  3. the Kubernetes `db-bootstrap` Job: `lib/run-init.sh` loops over the files (it must live in `lib/`: the Postgres image entrypoint executes every `*.sh` in `docker-entrypoint-initdb.d`, found in S3) with `psql -v ON_ERROR_STOP=1 -f`. Kustomize can't read files outside its root, so `scripts/sync-k8s-assets.sh` copies the directory byte for byte to `deploy/k8s/base/bootstrap/init/` and CI fails on any difference (R32, C36). `deploy/compose/init/` stays the only source that is edited.
 - **Missing variable:** the template checks `:{?var}` and raises, so the run fails with the variable's name and never with its value.
 - **Idempotent:** roles are created only if missing, then `ALTER ROLE … PASSWORD` keeps them in sync, so the Job can be re-run to rotate passwords. Schema and grants use `IF NOT EXISTS` or are naturally repeatable.
 - **No logging of passwords:** the server keeps `log_statement = none` (the default); `compose.yaml` doesn't change it. The test `test_bootstrap_sql.py` asserts this setting.
@@ -1316,7 +1316,7 @@ the design runs it with no load-restrictor flag, so the script copies the shared
 
 | Source (the only copy that is edited) | Copy |
 |---|---|
-| `deploy/compose/init/` (`*.sql`, `lib/service_schema.psql`, `run-init.sh`) | `deploy/k8s/base/bootstrap/init/` |
+| `deploy/compose/init/` (`*.sql`, `lib/service_schema.psql`, `lib/run-init.sh`) | `deploy/k8s/base/bootstrap/init/` |
 | `deploy/compose/redis/redis.conf`, `entrypoint.sh` | `deploy/k8s/components/in-cluster-data/redis/` |
 | `deploy/observability/collector.yaml` | `deploy/k8s/base/otel-collector/collector.yaml` |
 | `deploy/observability/collector.prod.yaml` | `deploy/k8s/overlays/prod/collector.prod.yaml` |
@@ -2388,7 +2388,7 @@ spec:
 
 | Job | Image | Runs | Credentials | Notes |
 |---|---|---|---|---|
-| `db-bootstrap` | `postgres:16-alpine` (pinned) | `sh /init/run-init.sh` → `for f in $INIT_FILES; do psql -v ON_ERROR_STOP=1 -f /init/$f; done` | `PGHOST`, `PGUSER`, `PGPASSWORD` (the admin) and every role password, from the `db-bootstrap` Secret | Same SQL as Compose (PAY-606), mounted from the `db-init` ConfigMap generated from the synced copy `deploy/k8s/base/bootstrap/init/` (D8, R32, C36), so `10-identity.sql`'s audit-log revoke (C50) runs on every rotation too. `INIT_FILES`: all six files in dev/uat; prod omits `40-bank-stub.sql`. Run once per environment and again to rotate passwords; `backoffLimit: 2`, `ttlSecondsAfterFinished: 86400` |
+| `db-bootstrap` | `postgres:16-alpine` (pinned) | `sh /init/lib/run-init.sh` → `for f in $INIT_FILES; do psql -v ON_ERROR_STOP=1 -f /init/$f; done` | `PGHOST`, `PGUSER`, `PGPASSWORD` (the admin) and every role password, from the `db-bootstrap` Secret | Same SQL as Compose (PAY-606), mounted from the `db-init` ConfigMap generated from the synced copy `deploy/k8s/base/bootstrap/init/` (D8, R32, C36), so `10-identity.sql`'s audit-log revoke (C50) runs on every rotation too. `INIT_FILES`: all six files in dev/uat; prod omits `40-bank-stub.sql`. Run once per environment and again to rotate passwords; `backoffLimit: 2`, `ttlSecondsAfterFinished: 86400` |
 | `migrate-identity-<version>`, `migrate-payroll-<version>`, `migrate-payouts-<version>` (+ `migrate-bank-stub-<version>` in the bank-stub component) | the service image | `alembic -c /app/alembic.ini upgrade head` | the service's ConfigMap (C1 keys, `COMPANY_ID`) with `DB_USER=<schema>_migrator`, and the `<svc>-migrator` Secret (`DB_PASSWORD`) | Name per version (`nameSuffix` in `base/migrations/kustomization.yaml`, e.g. `-0-1-0`), because a Job's pod template is immutable; `backoffLimit: 1`, `activeDeadlineSeconds: 600`, `ttlSecondsAfterFinished: 604800`; same pod security context as the Deployments |
 | `bootstrap-owner` | identity | `python -m identity.bootstrap_owner --if-empty --email $(OWNER_EMAIL) --company-id $(COMPANY_ID)` | identity ConfigMap with `DB_USER=identity_migrator`, `identity-migrator` Secret | PAY-100, R16. `OWNER_EMAIL` from the overlay's ConfigMap. `--if-empty` exits 0 when users exist, so the Job can be re-applied; no `podFailurePolicy`; `backoffLimit: 2`. uat and prod create a **pending** owner and email the invite; the dev overlay adds `--password-env SEED_OWNER_PASSWORD` (allowed only with `ENV=dev`) and the secret, like Compose |
 
