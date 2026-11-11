@@ -4,7 +4,7 @@
 |---|---|
 | **Severity** | page (possible double payment) |
 | **Service** | payroll |
-| **Alert** | `increase(payroll_late_settlements_total[15m]) > 0` (`deploy/observability/prometheus/rules/alerts.yml`) |
+| **Alert** | `increase(payroll_late_settlements_total[15m]) > 0 or (payroll_late_settlements_total > 0 unless payroll_late_settlements_total offset 15m)` (`deploy/observability/prometheus/rules/alerts.yml`) |
 | **Requirement** | PAY-NFR-02 (a paid payout has exactly one settled transfer); C71 |
 | **Design** | `docs/specs/payrun-0.1/design-low-level-payroll.md` §4.7 "Late settlement" |
 | **Dashboard** | Queues and workers, `http://127.0.0.1:4101/d/payrun-queues` ("Late settlements") |

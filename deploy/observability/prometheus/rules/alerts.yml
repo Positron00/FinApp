@@ -33,7 +33,9 @@ groups:
           runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutSettlementSlow.md"
           dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
       - alert: PayoutDLQ
-        expr: 'increase(queue_messages_total{outcome="dlq"}[15m]) > 0'
+        # The `unless … offset` arm (C75) catches a series whose first exported sample is already
+        # > 0 (a DLQ within a restarted worker's first export interval), which increase() reads as 0.
+        expr: 'increase(queue_messages_total{outcome="dlq"}[15m]) > 0 or (queue_messages_total{outcome="dlq"} > 0 unless queue_messages_total{outcome="dlq"} offset 15m)'
         labels: { severity: page, service_name: payout-worker }
         annotations:
           summary: "Payout messages were dead-lettered in the last 15 minutes"
@@ -50,7 +52,8 @@ groups:
           runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutNeedsOperator.md"
           dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
       - alert: PayoutLateSettlement
-        expr: "increase(payroll_late_settlements_total[15m]) > 0"
+        # C75: the second arm pages when a restarted payroll's first exported sample is already > 0.
+        expr: "increase(payroll_late_settlements_total[15m]) > 0 or (payroll_late_settlements_total > 0 unless payroll_late_settlements_total offset 15m)"
         labels: { severity: page, service_name: payroll }
         annotations:
           summary: "The bank settled a payout attempt that payroll had already rejected or replaced"
@@ -76,7 +79,7 @@ groups:
           runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutStreamNearMaxlen.md"
           dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
       - alert: EmailOutboxStuck
-        expr: "max(identity_email_oldest_pending_age_seconds) > 900 or sum(increase(identity_emails_failed_total[1h])) > 0"
+        expr: "max(identity_email_oldest_pending_age_seconds) > 900 or sum(increase(identity_emails_failed_total[1h])) > 0 or sum(identity_emails_failed_total > 0 unless identity_emails_failed_total offset 1h) > 0"
         for: 5m
         labels: { severity: warning, service_name: identity }
         annotations:

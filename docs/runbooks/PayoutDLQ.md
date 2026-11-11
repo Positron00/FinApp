@@ -4,7 +4,7 @@
 |---|---|
 | **Severity** | page (money may be stuck) |
 | **Service** | payout-worker |
-| **Alert** | `increase(queue_messages_total{outcome="dlq"}[15m]) > 0` (`deploy/observability/prometheus/rules/alerts.yml`) |
+| **Alert** | `increase(queue_messages_total{outcome="dlq"}[15m]) > 0 or (queue_messages_total{outcome="dlq"} > 0 unless queue_messages_total{outcome="dlq"} offset 15m)` (`deploy/observability/prometheus/rules/alerts.yml`) |
 | **Requirement** | PAY-408, PAY-409, PAY-NFR-11; DLQ entry contract `contracts/events/payout.requested.dlq.v1.json` (C21) |
 | **Dashboard** | Queues and workers, `http://127.0.0.1:4101/d/payrun-queues` |
 

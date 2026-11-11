@@ -510,9 +510,9 @@ Loki → Grafana, plus Alertmanager. The BFF records the journey SLI with an exp
   | `BffAvailabilityFastBurn` | page | paging receiver |
   | `BffAvailabilitySlowBurn` | ticket | ticket receiver |
   | `PayoutSettlementSlow` (`max(payroll_runs_processing_oldest_age_seconds) > 60` for 2 m) | page | paging receiver |
-  | `PayoutDLQ` (`increase(queue_messages_total{outcome="dlq"}[15m]) > 0`) | page (money stuck) | paging receiver |
+  | `PayoutDLQ` (`increase(queue_messages_total{outcome="dlq"}[15m]) > 0`, or a new series already above 0, C75) | page (money stuck) | paging receiver |
   | `PayoutNeedsOperator` (`max(payroll_attempts_needs_operator) > 0`) | page | paging receiver |
-  | `PayoutLateSettlement` (`increase(payroll_late_settlements_total[15m]) > 0`; a late `settled` for a rejected or superseded attempt, possible double payment) | page | paging receiver |
+  | `PayoutLateSettlement` (`increase(payroll_late_settlements_total[15m]) > 0`, or a new series above 0 (C75); a late `settled` for a rejected or superseded attempt, possible double payment) | page | paging receiver |
   | `PayoutsStuck` (`max(payroll_payouts_stuck) > 0` for 10 m) | page | paging receiver |
   | `PayoutStreamNearMaxlen` (length > 80% of MAXLEN) | warning | ticket receiver |
   | `EmailOutboxStuck` (oldest pending > 15 m, or `increase(identity_emails_failed_total[1h]) > 0`) | warning | ticket receiver |

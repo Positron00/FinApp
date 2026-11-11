@@ -4,7 +4,7 @@
 |---|---|
 | **Severity** | warning (ticket) |
 | **Service** | identity (email outbox and relay) |
-| **Alert** | `max(identity_email_oldest_pending_age_seconds) > 900 or sum(increase(identity_emails_failed_total[1h])) > 0` for 5 m (`deploy/observability/prometheus/rules/alerts.yml`) |
+| **Alert** | `max(identity_email_oldest_pending_age_seconds) > 900 or sum(increase(identity_emails_failed_total[1h])) > 0 or sum(identity_emails_failed_total > 0 unless identity_emails_failed_total offset 1h) > 0` for 5 m (`deploy/observability/prometheus/rules/alerts.yml`) |
 | **Requirement** | PAY-101, PAY-105 (invite and reset emails), PAY-110 (email delivery); R25, C20 |
 | **Dashboard** | Service overview (`service` = identity), `http://127.0.0.1:4101/d/payrun-service-overview`; Queues and workers ("Identity emails") |
 

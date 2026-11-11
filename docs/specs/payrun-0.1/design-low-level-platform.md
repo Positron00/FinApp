@@ -2129,12 +2129,12 @@ gives NaN, which compares false, so the burn alerts stay quiet when idle.
 | `BffAvailabilityFastBurn` | `sli:bff_errors:ratio_rate1h > (14.4 * 0.005) and sli:bff_errors:ratio_rate5m > (14.4 * 0.005)` | 2m | page | `service_name: web`, `slo: bff-availability` |
 | `BffAvailabilitySlowBurn` | `sli:bff_errors:ratio_rate6h > (6 * 0.005) and sli:bff_errors:ratio_rate30m > (6 * 0.005)` | 15m † | ticket | `service_name: web`, `slo: bff-availability` |
 | `PayoutSettlementSlow` | `max(payroll_runs_processing_oldest_age_seconds) > 60` | 2m | page | `service_name: payroll` |
-| `PayoutDLQ` | `increase(queue_messages_total{outcome="dlq"}[15m]) > 0` | 0m | page | `service_name: payout-worker` |
+| `PayoutDLQ` | `increase(queue_messages_total{outcome="dlq"}[15m]) > 0 or (queue_messages_total{outcome="dlq"} > 0 unless queue_messages_total{outcome="dlq"} offset 15m)` (C75) | 0m | page | `service_name: payout-worker` |
 | `PayoutNeedsOperator` | `max(payroll_attempts_needs_operator) > 0` | 1m † | page | `service_name: payroll` |
-| `PayoutLateSettlement` | `increase(payroll_late_settlements_total[15m]) > 0` | 0m | page | `service_name: payroll`; runbook `docs/runbooks/PayoutLateSettlement.md` (possible double payment) |
+| `PayoutLateSettlement` | `increase(payroll_late_settlements_total[15m]) > 0 or (payroll_late_settlements_total > 0 unless payroll_late_settlements_total offset 15m)` (C75) | 0m | page | `service_name: payroll`; runbook `docs/runbooks/PayoutLateSettlement.md` (possible double payment) |
 | `PayoutsStuck` | `max(payroll_payouts_stuck) > 0` | 10m | page | `service_name: payroll` |
 | `PayoutStreamNearMaxlen` † | `max(redis_stream_length{stream="stream:payout.requested"}) > 0.8 * 100000` | 5m | warning | `service_name: redis` |
-| `EmailOutboxStuck` † | `max(identity_email_oldest_pending_age_seconds) > 900 or sum(increase(identity_emails_failed_total[1h])) > 0` (R25, C20) | 5m | warning | `service_name: identity` |
+| `EmailOutboxStuck` † | `max(identity_email_oldest_pending_age_seconds) > 900 or sum(increase(identity_emails_failed_total[1h])) > 0 or sum(identity_emails_failed_total > 0 unless identity_emails_failed_total offset 1h) > 0` (R25, C20, C75) | 5m | warning | `service_name: identity` |
 | `RateLimiterErrors` † | `sum by (service_name, component) (rate(rate_limiter_errors_total[5m])) > 0` | 5m | warning | — |
 | `OutboxStuck` † | `max by (service_name) (outbox_oldest_age_seconds) > 60` | 1m | warning | — |
 | `ConsumerLagGrowing` † | `max by (stream, group) (queue_consumer_lag) > 0 and max by (stream, group) (deriv(queue_consumer_lag[10m])) > 0` | 10m | warning | `service_name: payout-worker` |
@@ -2147,7 +2147,7 @@ gives NaN, which compares false, so the burn alerts stay quiet when idle.
 
 Notes:
 - **BankErrorRateHigh excludes business rejections by construction:** a bank `rejected` answer is HTTP 2xx, so the resilient client counts it as `outcome="ok"`; business outcomes are counted separately in `payouts_bank_transfers_total{outcome, reason}`.
-- **PayoutDLQ:** the worker pre-initialises `queue_messages_total{outcome="dlq"}` to 0 (C21; payout-worker LLD §3.3). Without that, a counter that first appears at 1 has `increase() = 0` and the alert never fires; a promtool case documents this.
+- **PayoutDLQ:** the worker pre-initialises `queue_messages_total{outcome="dlq"}` to 0 (C21; payout-worker LLD §3.3). That alone isn't enough: a DLQ inside a restarted worker's first export interval reaches Prometheus as a series that starts at 1, which `increase()` reads as 0. The live drill hit exactly this (C75). So the rule also fires on a series above 0 that didn't exist 15 minutes earlier (`unless … offset 15m`); PayoutLateSettlement and EmailOutboxStuck use the same second arm. promtool cases cover both.
 - The `max()` in the payroll gauge alerts collapses replicas, as the plan requires.
 - **EmailOutboxStuck** uses the counter, not a gauge of failed rows, so it clears one hour after the last failure once SMTP is fixed (R25).
 - **PodRestarts** needs kube-state-metrics, a listed cluster dependency (R28). The rule ships in the Kubernetes observability install only, not in the Compose Prometheus; its promtool test still runs in CI.
@@ -2165,7 +2165,7 @@ Example, verbatim in the file:
 
 ```yaml
 - alert: PayoutDLQ
-  expr: increase(queue_messages_total{outcome="dlq"}[15m]) > 0
+  expr: 'increase(queue_messages_total{outcome="dlq"}[15m]) > 0 or (queue_messages_total{outcome="dlq"} > 0 unless queue_messages_total{outcome="dlq"} offset 15m)'
   labels: { severity: page, service_name: payout-worker }
   annotations:
     summary: "Payout messages were dead-lettered in the last 15 minutes"
@@ -2183,7 +2183,7 @@ Example, verbatim in the file:
 | `BffAvailabilityFastBurn` | 10% of `bff_request_duration_seconds_count` are `status="500"` for 70 m (1 h ratio 0.1 > 0.072); expected at 65m with labels and the full annotations | 5% errors (< 0.072), and a 4 m spike of 100% errors (5 m window high, 1 h low); only `/api/readyz` and `/api/livez` failing (C4) |
 | `BffAvailabilitySlowBurn` | 4% errors for 7 h (> 0.03) | 2% errors for 7 h; no traffic (NaN) |
 | `PayoutSettlementSlow` | gauge 0 then 90 for 5 m | 45 for 30 m; 90 for 1 m only |
-| `PayoutDLQ` | counter `0 0 0 1 1 1 …` (pre-initialised) | flat 0; **and the documented pitfall:** a series that first appears at 1 does not fire |
+| `PayoutDLQ` | counter `0 0 0 1 1 1 …` (pre-initialised) | flat 0; a series that first appears at 1 fires, then clears after 15 m (C75) |
 | `PayoutNeedsOperator` | 1 for 3 m (one replica 0, another 1, so `max` matters) | 0 |
 | `PayoutsStuck` | 2 for 12 m | 2 for 8 m, then 0 |
 | `PayoutStreamNearMaxlen` | 85000 for 10 m | 79000 |

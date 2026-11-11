@@ -281,7 +281,7 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "sum(increase(queue_messages_total{outcome=\"dlq\"}[15m]))",
+          "expr": "(sum(increase(queue_messages_total{outcome=\"dlq\"}[15m]) and queue_messages_total{outcome=\"dlq\"} offset 15m) or vector(0)) + (sum(queue_messages_total{outcome=\"dlq\"} unless queue_messages_total{outcome=\"dlq\"} offset 15m) or vector(0))",
           "legendFormat": "dlq in last 15 m (PayoutDLQ)",
           "range": true,
           "exemplar": false
@@ -596,7 +596,7 @@
             "uid": "prometheus"
           },
           "refId": "B",
-          "expr": "sum(increase(identity_emails_failed_total[1h]))",
+          "expr": "(sum(increase(identity_emails_failed_total[1h]) and identity_emails_failed_total offset 1h) or vector(0)) + (sum(identity_emails_failed_total unless identity_emails_failed_total offset 1h) or vector(0))",
           "legendFormat": "failed in last 1 h (C20)",
           "range": true,
           "exemplar": false
@@ -934,7 +934,7 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "sum(increase(payroll_late_settlements_total[15m]))",
+          "expr": "(sum(increase(payroll_late_settlements_total[15m]) and payroll_late_settlements_total offset 15m) or vector(0)) + (sum(payroll_late_settlements_total unless payroll_late_settlements_total offset 15m) or vector(0))",
           "legendFormat": "late settlements in last 15 m",
           "range": true,
           "exemplar": false
