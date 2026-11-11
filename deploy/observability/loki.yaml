@@ -1,0 +1,32 @@
+# Loki 3.x, single binary, native OTLP ingest at /otlp (platform LLD §8.6). Logs are kept 14 days.
+# OTLP log records keep trace_id, span_id and severity_text as structured metadata, so the trace
+# test's query `{service_name=~".+"} | trace_id="<id>"` needs no parser.
+auth_enabled: false
+server: { http_listen_port: 3100 }
+common:
+  path_prefix: /loki
+  replication_factor: 1
+  ring: { kvstore: { store: inmemory } }
+  storage: { filesystem: { chunks_directory: /loki/chunks, rules_directory: /loki/rules } }
+schema_config:
+  configs:
+    - {
+        from: "2026-01-01",
+        store: tsdb,
+        object_store: filesystem,
+        schema: v13,
+        index: { prefix: index_, period: 24h },
+      }
+limits_config:
+  retention_period: 336h
+  allow_structured_metadata: true
+  otlp_config:
+    resource_attributes:
+      attributes_config:
+        - action: index_label
+          attributes: [service.name, deployment.environment.name]
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem
+analytics: { reporting_enabled: false }

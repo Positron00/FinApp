@@ -19,3 +19,10 @@ deploy/observability
 .env.*
 **/*.pem
 ci-logs
+**/e2e
+**/playwright.config.ts
+**/*.tsbuildinfo
+**/.hypothesis
+.coverage
+**/htmlcov
+apps/web/next-env.d.ts

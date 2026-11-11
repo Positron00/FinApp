@@ -1,0 +1,12 @@
+# Dashboards as code (platform LLD §8.7-8.8): read-only, from deploy/observability/grafana/dashboards.
+apiVersion: 1
+providers:
+  - name: PayRun
+    folder: PayRun
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

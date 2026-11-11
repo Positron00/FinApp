@@ -1,0 +1,149 @@
+# Alert rules (platform LLD §8.3; plan §11; PAY-NFR-10, 11). PodRestarts ships only with the
+# Kubernetes observability install (R28); every other alert of plan §11 is here.
+# CollectorDropping matches the counters with and without `_total`: Collector 0.164 exports its
+# own counters unsuffixed (otelcol_exporter_sent_spans) and creates send_failed only on failure.
+groups:
+  - name: payrun-alerts
+    rules:
+      - alert: BffAvailabilityFastBurn
+        expr: "sli:bff_errors:ratio_rate1h > (14.4 * 0.005) and sli:bff_errors:ratio_rate5m > (14.4 * 0.005)"
+        for: 2m
+        labels: { severity: page, service_name: web, slo: bff-availability }
+        annotations:
+          summary: "The BFF is burning its 30-day error budget 14.4x too fast"
+          description: "{{ $value | humanizePercentage }} of BFF requests failed with 5xx over the last hour and 5 minutes. Check the Journeys dashboard for the failing route, then its service's error traces."
+          runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/BffAvailabilityFastBurn.md"
+          dashboard_url: "http://127.0.0.1:4101/d/payrun-journeys"
+      - alert: BffAvailabilitySlowBurn
+        expr: "sli:bff_errors:ratio_rate6h > (6 * 0.005) and sli:bff_errors:ratio_rate30m > (6 * 0.005)"
+        for: 15m
+        labels: { severity: ticket, service_name: web, slo: bff-availability }
+        annotations:
+          summary: "The BFF is burning its 30-day error budget 6x too fast"
+          description: "{{ $value | humanizePercentage }} of BFF requests failed with 5xx over the last 6 hours. Find the route with the highest 5xx ratio on the Journeys dashboard."
+          runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/BffAvailabilitySlowBurn.md"
+          dashboard_url: "http://127.0.0.1:4101/d/payrun-journeys"
+      - alert: PayoutSettlementSlow
+        expr: "max(payroll_runs_processing_oldest_age_seconds) > 60"
+        for: 2m
+        labels: { severity: page, service_name: payroll }
+        annotations:
+          summary: "A pay run has been processing for more than 60 seconds"
+          description: "The oldest processing run is {{ $value | humanizeDuration }} old. Check payout-worker health, consumer lag and the bank dependency."
+          runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutSettlementSlow.md"
+          dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
+      - alert: PayoutDLQ
+        expr: 'increase(queue_messages_total{outcome="dlq"}[15m]) > 0'
+        labels: { severity: page, service_name: payout-worker }
+        annotations:
+          summary: "Payout messages were dead-lettered in the last 15 minutes"
+          description: "{{ $value }} message(s) moved to {{ $labels.stream }}.dlq. Money may be stuck: follow the DLQ replay steps."
+          runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutDLQ.md"
+          dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
+      - alert: PayoutNeedsOperator
+        expr: "max(payroll_attempts_needs_operator) > 0"
+        for: 1m
+        labels: { severity: page, service_name: payroll }
+        annotations:
+          summary: "Payout attempts need an operator decision"
+          description: "{{ $value }} payout attempt(s) are blocked in needs_operator. Check the bank for each before choosing Send again or Mark rejected."
+          runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutNeedsOperator.md"
+          dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
+      - alert: PayoutsStuck
+        expr: "max(payroll_payouts_stuck) > 0"
+        for: 10m
+        labels: { severity: page, service_name: payroll }
+        annotations:
+          summary: "Payouts are stuck without progress"
+          description: "{{ $value }} payout(s) have had no result for longer than PAYOUT_STUCK_AFTER_S. Check the worker, the stream and re-publish counts."
+          runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutsStuck.md"
+          dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
+      - alert: PayoutStreamNearMaxlen
+        expr: 'max(redis_stream_length{stream="stream:payout.requested"}) > 0.8 * 100000'
+        for: 5m
+        labels: { severity: warning, service_name: redis }
+        annotations:
+          summary: "The payout stream is above 80% of STREAM_MAXLEN"
+          description: "stream:payout.requested holds {{ $value }} entries; trimming past 100000 would drop unread messages. Check consumer health and lag."
+          runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutStreamNearMaxlen.md"
+          dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
+      - alert: EmailOutboxStuck
+        expr: "max(identity_email_oldest_pending_age_seconds) > 900 or sum(increase(identity_emails_failed_total[1h])) > 0"
+        for: 5m
+        labels: { severity: warning, service_name: identity }
+        annotations:
+          summary: "Identity emails are stuck or failing"
+          description: "The oldest pending email is old, or emails failed permanently in the last hour ({{ $value }}). Check SMTP connectivity and identity logs."
+          runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/EmailOutboxStuck.md"
+          dashboard_url: "http://127.0.0.1:4101/d/payrun-service-overview"
+      - alert: RateLimiterErrors
+        expr: "sum by (service_name, component) (rate(rate_limiter_errors_total[5m])) > 0"
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "The rate limiter in {{ $labels.service_name }} is failing"
+          description: "Rate-limiter errors in {{ $labels.component }} ({{ $value }}/s). Check Redis reachability from that service."
+          runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/RateLimiterErrors.md"
+          dashboard_url: "http://127.0.0.1:4101/d/payrun-service-overview"
+      - alert: OutboxStuck
+        expr: "max by (service_name) (outbox_oldest_age_seconds) > 60"
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "The {{ $labels.service_name }} outbox is not draining"
+          description: "The oldest unsent outbox row is {{ $value | humanizeDuration }} old. Check the relay and Redis."
+          runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/OutboxStuck.md"
+          dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
+      - alert: ConsumerLagGrowing
+        expr: "max by (stream, group) (queue_consumer_lag) > 0 and max by (stream, group) (deriv(queue_consumer_lag[10m])) > 0"
+        for: 10m
+        labels: { severity: warning, service_name: payout-worker }
+        annotations:
+          summary: "Consumer lag on {{ $labels.stream }} keeps growing"
+          description: "Group {{ $labels.group }} is falling behind. Check worker health, concurrency and bank latency."
+          runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/ConsumerLagGrowing.md"
+          dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
+      - alert: BankBreakerOpen
+        expr: 'max(circuit_breaker_state{target="bank"}) == 2'
+        for: 5m
+        labels: { severity: warning, service_name: payout-worker }
+        annotations:
+          summary: "The bank circuit breaker has been open for 5 minutes"
+          description: "Calls to the bank fail fast. Check the bank dependency dashboard and the bank's status."
+          runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/BankBreakerOpen.md"
+          dashboard_url: "http://127.0.0.1:4101/d/payrun-bank"
+      - alert: BankErrorRateHigh
+        expr: 'provider:external_errors:ratio_rate5m{provider="bank"} > 0.05'
+        for: 10m
+        labels: { severity: warning, service_name: payout-worker }
+        annotations:
+          summary: "More than 5% of bank calls fail"
+          description: "{{ $value | humanizePercentage }} of bank calls failed at the transport or HTTP level (business rejections are not counted)."
+          runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/BankErrorRateHigh.md"
+          dashboard_url: "http://127.0.0.1:4101/d/payrun-bank"
+      - alert: SigninFailuresSpike
+        expr: 'sum(increase(auth_signins_total{outcome="failure"}[15m])) > 50'
+        labels: { severity: warning, service_name: identity }
+        annotations:
+          summary: "Many failed sign-ins in the last 15 minutes"
+          description: "{{ $value }} failed sign-ins in 15 minutes. Check the auth audit log for a credential-stuffing pattern."
+          runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/SigninFailuresSpike.md"
+          dashboard_url: "http://127.0.0.1:4101/d/payrun-service-overview"
+      - alert: RedisMemoryHigh
+        expr: "max(redis_memory_used_bytes / (redis_memory_max_bytes > 0)) > 0.8"
+        for: 5m
+        labels: { severity: warning, service_name: redis }
+        annotations:
+          summary: "Redis memory is above 80% of maxmemory"
+          description: "Redis uses {{ $value | humanizePercentage }} of maxmemory with noeviction: writes will fail when it is full."
+          runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/RedisMemoryHigh.md"
+          dashboard_url: "http://127.0.0.1:4101/d/payrun-platform"
+      - alert: CollectorDropping
+        expr: '(sum(rate({__name__=~"otelcol_exporter_send_failed_spans(_total)?"}[5m])) or vector(0)) + (sum(rate({__name__=~"otelcol_exporter_send_failed_metric_points(_total)?"}[5m])) or vector(0)) + (sum(rate({__name__=~"otelcol_exporter_send_failed_log_records(_total)?"}[5m])) or vector(0)) + (sum(rate({__name__=~"otelcol_receiver_refused_spans(_total)?"}[5m])) or vector(0)) > 0'
+        for: 10m
+        labels: { severity: warning, service_name: otel-collector }
+        annotations:
+          summary: "The OTel Collector is dropping telemetry"
+          description: "Export or receive failures at {{ $value }}/s. Check Tempo, Loki and Prometheus health."
+          runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/CollectorDropping.md"
+          dashboard_url: "http://127.0.0.1:4101/d/payrun-platform"

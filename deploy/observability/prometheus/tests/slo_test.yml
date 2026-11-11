@@ -1,0 +1,36 @@
+# promtool test rules tests/slo_test.yml (platform LLD §8.3; PAY-NFR-04, 10). Run from this folder.
+rule_files: [../rules/recording.yml]
+evaluation_interval: 30s
+tests:
+  - name: 10% BFF 5xx gives a 0.1 error ratio; health and telemetry routes don't count (C4)
+    interval: 30s
+    input_series:
+      - series: 'bff_request_duration_seconds_count{route="/api/pay-runs", status="200"}'
+        values: "0+27x20"
+      - series: 'bff_request_duration_seconds_count{route="/api/pay-runs", status="500"}'
+        values: "0+3x20"
+      - series: 'bff_request_duration_seconds_count{route="/api/readyz", status="503"}'
+        values: "0+50x20"
+      - series: 'bff_request_duration_seconds_count{route="/api/livez", status="500"}'
+        values: "0+50x20"
+      - series: 'bff_request_duration_seconds_count{route="/api/telemetry", status="500"}'
+        values: "0+50x20"
+    promql_expr_test:
+      - expr: sli:bff_errors:ratio_rate5m
+        eval_time: 10m
+        exp_samples:
+          - labels: "sli:bff_errors:ratio_rate5m"
+            value: 0.1
+  - name: dependency error ratio per provider
+    interval: 30s
+    input_series:
+      - series: 'external_requests_total{provider="bank", outcome="ok"}'
+        values: "0+9x20"
+      - series: 'external_requests_total{provider="bank", outcome="timeout"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: provider:external_errors:ratio_rate5m
+        eval_time: 10m
+        exp_samples:
+          - labels: 'provider:external_errors:ratio_rate5m{provider="bank"}'
+            value: 0.1

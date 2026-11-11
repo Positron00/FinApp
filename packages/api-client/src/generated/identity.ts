@@ -269,6 +269,15 @@ export interface operations {
                     "application/json": components["schemas"]["SessionUser"];
                 };
             };
+            /** @description bad_request (a body that is not valid JSON) or the code named by the route */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
             /** @description invalid_token, or invalid_credentials on login */
             401: {
                 headers: {
@@ -349,7 +358,7 @@ export interface operations {
                     "application/json": components["schemas"]["SessionUser"];
                 };
             };
-            /** @description Bad request (see the error code) */
+            /** @description bad_request (a body that is not valid JSON) or the code named by the route */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -436,6 +445,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["UserOut"];
+                };
+            };
+            /** @description bad_request (a body that is not valid JSON) or the code named by the route */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             /** @description invalid_token, or invalid_credentials on login */

@@ -1,0 +1,68 @@
+# OpenTelemetry Collector (platform LLD §8.1; PAY-NFR-04, 09, 10). Used by Compose and the uat overlay.
+# traces -> Tempo (OTLP gRPC), metrics -> Prometheus exporter (scraped on :8889), logs -> Loki OTLP.
+# Late-2026 component names: otlp_grpc, otlp_http, resource_constant_labels.
+extensions:
+  health_check: { endpoint: 0.0.0.0:13133 }
+
+receivers:
+  otlp:
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317 }
+      http: { endpoint: 0.0.0.0:4318, max_request_body_size: 4194304 }
+
+processors:
+  memory_limiter: { check_interval: 1s, limit_percentage: 80, spike_limit_percentage: 25 }
+  batch: { send_batch_size: 1024, timeout: 2s }
+  # Defence in depth for PAY-NFR-07: drop deny-listed attributes, mask token-looking query strings.
+  transform/redact:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - delete_matching_keys(attributes, "(?i).*(password|token|authorization|cookie|account|routing|api_key|secret|salary|amount).*")
+          - replace_pattern(attributes["url.full"], "([?&#](token|code|key)=)[^&#]*", "$$1[REDACTED]")
+          - delete_key(attributes, "url.query")
+    log_statements:
+      - context: log
+        statements:
+          - delete_matching_keys(attributes, "(?i).*(password|token|authorization|cookie|account|routing|api_key|secret|salary|amount).*")
+          - replace_pattern(body, "eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+", "[REDACTED]")
+  resource/env:
+    attributes:
+      - { key: deployment.environment.name, value: dev, action: insert } # only if the SDK didn't set it
+
+exporters:
+  otlp_grpc/tempo: { endpoint: tempo:4317, tls: { insecure: true } }
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    enable_open_metrics: true # exemplars
+    resource_constant_labels:
+      included: ["service.name", "deployment.environment.name"]
+    metric_expiration: 10m
+  otlp_http/loki: { endpoint: http://loki:3100/otlp }
+
+service:
+  extensions: [health_check]
+  telemetry:
+    metrics:
+      readers:
+        - pull: { exporter: { prometheus: { host: 0.0.0.0, port: 8888 } } }
+  pipelines:
+    traces:
+      {
+        receivers: [otlp],
+        processors: [memory_limiter, resource/env, transform/redact, batch],
+        exporters: [otlp_grpc/tempo],
+      }
+    metrics:
+      {
+        receivers: [otlp],
+        processors: [memory_limiter, resource/env, batch],
+        exporters: [prometheus],
+      }
+    logs:
+      {
+        receivers: [otlp],
+        processors: [memory_limiter, resource/env, transform/redact, batch],
+        exporters: [otlp_http/loki],
+      }

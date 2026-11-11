@@ -1,5 +1,6 @@
 """DB engine arguments, error mapping, IDs and lock keys (platform LLD §3.7; PAY-605, PAY-608)."""
 
+import asyncio
 import uuid
 from typing import Any
 
@@ -53,7 +54,9 @@ def test_create_engine_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
             "search_path": "payroll",
         },
         "timeout": 2,
+        "command_timeout": 2.5,
     }
+    assert db.default_db_budget_s() == 4.0
     create_engine(settings, user="payroll_migrator", password=SecretStr("m-pass"))
     assert captured["url"].startswith("postgresql+asyncpg://payroll_migrator:m-pass@pg:5432/")
 
@@ -157,3 +160,131 @@ def test_identifier_checks() -> None:
     assert db._check_ident("payroll", "schema") == "payroll"
     with pytest.raises(ValueError, match="schema"):
         db._check_ident("Pay roll", "schema")
+
+
+# --- the DB time budget (S8 slow-DB finding; PAY-605, HLD §4 "Slow DB") ----------------------
+
+
+class _FakeTx:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+class _FakeSession:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def __aenter__(self) -> _FakeSession:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        self.closed = True
+
+    def begin(self) -> _FakeTx:
+        return _FakeTx()
+
+
+def test_db_budget_is_statement_plus_pool_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The budget follows DB_STATEMENT_TIMEOUT_MS / 1000 + DB_POOL_TIMEOUT_S."""
+    monkeypatch.setattr(db, "create_async_engine", lambda url, **kw: "engine")
+    monkeypatch.setitem(db._budget, "s", 4.0)
+    s = make_settings(db_statement_timeout_ms=1500, db_pool_timeout_s=1.0)
+    assert db.db_budget_s(s) == 2.5
+    create_engine(s)
+    assert db.default_db_budget_s() == 2.5
+
+
+async def test_map_db_errors_budget_is_db_timeout(caplog_json: JsonLogCapture) -> None:
+    """A unit of DB work that outlives its budget ends with 503 db_timeout, on time."""
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    with pytest.raises(DbTimeout), map_db_errors("slow", budget_s=0.05):
+        await asyncio.sleep(5)
+    assert loop.time() - start < 1
+    (logged,) = caplog_json.events("db.timeout")
+    assert logged["operation"] == "slow"
+    task = asyncio.current_task()
+    assert task is not None
+    assert task.cancelling() == 0  # the deadline's own cancellation was taken back
+    await asyncio.sleep(0)  # and the task keeps running normally
+
+
+async def test_map_db_errors_budget_when_driver_rewraps_the_cancellation() -> None:
+    """If the driver turns the deadline's cancellation into its own error, it's still a timeout."""
+
+    async def driver() -> None:
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError as exc:
+            raise sqlalchemy.exc.InterfaceError("SELECT", {}, Exception("cancelled")) from exc
+
+    with pytest.raises(DbTimeout), map_db_errors(budget_s=0.05):
+        await driver()
+
+
+async def test_map_db_errors_within_budget_is_untouched() -> None:
+    with map_db_errors(budget_s=1):
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.06)  # the timer was cancelled: nothing fires later
+
+
+async def test_map_db_errors_outside_cancellation_propagates() -> None:
+    """A cancellation that isn't the budget's (shutdown, client gone) stays a CancelledError."""
+
+    async def work() -> None:
+        with map_db_errors(budget_s=5):
+            await asyncio.sleep(5)
+
+    t = asyncio.create_task(work())
+    await asyncio.sleep(0.01)
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t
+
+
+def test_map_db_errors_without_a_loop_has_no_budget() -> None:
+    """Outside a coroutine (sync callers) there's nothing to cancel, so no deadline is armed."""
+    with map_db_errors(budget_s=0.0):
+        pass
+
+
+async def test_transaction_budget_is_db_timeout(caplog_json: JsonLogCapture) -> None:
+    session = _FakeSession()
+    with pytest.raises(DbTimeout):
+        async with db.transaction(lambda: session, budget_s=0.05):  # type: ignore[arg-type]
+            await asyncio.sleep(5)
+    assert session.closed
+    (logged,) = caplog_json.events("db.timeout")
+    assert logged["operation"] == "transaction"
+
+
+async def test_transaction_uses_the_default_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(db._budget, "s", 0.05)
+    with pytest.raises(DbTimeout):
+        async with db.transaction(_FakeSession):  # type: ignore[arg-type]
+            await asyncio.sleep(5)
+    async with db.transaction(_FakeSession) as s:  # type: ignore[arg-type]
+        assert s is not None
+
+
+async def test_map_db_errors_budget_also_cuts_slow_cleanup() -> None:
+    """Cleanup inside the block (a rollback over the same slow link) is cancelled too, so the
+    whole block ends close to the budget, not budget + cleanup."""
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+
+    async def body() -> None:
+        try:
+            await asyncio.sleep(5)
+        finally:
+            await asyncio.sleep(5)  # stands in for the rollback and connection release
+
+    with pytest.raises(DbTimeout), map_db_errors(budget_s=0.05):
+        await body()
+    assert loop.time() - start < 1
+    task = asyncio.current_task()
+    assert task is not None
+    assert task.cancelling() == 0

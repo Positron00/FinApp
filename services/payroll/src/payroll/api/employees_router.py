@@ -34,7 +34,7 @@ async def list_employees(
     return await svc.list_employees(rt, principal.cid, status=status, cursor=cursor, limit=limit)
 
 
-@router.post("", response_model=EmployeeOut, status_code=201, responses=errors(409))
+@router.post("", response_model=EmployeeOut, status_code=201, responses=errors(400, 409))
 async def create_employee(
     body: EmployeeCreate,
     rt: RT,

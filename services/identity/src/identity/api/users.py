@@ -38,7 +38,7 @@ async def users_me(principal: UserCaller, rt: Runtime) -> MeOut:
     operation_id="users_invite",
     status_code=status.HTTP_201_CREATED,
     response_model=UserOut,
-    responses=errors(403, 409, 429),
+    responses=errors(400, 403, 409, 429),
     summary="Invite a user (admin)",
 )
 async def users_invite(body: InviteUserIn, actor: AdminActor, rt: Runtime, ip: ClientIp) -> UserOut:

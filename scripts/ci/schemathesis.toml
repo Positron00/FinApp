@@ -1,0 +1,16 @@
+# Schemathesis settings for the e2e job (platform LLD §3.15; R30). Used with
+# `schemathesis --config-file scripts/ci/schemathesis.toml run ...` by scripts/ci/schemathesis.sh.
+#
+# Every check runs except two that misread designed behaviour:
+# - positive_data_acceptance: schema-valid but business-invalid input is a documented 4xx
+#   (a random invite token is 400 invite_invalid; an unknown email 422), not a contract break.
+# - negative_data_rejection on bank-stub POST /v1/transfers: a known Idempotency-Key replays the
+#   stored transfer *whatever the body*, before validating it (bank-stub LLD §3.1 step 4, R6), so
+#   Schemathesis' "missing body accepted" case is the replay contract working.
+[checks]
+positive_data_acceptance.enabled = false
+
+[[operations]]
+include-path = "/v1/transfers"
+include-method = "POST"
+checks.negative_data_rejection.enabled = false

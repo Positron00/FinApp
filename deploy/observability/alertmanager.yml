@@ -1,0 +1,33 @@
+# Alertmanager (platform LLD §8.4, ADR 0010). The same file serves every environment: the receiver
+# URLs are read from files that Compose writes into a tmpfs from ALERT_PAGE_WEBHOOK_URL and
+# ALERT_TICKET_WEBHOOK_URL (dev and CI point both at alert-sink), and Kubernetes mounts from a Secret.
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: ticket
+  group_by: [alertname, service_name]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers: ['severity="page"']
+      receiver: page
+      group_wait: 10s
+      repeat_interval: 1h
+    - matchers: ['severity=~"ticket|warning"']
+      receiver: ticket
+
+inhibit_rules:
+  - source_matchers: ['alertname="BffAvailabilityFastBurn"']
+    target_matchers: ['alertname="BffAvailabilitySlowBurn"']
+
+receivers:
+  - name: page
+    webhook_configs:
+      - url_file: /etc/alertmanager/secrets/page_url
+        send_resolved: true
+  - name: ticket
+    webhook_configs:
+      - url_file: /etc/alertmanager/secrets/ticket_url
+        send_resolved: true

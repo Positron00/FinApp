@@ -1,0 +1,41 @@
+# Grafana datasources (platform LLD §8.7): Prometheus exemplars -> Tempo; Tempo trace -> Loki logs;
+# Loki trace_id (structured metadata) -> Tempo. "$$" escapes Grafana's provisioning env expansion.
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      exemplarTraceIdDestinations:
+        - { name: trace_id, datasourceUid: tempo }
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: "-5m"
+        spanEndTimeShift: "5m"
+        customQuery: true
+        query: '{service_name="$${__span.tags["service.name"]}"} | trace_id="$${__trace.traceId}"'
+      tracesToMetrics:
+        datasourceUid: prometheus
+      nodeGraph:
+        enabled: true
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      derivedFields:
+        - name: trace_id
+          matcherType: label # trace_id is structured metadata, not in the line
+          matcherRegex: trace_id
+          datasourceUid: tempo
+          url: "$${__value.raw}"

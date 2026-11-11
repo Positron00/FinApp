@@ -5,7 +5,16 @@
   "description": "One entry of stream:payout.requested.dlq. payout-worker writes it (XADD ... MAXLEN ~ 10000) when it dead-letters a stream:payout.requested message, then XACKs the original. Redis stream fields are strings on the wire; this schema describes the entry after decoding, with delivery_count as an integer. It never contains bank details, names or exception text beyond the redacted summary in error. Sources: README C21, PAY-408, PAY-409.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["envelope", "source_id", "error_kind", "error_code", "error", "delivery_count", "consumer", "failed_at"],
+  "required": [
+    "envelope",
+    "source_id",
+    "error_kind",
+    "error_code",
+    "error",
+    "delivery_count",
+    "consumer",
+    "failed_at"
+  ],
   "properties": {
     "envelope": {
       "description": "The original entry's envelope field, unchanged: the payout.requested v1 envelope as a JSON string. It may be empty or invalid JSON when the original entry was malformed (error_code schema_invalid).",

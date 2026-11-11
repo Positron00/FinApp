@@ -1,0 +1,51 @@
+# SLI recording rules (platform LLD §8.3; PAY-NFR-04, 10). The BFF SLI counts the J1-J5 routes only:
+# every route except the health routes and telemetry (C4). A window with no traffic is NaN, which
+# compares false, so the burn alerts stay quiet when idle.
+groups:
+  - name: slo-bff-availability
+    interval: 30s
+    rules:
+      - record: sli:bff_errors:ratio_rate5m
+        expr: |
+          sum(rate(bff_request_duration_seconds_count{route!~"/api/livez|/api/readyz|/api/telemetry", status=~"5.."}[5m]))
+          /
+          sum(rate(bff_request_duration_seconds_count{route!~"/api/livez|/api/readyz|/api/telemetry"}[5m]))
+      - record: sli:bff_errors:ratio_rate30m
+        expr: |
+          sum(rate(bff_request_duration_seconds_count{route!~"/api/livez|/api/readyz|/api/telemetry", status=~"5.."}[30m]))
+          /
+          sum(rate(bff_request_duration_seconds_count{route!~"/api/livez|/api/readyz|/api/telemetry"}[30m]))
+      - record: sli:bff_errors:ratio_rate1h
+        expr: |
+          sum(rate(bff_request_duration_seconds_count{route!~"/api/livez|/api/readyz|/api/telemetry", status=~"5.."}[1h]))
+          /
+          sum(rate(bff_request_duration_seconds_count{route!~"/api/livez|/api/readyz|/api/telemetry"}[1h]))
+      - record: sli:bff_errors:ratio_rate6h
+        expr: |
+          sum(rate(bff_request_duration_seconds_count{route!~"/api/livez|/api/readyz|/api/telemetry", status=~"5.."}[6h]))
+          /
+          sum(rate(bff_request_duration_seconds_count{route!~"/api/livez|/api/readyz|/api/telemetry"}[6h]))
+  - name: slo-bff-latency
+    interval: 30s
+    rules:
+      - record: sli:bff_latency_p95:5m
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(bff_request_duration_seconds_bucket{route!~"/api/livez|/api/readyz|/api/telemetry|.*/calculate|.*/approve"}[5m])))
+      - record: sli:bff_latency_heavy_p95:5m
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(bff_request_duration_seconds_bucket{route=~".*/calculate|.*/approve"}[5m])))
+  - name: slo-settlement
+    interval: 1m
+    rules:
+      - record: sli:payout_settlement_p95:1h
+        expr: histogram_quantile(0.95, sum by (le) (rate(payroll_payout_settlement_seconds_bucket[1h])))
+  - name: dependencies
+    interval: 30s
+    rules:
+      - record: provider:external_requests:rate5m
+        expr: sum by (provider, outcome) (rate(external_requests_total[5m]))
+      - record: provider:external_errors:ratio_rate5m
+        expr: |
+          sum by (provider) (rate(external_requests_total{outcome!="ok"}[5m]))
+          /
+          sum by (provider) (rate(external_requests_total[5m]))

@@ -123,7 +123,7 @@ log events, metrics and alerts, and adds test layers. Every alerted row has a ru
 | Redis down | Client errors | Session 503; limiter rules; outbox holds | `ratelimit.backend_error` / `rate_limiter_errors_total`, `outbox_unsent` | `OutboxStuck`, `RateLimiterErrors` | PAY-603, 402 |
 | Redis data loss / NOGROUP | NOGROUP error | Recreate the group; re-publish | `queue.group.recreated`, `payout.republished` | `PayoutsStuck` | PAY-407, 408 |
 | Outbox relay crash | Unsent age | Another replica or the restart sends | `outbox.relay.error` / `outbox_oldest_age_seconds` | `OutboxStuck` | PAY-402 |
-| Slow DB (2 s) | Statement timeout | 503 `db_timeout` | `http.request` / `http_server_request_duration_seconds` | `BffAvailabilityFastBurn` | PAY-605, NFR-04 |
+| Slow DB (2 s) | Statement timeout (slow query); asyncpg `command_timeout` and the per-unit DB budget `DB_STATEMENT_TIMEOUT_MS/1000 + DB_POOL_TIMEOUT_S` (slow link) | 503 `db_timeout` within the 4 s budget | `http.request` / `http_server_request_duration_seconds` | `BffAvailabilityFastBurn` | PAY-605, NFR-04 |
 | Postgres down | `/readyz` | 503 `db_unavailable` fast; recovers | `db.unavailable` / `http_server_request_duration_seconds` | `BffAvailabilityFastBurn` | PAY-605 |
 | identity down | BFF client | 503 `service_unavailable`; breaker | `bff.upstream_error` / `circuit_breaker_state` | `BffAvailabilityFastBurn` | PAY-602 |
 | SMTP down | Relay errors | Queued; failed after 10 attempts | `email.send_failed` / `identity_emails_pending`, `identity_emails_failed_total` | `EmailOutboxStuck` | PAY-110 |

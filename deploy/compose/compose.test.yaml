@@ -1,0 +1,85 @@
+# Test override (platform LLD §7.4): used by scripts/stack.sh when the `test` profile is on.
+# - Publishes the service, Tempo, Loki, Prometheus, Alertmanager, alert-sink and Toxiproxy ports on
+#   127.0.0.1 at the APP_PORT_BASE offsets, for host-run tests (Schemathesis, trace test, faults).
+# - Routes runtime DB and Redis traffic (and web/worker -> payroll, worker -> bank) through Toxiproxy.
+#   Migrations, bootstrap-owner and the exporters keep direct connections, so a toxic never breaks
+#   start-up or monitoring. Web -> identity stays direct (identity-down tests stop the container).
+# - Raises the rate limits only (plan §12). Payout timing stays at production values (C53).
+x-limits-raised: &limits-raised
+  SERVICE_RATE_LIMIT_USER: "1000000"
+  SERVICE_RATE_LIMIT_WORKER: "1000000"
+
+x-via-toxiproxy: &via-toxiproxy
+  DB_HOST: toxiproxy
+  DB_PORT: "15432"
+  REDIS_HOST: toxiproxy
+  REDIS_PORT: "16379"
+
+services:
+  identity:
+    environment:
+      <<: [*limits-raised, *via-toxiproxy]
+      AUTH_LOGIN_LIMIT_ACCOUNT: "1000000"
+      AUTH_LOGIN_LIMIT_IP: "1000000"
+    ports: ["127.0.0.1:${IDENTITY_PORT:?}:8000"]
+    depends_on: { toxiproxy: { condition: service_healthy } }
+
+  payroll:
+    environment: { <<: [*limits-raised, *via-toxiproxy] }
+    ports: ["127.0.0.1:${PAYROLL_PORT:?}:8000"]
+    depends_on: { toxiproxy: { condition: service_healthy } }
+
+  payout-worker:
+    environment:
+      <<: *via-toxiproxy
+      PAYOUT_PAYROLL_BASE_URL: http://toxiproxy:18001 # C46
+      BANK_BASE_URL: http://toxiproxy:18002
+    ports: ["127.0.0.1:${PAYOUT_WORKER_PORT:?}:8000"]
+    depends_on: { toxiproxy: { condition: service_healthy } }
+
+  bank-stub:
+    environment:
+      DB_HOST: toxiproxy
+      DB_PORT: "15432"
+      # Deterministic outcomes for the e2e journeys: only accounts ending 0000 are rejected.
+      # The 5% random rejection of the base file would end ~23% of 5-payout runs partially_failed.
+      BANK_STUB_FAILURE_RATE: "0"
+    ports: ["127.0.0.1:${BANK_STUB_PORT:?}:8000"]
+    depends_on: { toxiproxy: { condition: service_healthy } }
+
+  web:
+    environment:
+      PAYROLL_BASE_URL: http://toxiproxy:18001
+      REDIS_HOST: toxiproxy # C1/C12 names; no REDIS_URL
+      REDIS_PORT: "16379"
+      BFF_RATE_LIMIT_SESSION: "1000000"
+      BFF_RATE_LIMIT_IP: "1000000"
+    depends_on: { toxiproxy: { condition: service_healthy } }
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    profiles: [test]
+    restart: unless-stopped
+    command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
+    volumes: ["./toxiproxy.json:/config/toxiproxy.json:ro"]
+    ports: ["127.0.0.1:${TOXIPROXY_PORT:?}:8474"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "/toxiproxy-cli", "list"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_interval: 1s
+      start_period: 30s
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    networks: [payrun]
+
+  tempo: { ports: ["127.0.0.1:${TEMPO_PORT:?}:3200"] }
+  loki: { ports: ["127.0.0.1:${LOKI_PORT:?}:3100"] }
+  prometheus: { ports: ["127.0.0.1:${PROMETHEUS_PORT:?}:9090"] }
+  alertmanager: { ports: ["127.0.0.1:${ALERTMANAGER_PORT:?}:9093"] }
+  alert-sink: { ports: ["127.0.0.1:${ALERT_SINK_PORT:?}:8080"] }

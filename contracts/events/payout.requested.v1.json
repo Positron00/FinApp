@@ -36,7 +36,15 @@
     "data": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["payout_id", "pay_run_id", "company_id", "attempt", "amount_cents", "currency", "republish_seq"],
+      "required": [
+        "payout_id",
+        "pay_run_id",
+        "company_id",
+        "attempt",
+        "amount_cents",
+        "currency",
+        "republish_seq"
+      ],
       "properties": {
         "payout_id": {
           "type": "string",

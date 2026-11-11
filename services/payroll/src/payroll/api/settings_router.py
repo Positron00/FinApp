@@ -28,7 +28,7 @@ async def get_company_settings(
     return await svc.get_settings(rt, principal.cid)
 
 
-@router.put("/settings", response_model=CompanySettingsOut, responses=errors(404, 409))
+@router.put("/settings", response_model=CompanySettingsOut, responses=errors(400, 404, 409))
 async def put_company_settings(
     body: CompanySettingsIn,
     rt: RT,

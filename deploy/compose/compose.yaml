@@ -1,0 +1,584 @@
+# PayRun local stack (platform LLD §7; PAY-NFR-13). Use scripts/stack.sh rather than calling this
+# directly: it adds --env-file .env and, with the test profile, compose.test.yaml.
+#   profiles: core (app + data + Mailpit), obs (OTel Collector + LGTM + alerting), test (Toxiproxy)
+# Every published port binds 127.0.0.1 at an APP_PORT_BASE offset computed by scripts/dev-env.sh.
+# No secret lives here: every credential comes from the git-ignored .env (${VAR:?}).
+name: payrun
+
+x-py-env: &py-env
+  ENV: ${ENV:-dev}
+  APP_VERSION: ${APP_VERSION:-dev}
+  LOG_LEVEL: INFO # any case accepted (C24)
+  COMPANY_ID: ${COMPANY_ID:?run scripts/dev-env.sh} # C28, C47
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_NAME: payrun
+  DB_STATEMENT_TIMEOUT_MS: "2000"
+  DB_POOL_TIMEOUT_S: "2"
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_SOCKET_TIMEOUT_MS: "500"
+  SERVICE_RATE_LIMIT_USER: "600"
+  SERVICE_RATE_LIMIT_WORKER: "6000"
+  BREAKER_FAILURES: "5"
+  BREAKER_RESET_S: "30"
+  MAINTENANCE_INTERVAL_S: "60"
+  RETENTION_OUTBOX_DAYS: "7"
+  RETENTION_PROCESSED_EVENTS_DAYS: "30"
+  RETENTION_TOKENS_DAYS: "7"
+  RETENTION_BANK_DETAILS_DAYS: "30"
+  IDEMPOTENCY_TTL_H: "24"
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  OTEL_TRACES_SAMPLER: parentbased_always_on # C23: every service and environment; no _ARG
+  OTEL_METRIC_EXPORT_INTERVAL: "15000"
+  OTEL_SEMCONV_STABILITY_OPT_IN: http
+
+x-payout-timing: &payout-timing # production timing everywhere (C53)
+  PAYOUT_MAX_DELIVERIES: "5"
+  PAYOUT_CLAIM_MIN_IDLE_MS: "60000"
+  PAYOUT_REPUBLISH_AFTER_S: "360" # README resolution R1
+  PAYOUT_REPUBLISH_MAX_BACKOFF_S: "900"
+  PAYOUT_REPUBLISH_MAX: "10"
+  BANK_TOTAL_DEADLINE_S: "15"
+  PAYOUT_PAYROLL_CALL_DEADLINE_S: "5"
+  PAYOUT_MARK_REJECTED_MIN_WAIT_S: "120" # C48
+
+x-identity-env: &identity-env
+  INTERNAL_JWT_PUBLIC_KEYS: ${IDENTITY_INTERNAL_JWT_PUBLIC_KEYS:?}
+  AUDIT_IP_HASH_KEY: ${AUDIT_IP_HASH_KEY:?}
+  SMTP_HOST: ${SMTP_HOST:-mailpit} # unprefixed infrastructure keys (C49)
+  SMTP_PORT: ${SMTP_PORT:-1025}
+  AUTH_LOGIN_LIMIT_ACCOUNT: "5"
+  AUTH_LOGIN_LIMIT_IP: "20"
+  INVITE_TTL_H: "72"
+  RESET_TTL_H: "1"
+  EMAIL_MAX_ATTEMPTS: "10"
+  IDENTITY_PUBLIC_BASE_URL: http://127.0.0.1:${WEB_PORT:?} # invite and reset links (C12)
+
+x-app: &app
+  restart: unless-stopped
+  pull_policy: never # built locally (scripts/stack.sh runs up --build)
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  networks: [payrun]
+  profiles: [core]
+
+x-one-shot: &one-shot
+  <<: *app
+  restart: "no"
+
+x-py-health: &py-health
+  test:
+    [
+      "CMD",
+      "python",
+      "-c",
+      "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=2).status == 200 else 1)",
+    ]
+  interval: 5s
+  timeout: 3s
+  retries: 6
+  start_period: 20s # ready within 20 s after migrations (PAY-NFR-15)
+  start_interval: 1s
+
+x-build-identity: &build-identity
+  context: ../..
+  dockerfile: deploy/docker/python-service.Dockerfile
+  args: { PACKAGE: identity, SERVICE_DIR: identity, VERSION: "${APP_VERSION:-dev}" }
+x-build-payroll: &build-payroll
+  context: ../..
+  dockerfile: deploy/docker/python-service.Dockerfile
+  args: { PACKAGE: payroll, SERVICE_DIR: payroll, VERSION: "${APP_VERSION:-dev}" }
+x-build-payout-worker: &build-payout-worker
+  context: ../..
+  dockerfile: deploy/docker/python-service.Dockerfile
+  args: { PACKAGE: payout_worker, SERVICE_DIR: payout_worker, VERSION: "${APP_VERSION:-dev}" }
+x-build-bank-stub: &build-bank-stub
+  context: ../..
+  dockerfile: deploy/docker/python-service.Dockerfile
+  args: { PACKAGE: bank_stub, SERVICE_DIR: bank_stub, VERSION: "${APP_VERSION:-dev}" }
+
+services:
+  # ---------------------------------------------------------------- data (core)
+  postgres:
+    image: postgres:16.14-alpine
+    profiles: [core]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: payrun
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      IDENTITY_DB_MIGRATOR_PASSWORD: ${IDENTITY_DB_MIGRATOR_PASSWORD:?}
+      IDENTITY_DB_PASSWORD: ${IDENTITY_DB_PASSWORD:?}
+      PAYROLL_DB_MIGRATOR_PASSWORD: ${PAYROLL_DB_MIGRATOR_PASSWORD:?}
+      PAYROLL_DB_PASSWORD: ${PAYROLL_DB_PASSWORD:?}
+      PAYOUTS_DB_MIGRATOR_PASSWORD: ${PAYOUTS_DB_MIGRATOR_PASSWORD:?}
+      PAYOUTS_DB_PASSWORD: ${PAYOUTS_DB_PASSWORD:?}
+      BANK_STUB_DB_MIGRATOR_PASSWORD: ${BANK_STUB_DB_MIGRATOR_PASSWORD:?}
+      BANK_STUB_DB_PASSWORD: ${BANK_STUB_DB_PASSWORD:?}
+      POSTGRES_EXPORTER_PASSWORD: ${POSTGRES_EXPORTER_PASSWORD:?}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d payrun"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+      start_interval: 1s
+    networks: [payrun]
+
+  redis:
+    image: redis:7.4.11-alpine
+    profiles: [core]
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/usr/local/etc/redis/entrypoint.sh"]
+    environment:
+      REDIS_ADMIN_PASSWORD: ${REDIS_ADMIN_PASSWORD:?}
+      REDIS_WEB_PASSWORD: ${REDIS_WEB_PASSWORD:?}
+      REDIS_IDENTITY_PASSWORD: ${REDIS_IDENTITY_PASSWORD:?}
+      REDIS_PAYROLL_PASSWORD: ${REDIS_PAYROLL_PASSWORD:?}
+      REDIS_PAYOUT_WORKER_PASSWORD: ${REDIS_PAYOUT_WORKER_PASSWORD:?}
+      REDIS_EXPORTER_PASSWORD: ${REDIS_EXPORTER_PASSWORD:?}
+    volumes:
+      - redisdata:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - ./redis/entrypoint.sh:/usr/local/etc/redis/entrypoint.sh:ro
+    # The generated ACL file never touches disk. Owned by the image's redis user (999:1000), which
+    # docker-entrypoint.sh drops to; a root-owned 0700 tmpfs (LLD §7.2) would hide the file from it.
+    tmpfs: ["/run/redis:mode=0700,uid=999,gid=1000"]
+    healthcheck:
+      test: ["CMD-SHELL", 'REDISCLI_AUTH="$$REDIS_ADMIN_PASSWORD" redis-cli ping | grep -q PONG']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_interval: 1s
+      start_period: 10s
+    networks: [payrun]
+
+  mailpit:
+    image: axllent/mailpit:v1.32.0
+    profiles: [core]
+    restart: unless-stopped
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+      MP_MAX_MESSAGES: "5000"
+    ports: ["127.0.0.1:${MAILPIT_PORT:?}:8025"]
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_interval: 1s
+      start_period: 30s
+    networks: [payrun]
+
+  # ---------------------------------------------------------------- one-shots (core)
+  # Migrations run as each schema's migrator role and connect straight to postgres (never through
+  # Toxiproxy), so a toxic can't break start-up.
+  migrate-identity:
+    <<: *one-shot
+    image: payrun/identity:${APP_VERSION:-dev}
+    build: *build-identity
+    command: ["alembic", "-c", "/app/alembic.ini", "upgrade", "head"]
+    environment:
+      <<: *py-env
+      DB_USER: identity_migrator
+      DB_PASSWORD: ${IDENTITY_DB_MIGRATOR_PASSWORD:?}
+      DB_SCHEMA: identity
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  migrate-payroll:
+    <<: *one-shot
+    image: payrun/payroll:${APP_VERSION:-dev}
+    build: *build-payroll
+    command: ["alembic", "-c", "/app/alembic.ini", "upgrade", "head"]
+    environment:
+      <<: *py-env
+      DB_USER: payroll_migrator
+      DB_PASSWORD: ${PAYROLL_DB_MIGRATOR_PASSWORD:?}
+      DB_SCHEMA: payroll
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  migrate-payouts:
+    <<: *one-shot
+    image: payrun/payout-worker:${APP_VERSION:-dev}
+    build: *build-payout-worker
+    command: ["alembic", "-c", "/app/alembic.ini", "upgrade", "head"]
+    environment:
+      <<: *py-env
+      DB_USER: payouts_migrator
+      DB_PASSWORD: ${PAYOUTS_DB_MIGRATOR_PASSWORD:?}
+      DB_SCHEMA: payouts
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  migrate-bank-stub:
+    <<: *one-shot
+    image: payrun/bank-stub:${APP_VERSION:-dev}
+    build: *build-bank-stub
+    command: ["alembic", "-c", "/app/alembic.ini", "upgrade", "head"]
+    environment:
+      <<: *py-env
+      REDIS_HOST: ""
+      DB_USER: bank_stub_migrator
+      DB_PASSWORD: ${BANK_STUB_DB_MIGRATOR_PASSWORD:?}
+      DB_SCHEMA: bank_stub
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  bootstrap-owner:
+    <<: *one-shot
+    image: payrun/identity:${APP_VERSION:-dev}
+    # R16: an active dev owner with SEED_OWNER_PASSWORD; --if-empty exits 0 when users exist, so a
+    # second `stack.sh up` still satisfies service_completed_successfully. No exit-code wrapper.
+    command:
+      [
+        "python",
+        "-m",
+        "identity.bootstrap_owner",
+        "--if-empty",
+        "--email",
+        "${SEED_OWNER_EMAIL:?}",
+        "--company-id",
+        "${COMPANY_ID:?}",
+        "--password-env",
+        "SEED_OWNER_PASSWORD",
+      ]
+    environment:
+      <<: *py-env
+      DB_USER: identity_migrator
+      DB_PASSWORD: ${IDENTITY_DB_MIGRATOR_PASSWORD:?}
+      DB_SCHEMA: identity
+      SEED_OWNER_PASSWORD: ${SEED_OWNER_PASSWORD:?}
+    depends_on:
+      migrate-identity: { condition: service_completed_successfully }
+
+  # ---------------------------------------------------------------- services (core)
+  identity:
+    <<: *app
+    image: payrun/identity:${APP_VERSION:-dev}
+    environment:
+      <<: [*py-env, *identity-env]
+      DB_USER: identity_app
+      DB_PASSWORD: ${IDENTITY_DB_PASSWORD:?}
+      DB_SCHEMA: identity
+      REDIS_USERNAME: identity
+      REDIS_PASSWORD: ${REDIS_IDENTITY_PASSWORD:?}
+    depends_on:
+      migrate-identity: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      mailpit: { condition: service_started }
+    healthcheck: *py-health
+
+  payroll:
+    <<: *app
+    image: payrun/payroll:${APP_VERSION:-dev}
+    environment:
+      <<: [*py-env, *payout-timing]
+      DB_USER: payroll_app
+      DB_PASSWORD: ${PAYROLL_DB_PASSWORD:?}
+      DB_SCHEMA: payroll
+      REDIS_USERNAME: payroll
+      REDIS_PASSWORD: ${REDIS_PAYROLL_PASSWORD:?}
+      INTERNAL_JWT_PUBLIC_KEYS: ${PAYROLL_INTERNAL_JWT_PUBLIC_KEYS:?}
+      PAYROLL_FIELD_KEYS: ${PAYROLL_FIELD_KEYS:?}
+      PAYROLL_FIELD_ACTIVE_KID: ${PAYROLL_FIELD_ACTIVE_KID:?}
+      STREAM_MAXLEN: "100000"
+      PAYOUT_STUCK_AFTER_S: "600"
+      PAYOUT_MAX_ATTEMPTS: "5" # payroll's key (C46)
+    depends_on:
+      migrate-payroll: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    healthcheck: *py-health
+
+  bank-stub:
+    <<: *app
+    image: payrun/bank-stub:${APP_VERSION:-dev}
+    environment:
+      <<: *py-env
+      REDIS_HOST: "" # no Redis and no JWT keyset (use_redis/use_jwt off)
+      DB_USER: bank_stub_app
+      DB_PASSWORD: ${BANK_STUB_DB_PASSWORD:?}
+      DB_SCHEMA: bank_stub
+      BANK_STUB_API_KEY: ${BANK_STUB_API_KEY:?}
+      BANK_STUB_FAILURE_RATE: "0.05"
+      BANK_STUB_LATENCY_MS: "20"
+    depends_on:
+      migrate-bank-stub: { condition: service_completed_successfully }
+    healthcheck: *py-health
+
+  payout-worker:
+    <<: *app
+    image: payrun/payout-worker:${APP_VERSION:-dev}
+    stop_grace_period: 75s
+    environment:
+      <<: [*py-env, *payout-timing]
+      DB_USER: payouts_app
+      DB_PASSWORD: ${PAYOUTS_DB_PASSWORD:?}
+      DB_SCHEMA: payouts
+      REDIS_USERNAME: payout-worker
+      REDIS_PASSWORD: ${REDIS_PAYOUT_WORKER_PASSWORD:?}
+      PAYOUT_CONCURRENCY: "16"
+      PAYOUT_XREAD_BLOCK_MS: "5000"
+      PAYOUT_CONSUMER_GC_IDLE_S: "3600"
+      BANK_KEY_SAFE_WINDOW_S: "86400"
+      PAYOUT_PAYROLL_BASE_URL: http://payroll:8000 # C46
+      PAYOUT_PAYROLL_CONNECT_TIMEOUT_S: "1"
+      PAYOUT_PAYROLL_READ_TIMEOUT_S: "2"
+      PAYOUT_PAYROLL_MAX_RETRIES: "3"
+      BANK_BASE_URL: http://bank-stub:8000
+      BANK_STUB_API_KEY: ${BANK_STUB_API_KEY:?}
+      PAYOUT_WORKER_JWT_PRIVATE_KEY: ${PAYOUT_WORKER_JWT_PRIVATE_KEY:?}
+      PAYOUT_WORKER_JWT_KID: ${PAYOUT_WORKER_JWT_KID:?}
+    depends_on:
+      migrate-payouts: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      payroll: { condition: service_healthy }
+      bank-stub: { condition: service_healthy }
+    healthcheck: *py-health
+
+  web:
+    <<: *app
+    image: payrun/web:${APP_VERSION:-dev}
+    build:
+      context: ../..
+      dockerfile: apps/web/Dockerfile
+      args: { VERSION: "${APP_VERSION:-dev}" }
+    environment:
+      ENV: ${ENV:-dev}
+      APP_VERSION: ${APP_VERSION:-dev}
+      LOG_LEVEL: INFO
+      NODE_ENV: production
+      PORT: "3000" # C4
+      PUBLIC_BASE_URL: http://127.0.0.1:${WEB_PORT:?} # C12
+      IDENTITY_BASE_URL: http://identity:8000
+      PAYROLL_BASE_URL: http://payroll:8000
+      REDIS_HOST: redis # C1, C12: no REDIS_URL
+      REDIS_PORT: "6379"
+      REDIS_USERNAME: web
+      REDIS_PASSWORD: ${REDIS_WEB_PASSWORD:?}
+      COMPANY_ID: ${COMPANY_ID:?}
+      INTERNAL_JWT_PRIVATE_KEY: ${INTERNAL_JWT_PRIVATE_KEY:?}
+      INTERNAL_JWT_KID: ${INTERNAL_JWT_KID:?}
+      SESSION_SECRET: ${SESSION_SECRET:?}
+      SESSION_COOKIE_NAME: sid
+      TRUSTED_PROXY_HOPS: "0"
+      BFF_RATE_LIMIT_SESSION: "120"
+      BFF_RATE_LIMIT_IP: "300"
+      SESSION_IDLE_TTL_S: "43200"
+      SESSION_ABS_TTL_S: "604800"
+      SESSION_ROLE_RECHECK_S: "60"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_SAMPLER: parentbased_always_on # C23
+      OTEL_METRIC_EXPORT_INTERVAL: "15000"
+    ports: ["127.0.0.1:${WEB_PORT:?}:3000"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/api/readyz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+      start_interval: 1s
+    depends_on:
+      identity: { condition: service_healthy }
+      payroll: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      bootstrap-owner: { condition: service_completed_successfully }
+
+  # ---------------------------------------------------------------- observability (obs)
+  # No core service depends on these: telemetry loss never blocks the app (exporters retry, drop).
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.164.0
+    profiles: [obs]
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes: ["../observability/collector.yaml:/etc/otelcol-contrib/config.yaml:ro"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # The image has no shell or HTTP client, so there is no healthcheck; --wait waits for "running".
+    networks: [payrun]
+
+  tempo:
+    image: grafana/tempo:2.10.9
+    profiles: [obs]
+    restart: unless-stopped
+    user: "10001:10001"
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ../observability/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    networks: [payrun]
+
+  loki:
+    image: grafana/loki:3.7.9
+    profiles: [obs]
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ../observability/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    networks: [payrun]
+
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    profiles: [obs]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --enable-feature=exemplar-storage
+      - --web.enable-lifecycle
+    volumes:
+      - ../observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../observability/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_interval: 1s
+      start_period: 30s
+    networks: [payrun]
+
+  alert-sink:
+    image: python:3.14.9-slim-trixie
+    profiles: [obs]
+    restart: unless-stopped
+    user: "65534:65534"
+    command: ["python", "/app/alert_sink.py"]
+    volumes: ["../observability/alert-sink/alert_sink.py:/app/alert_sink.py:ro"]
+    environment: { PYTHONDONTWRITEBYTECODE: "1", PYTHONUNBUFFERED: "1" }
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).status == 200 else 1)",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_interval: 1s
+      start_period: 30s
+    networks: [payrun]
+
+  alertmanager:
+    image: prom/alertmanager:v0.34.1
+    profiles: [obs]
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        printf %s "$$ALERT_PAGE_WEBHOOK_URL" > /etc/alertmanager/secrets/page_url &&
+        printf %s "$$ALERT_TICKET_WEBHOOK_URL" > /etc/alertmanager/secrets/ticket_url &&
+        exec /bin/alertmanager --config.file=/etc/alertmanager/alertmanager.yml --storage.path=/alertmanager
+    environment:
+      ALERT_PAGE_WEBHOOK_URL: ${ALERT_PAGE_WEBHOOK_URL:?}
+      ALERT_TICKET_WEBHOOK_URL: ${ALERT_TICKET_WEBHOOK_URL:?}
+    volumes: ["../observability/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro"]
+    tmpfs: ["/etc/alertmanager/secrets:mode=1777", "/alertmanager:mode=1777"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9093/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_interval: 1s
+      start_period: 30s
+    depends_on:
+      alert-sink: { condition: service_healthy }
+    networks: [payrun]
+
+  grafana:
+    image: grafana/grafana:13.2.5
+    profiles: [obs]
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_SERVER_ROOT_URL: http://127.0.0.1:${GRAFANA_PORT:?}
+    volumes:
+      - ../observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["127.0.0.1:${GRAFANA_PORT:?}:3000"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_interval: 1s
+      start_period: 30s
+    depends_on:
+      prometheus: { condition: service_healthy }
+      tempo: { condition: service_started }
+      loki: { condition: service_started }
+    networks: [payrun]
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.20.1
+    profiles: [obs]
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_URI: postgres:5432/payrun?sslmode=disable
+      DATA_SOURCE_USER: postgres_exporter
+      DATA_SOURCE_PASS: ${POSTGRES_EXPORTER_PASSWORD:?}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [payrun]
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.95.0
+    profiles: [obs]
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: redis://redis:6379
+      REDIS_USER: exporter
+      REDIS_PASSWORD: ${REDIS_EXPORTER_PASSWORD:?}
+      REDIS_EXPORTER_CHECK_SINGLE_STREAMS: stream:payout.requested,stream:payout.requested.dlq
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      redis: { condition: service_healthy }
+    networks: [payrun]
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+  prometheus-data: {}
+  tempo-data: {}
+  loki-data: {}
+  grafana-data: {}
+
+networks:
+  payrun: {}

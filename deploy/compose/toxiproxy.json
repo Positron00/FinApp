@@ -1,0 +1,6 @@
+[
+  { "name": "postgres", "listen": "0.0.0.0:15432", "upstream": "postgres:5432", "enabled": true },
+  { "name": "redis", "listen": "0.0.0.0:16379", "upstream": "redis:6379", "enabled": true },
+  { "name": "payroll", "listen": "0.0.0.0:18001", "upstream": "payroll:8000", "enabled": true },
+  { "name": "bank-stub", "listen": "0.0.0.0:18002", "upstream": "bank-stub:8000", "enabled": true }
+]

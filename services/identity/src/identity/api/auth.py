@@ -18,7 +18,7 @@ router = APIRouter(prefix="/v1/auth", tags=["auth"])
     "/login",
     operation_id="auth_login",
     response_model=SessionUser,
-    responses=errors(403, 429),
+    responses=errors(400, 403, 429),
     summary="Sign in with email and password (caller: service:web)",
 )
 async def auth_login(

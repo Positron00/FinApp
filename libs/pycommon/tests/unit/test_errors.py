@@ -206,6 +206,35 @@ def test_starlette_404_and_405(client: TestClient) -> None:
     assert "allow" in wrong.headers
 
 
+def test_405_allow_lists_every_route_on_the_path() -> None:
+    """RFC 9110: ``Allow`` names every method of the path, not only the first matching route's
+    (S8 Schemathesis ST205: ``OPTIONS /v1/company/settings`` said ``Allow: GET`` without PUT)."""
+    r = APIRouter()
+
+    @r.get("/things/{thing_id}")
+    async def get_thing(thing_id: int) -> dict[str, int]:
+        return {"id": thing_id}
+
+    @r.put("/things/{thing_id}")
+    async def put_thing(thing_id: int) -> dict[str, int]:
+        return {"id": thing_id}
+
+    @r.post("/things/{thing_id}/archive")
+    async def archive(thing_id: int) -> dict[str, int]:
+        return {"id": thing_id}
+
+    app = create_app(make_settings(), public_routers=[r], use_db=False, use_redis=False,
+                     use_jwt=False, instrument=False)  # fmt: skip
+    with TestClient(app, raise_server_exceptions=False) as c:
+        for method in ("OPTIONS", "DELETE", "PATCH"):
+            resp = c.request(method, "/things/7")
+            assert resp.status_code == 405
+            assert _error(resp)["code"] == "method_not_allowed"
+            assert resp.headers["allow"] == "GET, PUT"
+        resp = c.get("/things/7/archive")
+        assert resp.headers["allow"] == "POST"
+
+
 @pytest.mark.parametrize(
     ("kind", "code", "event"),
     [

@@ -438,6 +438,16 @@
             },
             "description": "Successful Response"
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "bad_request (a body that is not valid JSON) or the code named by the route"
+          },
           "401": {
             "content": {
               "application/json": {
@@ -556,7 +566,7 @@
                 }
               }
             },
-            "description": "Bad request (see the error code)"
+            "description": "bad_request (a body that is not valid JSON) or the code named by the route"
           },
           "401": {
             "content": {
@@ -667,6 +677,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "bad_request (a body that is not valid JSON) or the code named by the route"
           },
           "401": {
             "content": {

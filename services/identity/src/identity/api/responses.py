@@ -9,7 +9,7 @@ from pycommon.errors import ErrorBody
 __all__ = ["errors"]
 
 _DESCRIPTIONS: dict[int, str] = {
-    400: "Bad request (see the error code)",
+    400: "bad_request (a body that is not valid JSON) or the code named by the route",
     401: "invalid_token, or invalid_credentials on login",
     403: "forbidden_role",
     404: "Not found (see the error code)",

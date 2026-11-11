@@ -62,7 +62,7 @@ async def list_pay_runs(
     return await reads.list_runs(rt, principal.cid, status=status, cursor=cursor, limit=limit)
 
 
-@router.post("", response_model=PayRunOut, status_code=201, responses=errors(409))
+@router.post("", response_model=PayRunOut, status_code=201, responses=errors(400, 409))
 async def create_pay_run(body: PayRunCreate, rt: RT, principal: PayrollAdmin) -> PayRunOut:
     return await create_svc.create_run(rt, principal, body)
 

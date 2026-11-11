@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 from opentelemetry import trace
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.routing import Match
 
 from pycommon.logging import get_logger, log_event, request_id_var
 
@@ -301,12 +302,38 @@ async def _validation_handler(request: Request, exc: Exception) -> JSONResponse:
     )
 
 
+_PROBE_METHODS: Final = ("DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT")
+
+
+def allowed_methods(request: Request) -> list[str]:
+    """Every method some route fully matches at this path (RFC 9110 §15.5.6 ``Allow``).
+
+    Starlette builds ``Allow`` from the first route that matched the path only, so a path served
+    by two routes (``GET`` and ``PUT`` on ``/v1/company/settings``) answered ``Allow: GET``. Each
+    method is probed with the app's own route matching, which also sees FastAPI's included
+    routers and their prefixes.
+    """
+    routes = request.app.router.routes
+    allowed = []
+    for method in _PROBE_METHODS:
+        scope = {**request.scope, "method": method}
+        if any(route.matches(scope)[0] == Match.FULL for route in routes):
+            allowed.append(method)
+    return allowed
+
+
 async def _http_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     err = cast(StarletteHTTPException, exc)
     code, message = _STATUS_CODES.get(err.status_code, ("http_error", "The request failed."))
     if err.status_code >= 500 and err.status_code not in _STATUS_CODES:
         code, message = "internal_error", INTERNAL_MESSAGE
-    return error_response(err.status_code, code, message, headers=err.headers)
+    headers = dict(err.headers or {})
+    if err.status_code == 405:
+        methods = allowed_methods(request)
+        if methods:
+            headers = {k: v for k, v in headers.items() if k.lower() != "allow"}
+            headers["Allow"] = ", ".join(methods)
+    return error_response(err.status_code, code, message, headers=headers)
 
 
 def db_error_response(request: Request, exc: BaseException) -> JSONResponse | None:

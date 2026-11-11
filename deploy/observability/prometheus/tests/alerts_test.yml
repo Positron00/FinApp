@@ -1,0 +1,89 @@
+# promtool test rules tests/alerts_test.yml (platform LLD §8.3; PAY-NFR-10, 11). Run from this
+# folder. S8 covers a first set; the remaining fires/quiet cases of §8.3 land with H2.
+rule_files: [../rules/recording.yml, ../rules/alerts.yml]
+evaluation_interval: 30s
+tests:
+  - name: PayoutDLQ fires on a pre-initialised counter (C21)
+    interval: 1m
+    input_series:
+      - series: 'queue_messages_total{service_name="payout-worker", stream="stream:payout.requested", outcome="dlq"}'
+        values: "0 0 0 1 1 1 1 1"
+    alert_rule_test:
+      - alertname: PayoutDLQ
+        eval_time: 5m
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              service_name: payout-worker
+              stream: stream:payout.requested
+              outcome: dlq
+            exp_annotations:
+              summary: "Payout messages were dead-lettered in the last 15 minutes"
+              description: "1 message(s) moved to stream:payout.requested.dlq. Money may be stuck: follow the DLQ replay steps."
+              runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutDLQ.md"
+              dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
+  - name: PayoutDLQ stays quiet when flat, and misses a series that first appears at 1 (pitfall)
+    interval: 1m
+    input_series:
+      - series: 'queue_messages_total{service_name="payout-worker", stream="a", outcome="dlq"}'
+        values: "0 0 0 0 0 0"
+      - series: 'queue_messages_total{service_name="payout-worker", stream="b", outcome="dlq"}'
+        values: "_ _ _ 1 1 1"
+    alert_rule_test:
+      - alertname: PayoutDLQ
+        eval_time: 5m
+        exp_alerts: []
+  - name: BffAvailabilityFastBurn fires at 10% errors for 70 minutes
+    interval: 1m
+    input_series:
+      - series: 'bff_request_duration_seconds_count{route="/api/pay-runs", status="200"}'
+        values: "0+90x70"
+      - series: 'bff_request_duration_seconds_count{route="/api/pay-runs", status="500"}'
+        values: "0+10x70"
+    alert_rule_test:
+      - alertname: BffAvailabilityFastBurn
+        eval_time: 65m
+        exp_alerts:
+          - exp_labels: { severity: page, service_name: web, slo: bff-availability }
+            exp_annotations:
+              summary: "The BFF is burning its 30-day error budget 14.4x too fast"
+              description: "10% of BFF requests failed with 5xx over the last hour and 5 minutes. Check the Journeys dashboard for the failing route, then its service's error traces."
+              runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/BffAvailabilityFastBurn.md"
+              dashboard_url: "http://127.0.0.1:4101/d/payrun-journeys"
+  - name: BffAvailabilityFastBurn stays quiet when only health routes fail (C4)
+    interval: 1m
+    input_series:
+      - series: 'bff_request_duration_seconds_count{route="/api/pay-runs", status="200"}'
+        values: "0+90x70"
+      - series: 'bff_request_duration_seconds_count{route="/api/readyz", status="503"}'
+        values: "0+50x70"
+      - series: 'bff_request_duration_seconds_count{route="/api/livez", status="500"}'
+        values: "0+50x70"
+    alert_rule_test:
+      - alertname: BffAvailabilityFastBurn
+        eval_time: 65m
+        exp_alerts: []
+  - name: CollectorDropping fires on Collector 0.164's unsuffixed send_failed counter
+    interval: 1m
+    input_series:
+      - series: 'otelcol_exporter_send_failed_spans{exporter="otlp_grpc/tempo"}'
+        values: "0+5x20"
+    alert_rule_test:
+      - alertname: CollectorDropping
+        eval_time: 16m
+        exp_alerts:
+          - exp_labels: { severity: warning, service_name: otel-collector }
+            exp_annotations:
+              summary: "The OTel Collector is dropping telemetry"
+              description: "Export or receive failures at 0.08333333333333333/s. Check Tempo, Loki and Prometheus health."
+              runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/CollectorDropping.md"
+              dashboard_url: "http://127.0.0.1:4101/d/payrun-platform"
+  - name: CollectorDropping stays quiet with no failure series at all (or vector(0))
+    interval: 1m
+    input_series:
+      - series: 'otelcol_exporter_sent_spans{exporter="otlp_grpc/tempo"}'
+        values: "0+100x20"
+    alert_rule_test:
+      - alertname: CollectorDropping
+        eval_time: 16m
+        exp_alerts: []

@@ -919,9 +919,10 @@ def create_engine(settings: BaseServiceSettings, *, user: str | None = None,
                   password: SecretStr | None = None) -> AsyncEngine
 def session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]
 @asynccontextmanager
-async def transaction(sf: async_sessionmaker[AsyncSession]) -> AsyncIterator[AsyncSession]
+async def transaction(sf: async_sessionmaker[AsyncSession], *, budget_s: float | None = None) -> AsyncIterator[AsyncSession]
 @contextmanager
-def map_db_errors(operation: str = "db") -> Iterator[None]   # raises DbTimeout / DbUnavailable / ValidationFailed (22021)
+def map_db_errors(operation: str = "db", *, budget_s: float | None = None) -> Iterator[None]   # raises DbTimeout / DbUnavailable / ValidationFailed (22021)
+def db_budget_s(settings: BaseServiceSettings) -> float   # DB_STATEMENT_TIMEOUT_MS / 1000 + DB_POOL_TIMEOUT_S; create_engine records it as the default
 def new_id() -> UUID                                  # uuid.uuid7() (Python 3.14 stdlib)
 def advisory_lock_key(name: str) -> int               # signed 64-bit from sha256(name)[:8]
 class Base(DeclarativeBase): ...
@@ -937,8 +938,17 @@ that reject NUL in their request models never reach that path; it's the defence 
 `create_engine` uses `postgresql+asyncpg`, `pool_size`, `max_overflow`, `pool_timeout = DB_POOL_TIMEOUT_S`,
 `pool_pre_ping = True`, `pool_recycle = 1800`, and `connect_args = {"server_settings": {"statement_timeout":
 str(DB_STATEMENT_TIMEOUT_MS), "lock_timeout": "1000", "idle_in_transaction_session_timeout": "10000",
-"application_name": service_name, "search_path": db_schema}, "timeout": 2}`. So a slow DB yields
-`QueryCanceledError` at 2 s, mapped to 503 `db_timeout`; a dead DB yields a fast connect failure,
+"application_name": service_name, "search_path": db_schema}, "timeout": 2, "command_timeout":
+DB_STATEMENT_TIMEOUT_MS / 1000 + 0.5}`. Timeouts come from three layers, all mapped to 503 `db_timeout`:
+a slow *query* is cancelled by Postgres at `DB_STATEMENT_TIMEOUT_MS` (`QueryCanceledError`); a slow
+*link* (network latency, a stalled server) isn't visible to `statement_timeout`, which bounds only
+server-side execution, so asyncpg's per-command `command_timeout` bounds each command; and the whole
+unit of DB work in `transaction()` / `map_db_errors()` has a budget of `DB_STATEMENT_TIMEOUT_MS / 1000 +
+DB_POOL_TIMEOUT_S` (4 s), cleanup included. The budget behaves like `asyncio.timeout` but keeps
+cancelling until the block exits, so the rollback and connection release can't wait on the slow link
+again; SQLAlchemy terminates a connection whose release is cancelled. Without the budget, ~10 slow
+round trips (pre-ping, prepare, execute, commit) took ~20 s at 2 s latency and then succeeded (S8
+finding, `tests/resilience/test_slow_db.py`, pycommon `test_db_slow_link.py`). A dead DB yields a fast connect failure,
 mapped to 503 `db_unavailable`, and `pool_pre_ping` discards broken connections after recovery
 (the "no stuck pool connections" row of plan §12.1). `run_alembic_env` is called from each
 service's `migrations/env.py`; it reads the migrator credentials from `DB_USER` / `DB_PASSWORD`.

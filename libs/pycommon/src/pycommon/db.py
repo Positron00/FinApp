@@ -1,7 +1,15 @@
 """Async engine, sessions, error mapping, IDs and the Alembic env helper (platform LLD §3.7).
 
-A slow DB yields ``QueryCanceledError`` at ``DB_STATEMENT_TIMEOUT_MS`` (503 ``db_timeout``); a
-dead DB yields a fast connect failure (503 ``db_unavailable``); ``pool_pre_ping`` drops broken
+Timeouts (503 ``db_timeout``) come from three layers:
+
+- a slow *query* is cancelled by Postgres at ``DB_STATEMENT_TIMEOUT_MS`` (``QueryCanceledError``);
+- a slow *link* (network latency, a stalled server) is caught by asyncpg's per-command
+  ``command_timeout`` (statement timeout + 0.5 s), which the server-side timeout can't see;
+- the whole unit of DB work in :func:`transaction` / :func:`map_db_errors` has a budget of
+  ``DB_STATEMENT_TIMEOUT_MS / 1000 + DB_POOL_TIMEOUT_S``, so many slow round trips (pre-ping,
+  prepare, execute, commit) can't add up past it (S8 slow-DB finding).
+
+A dead DB yields a fast connect failure (503 ``db_unavailable``); ``pool_pre_ping`` drops broken
 connections.
 """
 
@@ -48,6 +56,8 @@ __all__ = [
     "TimestampMixin",
     "advisory_lock_key",
     "create_engine",
+    "db_budget_s",
+    "default_db_budget_s",
     "map_db_errors",
     "new_id",
     "run_alembic_env",
@@ -61,11 +71,26 @@ POOL_RECYCLE_S: Final = 1800
 LOCK_TIMEOUT_MS: Final = 1000
 IDLE_IN_TRANSACTION_TIMEOUT_MS: Final = 10000
 CONNECT_TIMEOUT_S: Final = 2
+COMMAND_TIMEOUT_MARGIN_S: Final = 0.5  # lets Postgres' own statement_timeout answer first
+
+# The default budget for transaction() and map_db_errors(): the code defaults (2 s statement
+# timeout + 2 s pool timeout) until create_engine() records the service's settings.
+_budget: dict[str, float] = {"s": 4.0}
+
+
+def db_budget_s(settings: BaseServiceSettings) -> float:
+    """``DB_STATEMENT_TIMEOUT_MS / 1000 + DB_POOL_TIMEOUT_S``: one unit of DB work's time budget."""
+    return settings.db_statement_timeout_ms / 1000 + settings.db_pool_timeout_s
+
+
+def default_db_budget_s() -> float:
+    return _budget["s"]
 
 
 def create_engine(
     settings: BaseServiceSettings, *, user: str | None = None, password: SecretStr | None = None
 ) -> AsyncEngine:
+    _budget["s"] = db_budget_s(settings)
     return create_async_engine(
         settings.db_url(user=user, password=password),
         pool_size=settings.db_pool_size,
@@ -82,6 +107,8 @@ def create_engine(
                 "search_path": settings.db_schema,
             },
             "timeout": CONNECT_TIMEOUT_S,
+            # Per-command client-side bound: latency on the link isn't seen by statement_timeout.
+            "command_timeout": settings.db_statement_timeout_ms / 1000 + COMMAND_TIMEOUT_MARGIN_S,
         },
     )
 
@@ -91,24 +118,109 @@ def session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
 
 
 @asynccontextmanager
-async def transaction(sf: async_sessionmaker[AsyncSession]) -> AsyncIterator[AsyncSession]:
-    """One session in one transaction: committed on success, rolled back on error."""
-    async with sf() as session, session.begin():
-        yield session
+async def transaction(
+    sf: async_sessionmaker[AsyncSession], *, budget_s: float | None = None
+) -> AsyncIterator[AsyncSession]:
+    """One session in one transaction: committed on success, rolled back on error.
+
+    The block, commit and cleanup included, must finish within ``budget_s`` (default: the
+    service's ``DB_STATEMENT_TIMEOUT_MS / 1000 + DB_POOL_TIMEOUT_S``), else 503 ``db_timeout``;
+    driver errors are mapped as in :func:`map_db_errors`, which provides the deadline. That
+    deadline behaves like ``asyncio.timeout`` but keeps cancelling until the block has exited,
+    so the rollback and connection release can't wait on a slow link a second time
+    (``asyncio.timeout`` cancels once, and its cleanup then took ~4 s more at 2 s latency).
+    """
+    with map_db_errors("transaction", budget_s=budget_s):
+        async with sf() as session, session.begin():
+            yield session
+
+
+class _Deadline:
+    """``asyncio.timeout`` for a *synchronous* ``with`` block inside a coroutine.
+
+    ``map_db_errors`` is a plain context manager (callers write ``with map_db_errors(): async
+    with …``), so it can't ``async with asyncio.timeout``. This does what ``asyncio.Timeout``
+    does: cancel the current task at the deadline, and on exit take its cancellations back
+    (``Task.uncancel``); a cancellation from anywhere else still propagates.
+
+    Unlike ``asyncio.Timeout`` it keeps cancelling every ``RECANCEL_S`` until the block exits:
+    the block's own cleanup (rollback, returning the connection to the pool) would otherwise
+    wait on the same slow link. SQLAlchemy terminates a connection whose release is cancelled.
+    """
+
+    RECANCEL_S: Final = 0.05
+
+    def __init__(self, budget_s: float) -> None:
+        self.expired = False
+        self._closed = False
+        self._own_cancel = False
+        self._task = asyncio.current_task()
+        self._handle: asyncio.TimerHandle | None = None
+        self._cancelling = 0
+        self._cancels = 0
+        if self._task is not None:
+            self._cancelling = self._task.cancelling()
+            self._handle = asyncio.get_running_loop().call_later(budget_s, self._expire)
+
+    def _expire(self) -> None:
+        if self._closed or self._task is None or self._task.done():
+            return
+        self.expired = True
+        self._cancels += 1
+        self._task.cancel()
+        self._handle = asyncio.get_running_loop().call_later(self.RECANCEL_S, self._expire)
+
+    def close(self, exc: BaseException | None) -> bool:
+        """Stop the timer. True when ``exc`` is this deadline's own cancellation. Idempotent."""
+        if not self._closed:
+            self._closed = True
+            if self._handle is not None:
+                self._handle.cancel()
+            if self.expired and self._task is not None:
+                left = self._task.cancelling()
+                for _ in range(self._cancels):
+                    left = self._task.uncancel()
+                self._own_cancel = left <= self._cancelling and isinstance(
+                    exc, asyncio.CancelledError
+                )
+        return self._own_cancel
+
+
+def _in_coroutine() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return asyncio.current_task() is not None
 
 
 @contextmanager
-def map_db_errors(operation: str = "db") -> Iterator[None]:
+def map_db_errors(operation: str = "db", *, budget_s: float | None = None) -> Iterator[None]:
     """Map driver timeouts to ``DbTimeout`` and connection failures to ``DbUnavailable``.
 
     The block is a DB call, so a bare ``OSError``/``TimeoutError`` in it counts as a DB error.
     Text Postgres rejects (SQLSTATE 22021, e.g. a NUL byte) becomes 422 ``validation_error`` (C63).
+    Inside a coroutine the block also has a time budget (``budget_s``, default the service's
+    ``DB_STATEMENT_TIMEOUT_MS / 1000 + DB_POOL_TIMEOUT_S``): past it, 503 ``db_timeout``.
     """
+    budget = default_db_budget_s() if budget_s is None else budget_s
+    deadline = _Deadline(budget) if _in_coroutine() else None
     try:
         yield
-    except DbTimeout, DbUnavailable, ValidationFailed:
-        raise
-    except Exception as exc:
+    except BaseException as exc:
+        own_cancel = deadline is not None and deadline.close(exc)
+        if own_cancel or (
+            deadline is not None
+            and deadline.expired
+            and not isinstance(exc, asyncio.CancelledError)
+        ):
+            # The budget ran out (the driver may have turned the cancellation into its own error).
+            log_event(_log, logging.WARNING, "db.timeout", operation=operation, budget_s=budget)
+            raise DbTimeout() from exc
+        if not isinstance(exc, Exception) or isinstance(
+            exc, DbTimeout | DbUnavailable | ValidationFailed
+        ):
+            raise
         if is_invalid_text(exc):
             raise ValidationFailed(details=[dict(d) for d in INVALID_TEXT_DETAILS]) from exc
         kind = db_error_kind(exc, in_db_call=True)
@@ -119,6 +231,9 @@ def map_db_errors(operation: str = "db") -> Iterator[None]:
             log_event(_log, logging.WARNING, "db.unavailable", operation=operation)
             raise DbUnavailable() from exc
         raise
+    finally:
+        if deadline is not None:
+            deadline.close(None)
 
 
 def new_id() -> UUID:
