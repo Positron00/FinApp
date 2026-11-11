@@ -308,7 +308,7 @@ sequenceDiagram
 2. The approver calls `POST /v1/pay-runs/{id}/payouts/{pid}/retry`.
    - Only a payout whose current attempt was **definitely rejected by the bank** (`failed`) can be retried. An `indeterminate` attempt never can.
    - The retry creates attempt n+1 (`payout_attempts` row), snapshots the current bank details, writes an outbox event, and moves the run back to `processing`.
-   - With dual approval on, the retrier must not be the last editor of that employee's bank details. Otherwise 403 `approver_must_differ` ([ADR 0005](../adr/0005-four-eyes-approval.md)).
+   - With dual approval on, the retrier must not have an unvetted bank-detail change on that employee, nor have marked the payout's last attempt rejected (C73). Otherwise 403 `approver_must_differ` ([ADR 0005](../adr/0005-four-eyes-approval.md)).
 3. The flow continues as in J4.
 
 **Failure paths:**
@@ -406,7 +406,7 @@ payroll's internal API rather than as events ([ADR 0003](../adr/0003-payout-flow
   | Edit company settings, view payroll audit | ✓ | | |
   | Manage employees and bank details | | ✓ | |
   | Create, edit hours, calculate, delete runs | | ✓ | |
-  | Approve runs, retry payouts, resolve blocked payouts (PAY-502) | | | ✓ (with dual approval on: not the calculator, nor the last bank-detail editor of an affected employee; ADR 0005) |
+  | Approve runs, retry payouts, resolve blocked payouts (PAY-502) | | | ✓ (with dual approval on: not the run's creator, calculator or an hours editor, nor the editor of an affected employee's unvetted bank change; ADR 0005 as amended by C73) |
   | View runs, payslips, employees (including salaries) | ✓ | ✓ | ✓ |
 
   All three roles can see salaries; this is recorded as a decision in [ADR 0002](../adr/0002-sign-in-and-roles.md).

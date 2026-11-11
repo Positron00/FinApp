@@ -8,7 +8,7 @@
 # bank down then up, bank timeout after settling, bank-stub restart, payroll down, Redis down,
 # Redis FLUSHALL, Redis restart (PAY-NFR-15), Postgres down, slow DB, identity down, SMTP down.
 # Payout timing is production's (C53), so the bank-down, payroll-down and FLUSHALL tests each wait
-# out a re-publish (about 8 minutes); the whole suite takes about 35 minutes. Fails if any test
+# out a re-publish (about 8 minutes); the whole suite takes about 28 minutes (27.6 measured 2026-11-11). Fails if any test
 # is skipped: a skip here means the stack wasn't reachable, which would hide the gate. --durations
 # prints the slowest tests, for the job's timeout (C70).
 # shellcheck source=scripts/ci/lib.sh disable=SC1091  # followed with -x; single-file runs (pre-commit) cannot

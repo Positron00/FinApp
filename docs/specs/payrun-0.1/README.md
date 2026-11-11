@@ -1,6 +1,6 @@
 # Spec: PayRun 0.1.0
 
-Status: v1.1 aligned with plan v1.3 (2026-11-10; S1–S7 done; Step 5 alignment review folded in; F1–F6 done on `release/0.1.0`; decision tables R1–R37 and C1–C70; traceability clean) · Source plan: [`docs/plan/architecture-plan.md`](../../plan/architecture-plan.md) · Base: `main` at `0b082dc` (initial commit) · Release: 0.1.0
+Status: v1.1 aligned with plan v1.3 (2026-11-10; S1–S7 done; Step 5 alignment review folded in; F1–F6, H1 and the H2 drills done and H3 security fixes applied on `release/0.1.0`; decision tables R1–R37 and C1–C75; traceability clean) · Source plan: [`docs/plan/architecture-plan.md`](../../plan/architecture-plan.md) · Base: `main` at `0b082dc` (initial commit) · Release: 0.1.0
 
 ## What this work does
 
@@ -36,7 +36,7 @@ employee may ever be paid twice, and every payout must reach a final state (plan
 | [`../../../contracts/events/payout.requested.v1.json`](../../../contracts/events/payout.requested.v1.json) | Event schema |
 | [`../../../contracts/events/payout.requested.dlq.v1.json`](../../../contracts/events/payout.requested.dlq.v1.json) | DLQ entry schema (C21) |
 | [`../../../contracts/events/examples/`](../../../contracts/events/examples/) | Event and DLQ examples, validated by `contract.sh` and read by the contract tests (C57) |
-| [`../../adr/`](../../adr/) | ADRs 0001–0012; they rank between `requirements.md` and the designs |
+| [`../../adr/`](../../adr/) | ADRs 0001–0013; they rank between `requirements.md` and the designs |
 
 Requirements say *what*; the designs say *how*; tasks say *in what order*. When documents
 disagree, the order is: the Contract decisions table (C), then the Spec resolutions table (R), then `requirements.md`, then the ADRs, then the designs, then the plan.

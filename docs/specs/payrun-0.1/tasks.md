@@ -1,6 +1,6 @@
 # Tasks: PayRun 0.1.0
 
-Status (2026-11-11): skeleton done (CI green on main). Step 4 on `release/0.1.0`: F1–F6 done; H1 next.
+Status (2026-11-11): skeleton done (CI green on main). Step 4 on `release/0.1.0`: F1–F6 and H1 done; H2 drills done; H3 security fixes done; the nightly run (H2 load and soak, H3) and R1 are in progress.
 Feature, hardening and release tasks (F*, H*, R1) run on `release/0.1.0`.
 
 **Rules for every task:**

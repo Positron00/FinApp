@@ -15,7 +15,7 @@ The worker moved at least one message from `stream:payout.requested` to `stream:
 - **at once** when it is poison (`error_kind = invalid`): schema-invalid (`schema_invalid`), the payout does not exist (`payout_not_found`), or the instruction's amount, currency or IDs differ from the event (`amount_mismatch`). When the IDs are readable the worker first reports the attempt as poison, which moves it to `needs_operator` (PayoutNeedsOperator follows);
 - **after `PAYOUT_MAX_DELIVERIES` (5) deliveries** when payroll keeps failing (`error_kind = payroll`) or the worker hits an internal error (`internal`). Those attempts stay `requested`, and payroll re-publishes them after `PAYOUT_REPUBLISH_AFTER_S` (360 s).
 
-The counter is pre-initialised at 0 (C21), so the first dead letter after a restart fires the alert. It clears 15 minutes after the last one.
+The counter is pre-initialised at 0 (C21), but a dead letter inside a restarted worker's first export interval still reaches Prometheus as a series that starts at 1. The rule's second arm (`unless … offset 15m`, C75) catches that, so the first dead letter after a restart pages too. It clears 15 minutes after the last one.
 
 ## Impact
 
