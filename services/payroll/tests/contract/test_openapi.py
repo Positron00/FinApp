@@ -32,6 +32,12 @@ EXPECTED: dict[tuple[str, str], tuple[str | None, str, str | None]] = {
     ("get", "/v1/pay-runs/{run_id}/payslips"): (None, "200", "Page_PayslipOut_"),
     ("get", "/v1/pay-runs/{run_id}/payslips/{payslip_id}"): (None, "200", "PayslipOut"),
     ("get", "/v1/pay-runs/{run_id}/payouts"): (None, "200", "Page_PayoutOut_"),
+    ("post", "/v1/pay-runs/{run_id}/payouts/{payout_id}/retry"): (None, "200", "PayoutOut"),
+    ("post", "/v1/pay-runs/{run_id}/payouts/{payout_id}/resolve"): (
+        "ResolveIn",
+        "200",
+        "PayoutOut",
+    ),
     ("get", "/v1/internal/payouts/{payout_id}/instruction"): (None, "200", "InstructionOut"),
     ("post", "/v1/internal/payouts/{payout_id}/result"): ("ResultIn", "200", "ResultOut"),
 }
@@ -51,7 +57,8 @@ def test_committed_spec_is_current(spec: dict[str, Any]) -> None:
 
 
 def test_routes_models_and_error_responses(spec: dict[str, Any]) -> None:
-    """PAY-NFR-12, PAY-602, PAY-203, PAY-301, PAY-304: exactly the S5, F2 and F3 routes, each
+    """PAY-NFR-12, PAY-602, PAY-203, PAY-301, PAY-304, PAY-500, PAY-502: exactly the S5, F2, F3
+    and F4a routes, each
     with its models (DELETE is 204 with no body), and every error status documented with the
     shared ErrorBody schema."""
     paths = {p: ops for p, ops in spec["paths"].items() if p not in HEALTH}
@@ -108,3 +115,22 @@ def test_pay_run_mutation_error_codes_are_documented(spec: dict[str, Any]) -> No
     assert schemas["HoursOut"]["properties"]["status"]["const"] == "draft"
     bound = schemas["HoursEntry"]["properties"]["hours_hundredths"]
     assert (bound["minimum"], bound["maximum"]) == (0, 74_400)
+
+
+def test_retry_and_resolve_contract(spec: dict[str, Any]) -> None:
+    """PAY-500, PAY-502, C34, C52, C48: retry takes an optional, pattern-checked Idempotency-Key
+    and documents 404 and 409 (no 400: the key is optional and there is no body); resolve takes
+    ResolveIn (action enum, note 1-500) and documents 400, 404 and 409 (resolve_too_early)."""
+    retry = spec["paths"]["/v1/pay-runs/{run_id}/payouts/{payout_id}/retry"]["post"]
+    [header] = [p for p in retry["parameters"] if p["in"] == "header"]
+    assert (header["name"], header.get("required", False)) == ("Idempotency-Key", False)
+    assert json.dumps(header["schema"]).count("A-Za-z0-9._:-") == 1
+    assert {"404", "409"} <= set(retry["responses"])
+    resolve = spec["paths"]["/v1/pay-runs/{run_id}/payouts/{payout_id}/resolve"]["post"]
+    assert {"400", "404", "409", "422"} <= set(resolve["responses"])
+    schema = spec["components"]["schemas"]["ResolveIn"]
+    assert schema["required"] == ["action", "note"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["action"]["enum"] == ["redrive", "mark_rejected"]
+    note = schema["properties"]["note"]
+    assert (note["minLength"], note["maxLength"]) == (1, 500)

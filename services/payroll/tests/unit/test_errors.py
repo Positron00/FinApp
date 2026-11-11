@@ -29,9 +29,13 @@ from payroll.domain import (
     NoEmployees,
     NotFound,
     NotHourly,
+    PayoutNotBlocked,
+    PayoutNotRetryable,
     PayRunExists,
     PayRunLocked,
     PayRunNotApprovable,
+    ResolveTooEarly,
+    RetryLimitReached,
 )
 from payroll.services.common import DecryptFailed, decrypt_or_500
 from pycommon.errors import install_handlers
@@ -74,6 +78,11 @@ CASES: list[tuple[DomainError, int, str, Any]] = [
     (InvalidCursor(), 422, "validation_error", [{"field": "query.cursor", "issue": "invalid_cursor"}]),
     (InvalidFields([("body.bank_account", "required_on_reactivation")] * 2), 422, "validation_error",
      [{"field": "body.bank_account", "issue": "required_on_reactivation"}]),
+    (PayoutNotRetryable("requested", "indeterminate"), 409, "payout_not_retryable",
+     {"payout_status": "requested", "attempt_status": "indeterminate"}),
+    (RetryLimitReached(5, 5), 409, "retry_limit_reached", {"current_attempt": 5, "max_attempts": 5}),
+    (PayoutNotBlocked("settled"), 409, "payout_not_blocked", {"attempt_status": "settled"}),
+    (ResolveTooEarly(37), 409, "resolve_too_early", {"retry_after_s": 37}),
 ]  # fmt: skip
 
 
@@ -115,3 +124,20 @@ def test_decrypt_failure_logs_and_is_internal_error(caplog_json: JsonLogCapture)
     assert (err.value.status, err.value.code) == (500, "internal_error")
     [event] = caplog_json.events("crypto.decrypt_failed")
     assert (event["kid"], event["entity"], event["entity_id"]) == ("k1", "employee", str(entity_id))
+
+
+async def test_resolve_too_early_sets_retry_after() -> None:
+    """PAY-502, C48: resolve_too_early carries Retry-After (whole seconds, at least 1)."""
+    app = FastAPI()
+    install_handlers(app)
+    install_domain_handler(app)
+
+    @app.get("/boom")
+    async def boom() -> None:
+        raise ResolveTooEarly(0)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://t"
+    ) as client:
+        r = await client.get("/boom")
+    assert (r.status_code, r.headers["retry-after"]) == (409, "1")

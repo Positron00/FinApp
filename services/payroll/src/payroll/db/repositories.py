@@ -328,6 +328,42 @@ class PayoutRepo:
         return row
 
     @staticmethod
+    async def lock_in_run(
+        session: AsyncSession, company_id: UUID, run_id: UUID, payout_id: UUID
+    ) -> Payout:
+        """``FOR UPDATE`` (lock order 4); a payout of another run or company is 404."""
+        stmt = (
+            select(Payout)
+            .where(
+                Payout.id == payout_id,
+                Payout.pay_run_id == run_id,
+                Payout.company_id == company_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        row = (await session.scalars(stmt)).first()
+        if row is None:
+            raise NotFound("payout_not_found")
+        return row
+
+    @staticmethod
+    async def with_name(
+        session: AsyncSession, company_id: UUID, payout_id: UUID
+    ) -> tuple[Payout, str]:
+        """The payout (fresh values) and its payslip's ``employee_name``."""
+        stmt = (
+            select(Payout, Payslip.employee_name)
+            .join(Payslip, Payslip.id == Payout.payslip_id)
+            .where(Payout.id == payout_id, Payout.company_id == company_id)
+            .execution_options(populate_existing=True)
+        )
+        row = (await session.execute(stmt)).first()
+        if row is None:  # pragma: no cover  (callers hold the payout)
+            raise NotFound("payout_not_found")
+        return row[0], row[1]
+
+    @staticmethod
     async def statuses(session: AsyncSession, company_id: UUID, run_id: UUID) -> list[str]:
         stmt = select(Payout.status).where(
             Payout.pay_run_id == run_id, Payout.company_id == company_id
@@ -396,6 +432,7 @@ class AttemptRepo:
                 PayoutAttempt.company_id == company_id,
             )
             .order_by(PayoutAttempt.payout_id, PayoutAttempt.attempt)
+            .execution_options(populate_existing=True)
         )
         for a in (await session.scalars(stmt)).all():
             out[a.payout_id].append(a)

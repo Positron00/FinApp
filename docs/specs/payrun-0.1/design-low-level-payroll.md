@@ -1,6 +1,6 @@
 # Low-level design: payroll service
 
-Status: draft v4, 2026-11-11 (F2 payroll setup; S5 review fixes, C63) · Sources: [architecture plan](../../plan/architecture-plan.md) v1.2 (accepted 2026-11-10), [requirements](requirements.md), [high-level design](design-high-level.md), the [spec README](README.md) "Spec resolutions" (R1–R37) and "Contract decisions" (C1–C63) tables, ADRs [0003](../../adr/0003-payout-flow.md), [0004](../../adr/0004-bank-details-at-rest.md), [0005](../../adr/0005-four-eyes-approval.md), [0006](../../adr/0006-money-and-rounding.md) · Event contracts: [`contracts/events/payout.requested.v1.json`](../../../contracts/events/payout.requested.v1.json), [`contracts/events/payout.requested.dlq.v1.json`](../../../contracts/events/payout.requested.dlq.v1.json) (written by payout-worker)
+Status: draft v5, 2026-11-11 (F4a payout robustness; F3; F2 payroll setup; S5 review fixes, C63) · Sources: [architecture plan](../../plan/architecture-plan.md) v1.2 (accepted 2026-11-10), [requirements](requirements.md), [high-level design](design-high-level.md), the [spec README](README.md) "Spec resolutions" (R1–R37) and "Contract decisions" (C1–C63) tables, ADRs [0003](../../adr/0003-payout-flow.md), [0004](../../adr/0004-bank-details-at-rest.md), [0005](../../adr/0005-four-eyes-approval.md), [0006](../../adr/0006-money-and-rounding.md) · Event contracts: [`contracts/events/payout.requested.v1.json`](../../../contracts/events/payout.requested.v1.json), [`contracts/events/payout.requested.dlq.v1.json`](../../../contracts/events/payout.requested.dlq.v1.json) (written by payout-worker)
 
 This document is the contract between the payroll implementers, the payout-worker team (§4.6, §4.7, §5)
 and the web team (§4.2–§4.5). Precedence: the README C-table, then the R-table, then `requirements.md`,
@@ -27,7 +27,7 @@ All paths are under `services/payroll/`. The package is `payroll`.
 | `src/payroll/main.py` | new | `create_app()` calls `pycommon.create_app(settings)` (OTel, request logging, 256 KB body limit, error handlers, JWT auth dependency, `/livez`, `/readyz`). It then mounts the routers and registers the lifespan tasks (outbox relay, maintenance runner) and the collection-time gauge callbacks (§7.2). |
 | `src/payroll/settings.py` | new | `Settings(pycommon.settings.BaseServiceSettings)`: inherits the shared `DB_*`, `REDIS_*` and other pycommon keys (C1), and adds the payroll-only `PAYROLL_*` keys and the shared `PAYOUT_*` timing keys (§6). `STARTUP_CHECKS`, the payroll extras passed to pycommon's `run_startup_checks` (§6.2). |
 | `src/payroll/crypto.py` | new | `FieldKeyring` (AES-256-GCM field encryption, kid rotation) and `FieldDecryptError` (§3.6). |
-| `src/payroll/metrics.py` | new | Every OTel instrument in §7.2, plus `register_collection_gauges(sync_engine)` (the collection-time gauge callbacks, including `outbox_*`; C18). |
+| `src/payroll/metrics.py` | new | Every OTel instrument in §7.2, plus `PayrollGaugeSource` and `register_collection_gauges(source)` (the collection-time gauge callbacks, including `outbox_*`; C18). |
 | `src/payroll/maintenance.py` | new | `build_maintenance(ctx) -> pycommon.maintenance.MaintenanceRunner` with lock name `payroll:maintenance` and the tasks `republish`, `purge_outbox`, `purge_idempotency_keys` and `purge_bank_details` (§5.3, §5.4). |
 | `src/payroll/api/__init__.py` | new | `routers: list[APIRouter]`. |
 | `src/payroll/api/deps.py` | new | `require_web_user`, `require_worker`, `require_roles(*roles)` (§8), `get_runtime`, the `IdempotencyHeader` parameter (pattern-checked, so a malformed key is 422) and `idem_request(...)`, which raises 400 `idempotency_key_required` and builds the §4.8 scope and hash. |
@@ -51,7 +51,7 @@ All paths are under `services/payroll/`. The package is `payroll`.
 | `src/payroll/domain/validation.py` | new | `aba_checksum_ok`, `is_monday` and the IANA timezone check. |
 | `src/payroll/domain/employees.py` | new (F2) | The PATCH rules that need the stored row (§4.3): `merge_pay_basis` (merged pay basis, the other type's amount cleared) and `check_bank_completeness` (all-or-none bank columns, `required_on_reactivation`). Raise `InvalidFields`. |
 | `src/payroll/db/models.py` | new | SQLAlchemy 2.0 declarative models for the 10 tables in §2 (`__table_args__ = {"schema": "payroll"}`). |
-| `src/payroll/db/session.py` | new | `session_scope(sessions, operation)`: one READ COMMITTED transaction, with pycommon's DB error mapping. The async engine and sessionmaker come from `pycommon.create_app` (asyncpg; `DB_*` keys; `statement_timeout` = `DB_STATEMENT_TIMEOUT_MS`, pool timeout `DB_POOL_TIMEOUT_S`). The sync engine for the collection-time gauges (psycopg, pool size 1) arrives with them in F4a. |
+| `src/payroll/db/session.py` | new | `session_scope(sessions, operation)`: one READ COMMITTED transaction, with pycommon's DB error mapping. The async engine and sessionmaker come from `pycommon.create_app` (asyncpg; `DB_*` keys; `statement_timeout` = `DB_STATEMENT_TIMEOUT_MS`, pool timeout `DB_POOL_TIMEOUT_S`). The collection-time gauges use their own one-connection engine on a private loop thread (`metrics.PayrollGaugeSource`, §7.2; F4a). |
 | `src/payroll/db/repositories.py` | new | `SettingsRepo`, `EmployeeRepo`, `PayRunRepo`, `PayslipRepo`, `HoursRepo`, `PayoutRepo`, `AttemptRepo`, `AuditRepo`, `OutboxRepo`, `IdempotencyRepo`. Every method takes `company_id` first and uses bound parameters only. |
 | `src/payroll/events/envelope.py` | new | `build_payout_requested(...)` and `validate_envelope(...)` (against the committed JSON Schema) (§5.1). |
 | `src/payroll/events/outbox.py` | new | `OutboxWriter.add_payout_requested(session, ...)`. It runs inside the caller's transaction and wakes the local relay after commit. |
@@ -645,14 +645,14 @@ def check_retry_dual(*, require_dual_approval: bool, retrier_id: str, bank_updat
 ### 3.5 `domain/retry.py` (PAY-500, PAY-407)
 
 ```python
-def check_retry(*, payout_status: PayoutStatus, attempt_status: AttemptStatus, current_attempt: int,
-                max_attempts: int, employee_active: bool, employee_has_bank: bool) -> None:
+def check_retry(*, payout_status: PayoutStatus, attempt_status: AttemptStatus | None, current_attempt: int,
+                max_attempts: int, employee_id: UUID, employee_active: bool, employee_has_bank: bool) -> None:
     if payout_status is not PayoutStatus.FAILED or attempt_status is not AttemptStatus.REJECTED:
         raise PayoutNotRetryable()                 # covers indeterminate and needs_operator attempts
     if current_attempt >= max_attempts:            # 5 including the first: refused at current_attempt = 5
         raise RetryLimitReached()
     if not (employee_active and employee_has_bank):
-        raise EmployeeBankDetailsMissing(employee_ids=[...])
+        raise EmployeeBankDetailsMissing(employee_ids=[employee_id])
     # the caller then runs check_retry_dual(...)
 
 def republish_backoff_s(publish_count: int, *, after_s: int, max_backoff_s: int) -> int:
@@ -688,9 +688,13 @@ class ResolveAction(StrEnum):
 
 OPERATOR_REJECTED: Final = "operator_rejected"
 
-def check_resolve(*, payout_status: PayoutStatus, attempt_status: AttemptStatus) -> None:
+def check_resolve(*, payout_status: PayoutStatus, attempt_status: AttemptStatus | None) -> None:
     if payout_status is not PayoutStatus.REQUESTED or attempt_status is not AttemptStatus.NEEDS_OPERATOR:
-        raise PayoutNotBlocked(attempt_status=attempt_status)
+        raise PayoutNotBlocked(attempt_status=attempt_status)    # None for a no_transfer payout
+
+def check_mark_rejected_wait(*, needs_operator_at: datetime, now: datetime, min_wait_s: int) -> None:
+    # ResolveTooEarly(retry_after_s = the whole seconds left, rounded up, at least 1) while
+    # now - needs_operator_at < min_wait_s (C48)
 
 @dataclass(frozen=True, slots=True)
 class ResolveTransition:
@@ -705,7 +709,7 @@ def resolve_transition(action: ResolveAction) -> ResolveTransition: ...
 ```
 
 - **redrive:** attempt → `requested`, `failure_reason = NULL`, `publish_count = 1`, `last_published_at = now()` (C13); `requested_at` is **not** changed, because it dates the bank key for the key safe window (PAY-410). A new outbox row with a fresh `event_id` and `republish_seq = 0`. The payout stays `requested`. The same bank key `<payout_id>:<attempt>` is used, so a redrive can't pay twice.
-- **mark_rejected:** allowed only when `now() − needs_operator_at ≥ PAYOUT_MARK_REJECTED_MIN_WAIT_S` (120 s, C48); earlier gives `ResolveTooEarly` → 409 `resolve_too_early` with `Retry-After`. Then attempt → `rejected`, `failure_reason = "operator_rejected"`, `final_at = now()`; payout → `failed`, `final_at = now()`. The normal retry (PAY-500) is then open, subject to `check_retry`.
+- **mark_rejected:** allowed only when `now − needs_operator_at ≥ PAYOUT_MARK_REJECTED_MIN_WAIT_S` (120 s, C48), checked by `check_mark_rejected_wait` under the attempt row lock; earlier gives `ResolveTooEarly` → 409 `resolve_too_early` with `Retry-After` (and `details.retry_after_s`). "now" is `Runtime.clock` **[decision, F4a]** (see §5.3). Then attempt → `rejected`, `failure_reason = "operator_rejected"`, `final_at = now()`; payout → `failed`, `final_at = now()`. The normal retry (PAY-500) is then open, subject to `check_retry`.
 - Either action is followed by `run_status_from_payouts` (PAY-406).
 - `check_resolve` runs after the locks are taken (§4.10). Any other state → `PayoutNotBlocked` (409 `payout_not_blocked`).
 
@@ -921,8 +925,8 @@ Rules (settled in F2):
 | `GET /v1/pay-runs/{run_id}/payslips?cursor=&limit=` | any | query: `cursor: str \| None`, `limit: Limit = 50` | 200 `Page[PayslipOut]`, ordered by `employee_name, id` (C8) | 404 `pay_run_not_found`, 422 |
 | `GET /v1/pay-runs/{run_id}/payslips/{payslip_id}` | any | — | 200 `PayslipOut` | 404 `pay_run_not_found`, 404 `payslip_not_found` |
 | `GET /v1/pay-runs/{run_id}/payouts?status=&cursor=&limit=` | any | query: `status: PayoutStatus \| None`, `cursor: str \| None`, `limit: Limit = 50` | 200 `Page[PayoutOut]`, ordered by the payslip's `employee_name`, then `id` (C8) | 404 `pay_run_not_found`, 422 |
-| `POST /v1/pay-runs/{run_id}/payouts/{payout_id}/retry` | approver | optional header `Idempotency-Key` **[decision]**, no body | 200 `PayoutOut` | 404 `pay_run_not_found`, 404 `payout_not_found`, 409 `payout_not_retryable`, 409 `retry_limit_reached`, 409 `employee_bank_details_missing`, 403 `approver_must_differ`, 422 `idempotency_key_reused`, 422 `validation_error` (malformed key) |
-| `POST /v1/pay-runs/{run_id}/payouts/{payout_id}/resolve` | approver | `ResolveIn`; no `Idempotency-Key` (a repeat finds the attempt no longer blocked) | 200 `PayoutOut` | 404 `pay_run_not_found`, 404 `payout_not_found`, 409 `payout_not_blocked`, 409 `resolve_too_early` (with `Retry-After`; mark_rejected within `PAYOUT_MARK_REJECTED_MIN_WAIT_S`, C48), 422 `validation_error` (unknown action, missing or too long note) |
+| `POST /v1/pay-runs/{run_id}/payouts/{payout_id}/retry` | approver | optional header `Idempotency-Key` **[decision]**, no body (so no 400) | 200 `PayoutOut` (with the attempt history; a replay carries `Idempotent-Replayed: true`) | 404 `pay_run_not_found`, 404 `payout_not_found`, 409 `payout_not_retryable`, 409 `retry_limit_reached`, 409 `employee_bank_details_missing`, 403 `approver_must_differ`, 422 `idempotency_key_reused`, 422 `validation_error` (malformed key) |
+| `POST /v1/pay-runs/{run_id}/payouts/{payout_id}/resolve` | approver | `ResolveIn`; no `Idempotency-Key` (a repeat finds the attempt no longer blocked) | 200 `PayoutOut` | 400 `bad_request` (body not JSON), 404 `pay_run_not_found`, 404 `payout_not_found`, 409 `payout_not_blocked`, 409 `resolve_too_early` (with `Retry-After`; mark_rejected within `PAYOUT_MARK_REJECTED_MIN_WAIT_S`, C48), 422 `validation_error` (unknown action, missing or too long note) |
 
 ```python
 class PayRunCreate(BaseModel):
@@ -1023,7 +1027,7 @@ class PayoutOut(BaseModel):               # the web Payout schema mirrors it fie
 
 class ResolveIn(BaseModel):              # PAY-502, R8
     action: Literal["redrive", "mark_rejected"]
-    note: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
+    note: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500), NoNul]
 ```
 
 `PayslipOut` amount fields are NULL while the payslip is `pending`, and it has no `schedule` field (C5).
@@ -1086,8 +1090,8 @@ class ResolveIn(BaseModel):              # PAY-502, R8
   1. Lock the run (`FOR UPDATE`), then the payout (`FOR UPDATE`), then the current attempt (`FOR UPDATE`), the same order as retry and result (§4.10).
   2. `check_resolve(payout_status, attempt_status)` → 409 `payout_not_blocked` unless the current attempt is `needs_operator`.
   3. Apply `resolve_transition(action)` (§3.5a) with conditional updates:
-     - **redrive:** `UPDATE payout_attempts SET status='requested', failure_reason=NULL, publish_count=1, last_published_at=now(), needs_operator_at=NULL WHERE id=:aid AND status='needs_operator'`, then `OutboxWriter.add_payout_requested(..., amount_cents = payouts.amount_cents, republish_seq=0)` (fresh `event_id`; C13).
-     - **mark_rejected:** `UPDATE payout_attempts SET status='rejected', failure_reason='operator_rejected', final_at=now(), needs_operator_at=NULL WHERE id=:aid AND status='needs_operator' AND now() - needs_operator_at >= make_interval(secs => :min_wait_s)` (rowcount 0 with the attempt still `needs_operator` → `ResolveTooEarly`), then `UPDATE payouts SET status='failed', final_at=now() WHERE id=:pid AND status='requested'`. Increment `payroll_payouts_total{outcome="operator_rejected"}`.
+     - **redrive:** `UPDATE payout_attempts SET status='requested', failure_reason=NULL, publish_count=1, last_published_at=:now, needs_operator_at=NULL WHERE id=:aid AND status='needs_operator'`, then `OutboxWriter.add_payout_requested(..., amount_cents = payouts.amount_cents, republish_seq=0)` (fresh `event_id`; C13).
+     - **mark_rejected:** `check_mark_rejected_wait(needs_operator_at, now=clock.now(), min_wait_s)` (→ `ResolveTooEarly`), then `UPDATE payout_attempts SET status='rejected', failure_reason='operator_rejected', final_at=now(), needs_operator_at=NULL WHERE id=:aid AND status='needs_operator'`, then `UPDATE payouts SET status='failed', final_at=now() WHERE id=:pid AND status='requested'`. Increment `payroll_payouts_total{outcome="operator_rejected"}`.
      - A rowcount of 0 raises `ConcurrentUpdate` (500).
   4. Recompute the run status as the result endpoint does (§4.7 step 5): a move into a final status sets `first_final_at` if NULL and observes `payroll_payout_settlement_seconds` once, increments `payroll_pay_runs_total{outcome}`, and logs `payrun.completed`.
   5. Write the `payout.operator_resolved` audit row `{attempt, action, note_len}`. The note's text is never stored, logged or traced (PAY-NFR-07); only its length is.
@@ -1391,12 +1395,12 @@ for each attempt:
   action = domain.retry.republish_decision(status, is_current, publish_count, last_published_at, now,
                                            has_unsent_outbox (re-queried), after_s, max_backoff_s, max_republish)
   REPUBLISH:
-    OutboxWriter.add_payout_requested(..., amount_cents = payouts.amount_cents, republish_seq = publish_count)
-    UPDATE payout_attempts SET publish_count = publish_count + 1, last_published_at = now()
+    UPDATE payout_attempts SET publish_count = publish_count + 1, last_published_at = :now
       WHERE id = :aid AND publish_count = :seen AND status IN ('requested','indeterminate')
+    rowcount 1 → OutboxWriter.add_payout_requested(..., amount_cents = payouts.amount_cents, republish_seq = :seen)
     payroll_payouts_republished_total += 1; log payout.republished
   NEEDS_OPERATOR:
-    UPDATE payout_attempts SET status = 'needs_operator', failure_reason = 'republish_limit', needs_operator_at = now()
+    UPDATE payout_attempts SET status = 'needs_operator', failure_reason = 'republish_limit', needs_operator_at = :now
       WHERE id = :aid AND status IN ('requested','indeterminate')
     audit payout.needs_operator; payroll_payouts_total{outcome="needs_operator"} += 1
     log payout.needs_operator (level error)
@@ -1405,6 +1409,9 @@ for each attempt:
 return the number of rows re-published plus moved to needs_operator
 ```
 
+- **Time source [decision, F4a]:** `:now` is `Runtime.clock.now()`, read once per tick and used both in the candidate filter (`a.last_published_at < :now - …`) and in the writes (`last_published_at`, `needs_operator_at`). Resolve uses the same clock for the C48 wait and the redrive's `last_published_at`. One source for the comparisons and the writes keeps the backoff exact under a fake clock in tests; in production `SystemClock` and the DB clock agree to NTP precision. The relay's send-time `last_published_at` and the result endpoint's `needs_operator_at` still use the DB's `now()`.
+- The exponent is capped (`LEAST(publish_count − 1, 32)`), so `power()` can't overflow; the cap is far past `PAYOUT_REPUBLISH_MAX`.
+- Metrics (`payroll_payouts_republished_total`, `payroll_payouts_total{outcome="needs_operator"}`) and the `payout.republished` / `payout.needs_operator` logs are emitted from an `after_commit` hook, so a rolled-back tick counts nothing. The `payout.needs_operator` log carries `pay_run_id`, `attempt` and `reason`; the audit actor is `system:maintenance`.
 - `after_s` = `PAYOUT_REPUBLISH_AFTER_S` (360, R1), `max_backoff_s` = `PAYOUT_REPUBLISH_MAX_BACKOFF_S` (900), `max_republish` = `PAYOUT_REPUBLISH_MAX` (10).
 - `republish_seq` is `publish_count` before the increment (R34), so the first re-publish carries 1.
 - Each re-publish is a **new outbox row with a fresh UUIDv7 `event_id`**, carrying the same `payout_id` and `attempt`, so the bank key is the same. The worker's instruction check is the gate (ADR 0003 d).
@@ -1427,6 +1434,7 @@ MaintenanceRunner(engine, sessions, lock_name="payroll:maintenance", interval_s=
 
 - **Lock:** each tick (every `MAINTENANCE_INTERVAL_S`, 60 s ± 10%) runs `pg_try_advisory_lock(advisory_lock_key("payroll:maintenance"))` on a dedicated connection. Another replica holding it → skip the tick (pycommon logs `maintenance.skipped` at debug).
 - **Tasks** run in the order above, each in its own transaction (committed on success, rolled back on error). A failing task doesn't stop the others.
+- **Wiring (F4a):** `build_maintenance(rt, engine)` is always built at start-up and kept on `Runtime.maintenance`, so tests call `tick()` directly; `build_app(..., maintenance=False)` only stops the background loop. The cutoffs and "now" come from `Runtime.clock`, read at each tick. The outbox and idempotency purges delete in batches of 1000 until a short batch; the bank purge handles at most 100 employees per tick.
 - **Logs and metrics** are pycommon's (C44): `maintenance.task.completed` {task, affected, duration_ms} at info, `maintenance.task.failed` {task, error_type} at error, and `maintenance_runs_total{task, outcome}` / `maintenance_duration_seconds{task}`. Payroll adds its domain events (`payout.republished`, `payout.needs_operator`, `employee.bank_details_purged`).
 - The purge SQL is payroll's own, because the tables are payroll's DDL (C22).
 
@@ -1443,9 +1451,12 @@ ids = SELECT e.id FROM employees e
 for each id, in order (inside the task's transaction):
   SELECT a.id FROM payout_attempts a JOIN payouts p ON p.id = a.payout_id
     WHERE p.employee_id = :id ORDER BY a.payout_id, a.attempt FOR UPDATE OF a   # lock order 5 before 6 (§4.10)
-  SELECT … FROM employees WHERE id = :id FOR UPDATE; re-check every condition above (skip the employee if any fails)
+  SELECT … FROM employees WHERE id = :id AND <the inactive/bank/cutoff conditions> FOR UPDATE
+  then, as a separate statement (a fresh READ COMMITTED snapshot taken after the lock, so it sees an
+  attempt committed by an approve that held the employee FOR SHARE): SELECT EXISTS (non-final attempt)
+  skip the employee if any re-check fails
   UPDATE employees SET bank_routing_enc = NULL, bank_account_enc = NULL, account_last4 = NULL,
-                       bank_purged_at = now() WHERE id = :id
+                       bank_purged_at = :now WHERE id = :id
   UPDATE payout_attempts a SET bank_snapshot_enc = NULL FROM payouts p
     WHERE a.payout_id = p.id AND p.employee_id = :id AND a.status IN ('settled','rejected')
           AND a.bank_snapshot_enc IS NOT NULL
@@ -1566,10 +1577,10 @@ Payroll calls `pycommon.startup_checks.run_startup_checks(settings, extra=STARTU
 | `payout.indeterminate` | warning | `payout_id`, `pay_run_id`, `attempt`, `publish_count` | outcome `indeterminate` applied | PAY-404, PAY-405 |
 | `payout.attempt_not_current` | info | `payout_id`, `attempt`, `current_attempt`, `source` (`instruction` \| `result`) | 409 | PAY-405, PAY-411 |
 | `payout.retry_requested` | info | `payout_id`, `pay_run_id`, `attempt` (new), `actor_id` | retry committed | PAY-500 |
-| `payout.retry_rejected` | info | `payout_id`, `code` | retry 409 | PAY-500 |
+| `payout.retry_rejected` | info | `payout_id`, `code` (`payout_not_retryable`, `retry_limit_reached`, `employee_bank_details_missing`) | retry 409 | PAY-500 |
 | `payout.republished` | info | `payout_id`, `attempt`, `republish_seq`, `event_id`, `attempt_status` | re-publish row written | PAY-407 |
 | `payout.operator_resolved` | warning | `payout_id`, `pay_run_id`, `attempt`, `action` (`redrive` \| `mark_rejected`), `note_len`, `actor_id`, `event_id` (redrive only) | resolve committed | PAY-502, R8 |
-| `payout.resolve_rejected` | info | `payout_id`, `code` (`payout_not_blocked`, `resolve_too_early`), `attempt_status` | resolve 409 | PAY-502 |
+| `payout.resolve_rejected` | info | `payout_id`, `code` (`payout_not_blocked`, `resolve_too_early`), `attempt_status` (`needs_operator` for `resolve_too_early`) | resolve 409 | PAY-502 |
 | `payout.needs_operator` | error | `payout_id`, `pay_run_id`, `attempt`, `reason` (`poison`, `republish_limit`, or the worker's reason such as `key_window_expired`, `amount_mismatch`) | attempt → `needs_operator` | PAY-407, PAY-409, PAY-410 |
 | `payout.instruction_served` | debug | `payout_id`, `attempt` | instruction 200 | PAY-411 |
 | `crypto.decrypt_failed` | error | `kid`, `entity` (`employee` \| `payout_attempt`), `entity_id` | `FieldDecryptError` | PAY-204 |
@@ -1608,12 +1619,12 @@ pycommon also emits `http.request`, `http.error`, `http.unhandled`, `auth.token.
 | DB pool in use / Redis connections | gauge (pycommon) | — | — | observability §5 |
 
 **How the collection-time gauges work** (R26, C18; this section is authoritative for payroll's gauges, including `outbox_*`).
-- **Callbacks:** `metrics.register_collection_gauges(sync_engine)` registers one OTel observable-gauge callback per gauge on the `payroll` meter. pycommon provides only the meter and the callback helper; the queries are payroll's.
-- **Where they run:** `PeriodicExportingMetricReader` collects on its own thread every `OTEL_METRIC_EXPORT_INTERVAL` (15 s). The callbacks run there, against a **sync** psycopg engine (pool size 1, `statement_timeout = PAYROLL_GAUGE_QUERY_TIMEOUT_MS`), so they never block the event loop.
+- **Callbacks:** `metrics.register_collection_gauges(source)` registers one callback per gauge through pycommon's `observable_gauge` (which refuses unit `"1"`, C63). pycommon provides only the callback helper; the query is payroll's.
+- **Where they run [changed, F4a]:** `PeriodicExportingMetricReader` collects on its own thread every `OTEL_METRIC_EXPORT_INTERVAL` (15 s). The callbacks call `PayrollGaugeSource.stats()`, which runs **one** query (five scalar subqueries) on a private event-loop thread with its own one-connection asyncpg engine (`statement_timeout` and connect timeout = `PAYROLL_GAUGE_QUERY_TIMEOUT_MS`), the same pattern as identity's email gauges. psycopg isn't a dependency, and a private loop also works when the collection runs on a thread that already has a loop (tests). A result is reused for 1 s, so the five callbacks of one collection share one query. The source starts lazily (no thread or connection until the first collection) and is closed on shutdown.
 - **Result:** every replica exports its own fresh value at each collection. No replica exports a stale value, and the alerts use `max()`.
 - **On failure:** a failed query logs `metrics.gauge_query_failed` and yields no observation for that cycle. It never yields a stale or zero value.
 
-Each callback runs its own single-row query; five small queries every 15 s per replica.
+One single-row query every 15 s per replica serves all five gauges. Units: `s` for the two ages, `{attempt}` for `payroll_payouts_stuck` and `payroll_attempts_needs_operator`, `{event}` for `outbox_unsent` (and for the `payroll_payouts_republished` counter).
 
 ### 7.3 Manual spans
 
@@ -1719,7 +1730,7 @@ issuer/kid mismatch → 401 `invalid_token` (C30). The route guards then apply:
 | `test_cursor.py` | Encode and decode round trip; a garbage, wrong-version or non-UUID cursor → `validation_error` with `details = [{field: "query.cursor", issue: "invalid_cursor"}]` | PAY-202, PAY-303, PAY-602 |
 | `test_event_envelope.py` | `build_payout_requested` output validates against the schema; `traceparent` is taken from the active span, or synthesised when there is none; the schema rejects extra properties, a wrong currency, amount 0 and a negative `republish_seq` | PAY-402 |
 | `test_settings.py` | Settings load the pycommon names (`DB_*`, `REDIS_*`, `DEBUG`, `DOCS_ENABLED`, `MAX_BODY_BYTES`; C1) and the `PAYROLL_*` keys; `LOG_LEVEL=info` is accepted as `INFO` (C24); startup checks through `run_startup_checks`: a `dev-` field kid in uat → `startup.check_failed` and exit 2 (C29); wrong key length; an active kid missing; `DOCS_ENABLED` on in prod; `PAYOUT_REPUBLISH_AFTER_S` = 360 passes and 300 fails the timing check (R1) → exit 2 in uat, warning in dev; logs the setting name and never the value | PAY-605 |
-| `test_metrics.py` | `InMemoryMetricReader`: each business counter and histogram increments with the right labels on its path (including `payroll_payouts_total{outcome="operator_rejected"}`); the settlement histogram is observed once per run; exported Prometheus names are exact | PAY-NFR-10, PAY-406 |
+| `test_metrics.py` | The five gauge names and units (never `"1"`, C63); the callbacks report the source's values at collection, nothing once closed or when the query fails (`metrics.gauge_query_failed`); `payroll_payouts_republished` name and unit. The per-path counter checks (`operator_rejected`, `needs_operator`, the settlement histogram once per run) live in the integration files that drive those paths (`test_resolve.py`, `test_republish.py`, `test_internal_result.py`) | PAY-NFR-10, PAY-NFR-11, PAY-406, PAY-407 |
 
 ### 9.2 `services/payroll/tests/integration/`
 
@@ -1795,6 +1806,13 @@ harness that mirrors the services layer. It runs with no I/O.
   5. The stored run status == `run_status_from_payouts(payout statuses)` (PAY-406).
   6. A final attempt's status never changes.
   7. **Liveness under a healthy bank** (a `teardown` drain: deliver everything, the bank always answers, ticks until quiet): every payout is final or `needs_operator`.
+- **As built (F4a):**
+  - The clock is whole seconds. A handler that fetched its instruction may start its bank POST only within `HANDLER_DEADLINE_S` (35 s) of the fetch.
+  - `bank_silent_for(rounds)` advances past the backoff cap and ticks maintenance, so the re-publish limit is reached in about 20% of examples.
+  - `operator_races_inflight_handler` plays the C48 race directly: the handler fetches, the payout is poisoned, the operator resolves after 0, 30 or 121 s, then the handler tries its POST.
+  - Rule targets map onto existing payouts.
+  - Invariant 7 is stricter than "final or blocked": an attempt live at teardown with re-publish budget left must end final.
+  - Mutation checks run while building it, all caught: a C48 wait of 0 or 30 s, no handler deadline, and a tick that never re-publishes.
 - **Settings:** `max_examples=500` and `stateful_step_count=60` in CI; the nightly run uses 5000.
 
 ### 9.5 Traceability
@@ -1831,15 +1849,15 @@ harness that mirrors the services layer. It runs with no I/O.
 | PAY-605 | `settings.py` (pycommon `run_startup_checks`), pycommon health | `unit/test_settings.py`, `integration/test_readyz.py` |
 | PAY-606 | migrations, bootstrap SQL | `integration/test_grants.py`, `integration/test_migrations.py` |
 | PAY-607 | `settings.py` (ACL user), relay | `integration/test_outbox.py` (connects as `payroll`) |
-| PAY-608 | `maintenance.py` (pycommon `MaintenanceRunner`) | `integration/test_maintenance.py` |
+| PAY-608 | `maintenance.py` (pycommon `MaintenanceRunner`) | `integration/test_maintenance.py`, `integration/test_retry.py` (purged employee) |
 | PAY-NFR-01 | `domain/calc.py`, `domain/periods.py` | `unit/test_calc_properties.py`, `unit/test_no_float.py` |
-| PAY-NFR-02 | `domain/state.py`, `domain/retry.py`, services | `unit/test_payout_model.py`, `integration/test_retry.py`, `integration/test_internal_result.py` |
+| PAY-NFR-02 | `domain/state.py`, `domain/retry.py`, `domain/resolve.py`, services | `unit/test_payout_model.py`, `integration/test_retry.py`, `integration/test_resolve.py`, `integration/test_republish.py`, `integration/test_internal_result.py` |
 | PAY-NFR-03 | `events/republish.py` | `integration/test_republish.py`, `unit/test_payout_model.py` (liveness) |
 | PAY-NFR-06 | `metrics.py` (settlement histogram) | `unit/test_metrics.py`, `integration/test_internal_result.py` |
 | PAY-NFR-07 | logging calls, redactor | `integration/test_secret_not_logged.py` |
 | PAY-NFR-08 | `api/schemas.py` (`account_last4` only), `maintenance.py` | `integration/test_employees_api.py`, `integration/test_maintenance.py` |
 | PAY-NFR-09 | `events/relay.py` (traceparent) | `integration/test_outbox.py` |
-| PAY-NFR-10, PAY-NFR-11 | `metrics.py` | `unit/test_metrics.py`, `integration/test_collection_gauges.py` |
+| PAY-NFR-10, PAY-NFR-11 | `metrics.py` | `unit/test_metrics.py`, `integration/test_collection_gauges.py`, `integration/test_resolve.py`, `integration/test_republish.py` |
 | PAY-NFR-12 | `openapi.json`, event schemas (`payout.requested.v1.json`, `payout.requested.dlq.v1.json`) | `contract/*` |
 
 PAY-403, PAY-404, PAY-408 and PAY-412 are owned by payout-worker and bank-stub. Payroll's side of them is §4.6, §4.7 and §5.
@@ -1855,6 +1873,22 @@ PAY-403, PAY-404, PAY-408 and PAY-412 are owned by payout-worker and bank-stub. 
 - 2026-11-11 (F2): PATCH `/v1/employees/{id}` and `GET /v1/audit-events` implemented. Settled here: `EmployeeUpdate` refuses an empty body (`no_fields`) and explicit nulls (`null_not_allowed`); only changed values are written and audited, and a no-op PATCH writes no audit row; any supplied bank field counts as a bank edit without decrypting the stored value (§2.2, §2.8); bank fields are re-encrypted individually with the active kid; `required_on_reactivation` is reported per missing field and `bank_details_incomplete` covers a half pair on a purged employee (§4.3); new `domain/employees.py` and `InvalidFields` (§1, §3.7); audit-events query parameters and cursor scope (§4.5); rotation procedure and the no-re-key consequence (§3.6); schedule moves against the overlap check (§4.3). Tests: `unit/test_employee_rules.py`, `integration/test_schedule_moves.py`, `integration/test_key_rotation.py`, `integration/test_audit_events_api.py` (§9); §9.5 PAY-300 points at the real file `test_pay_runs.py`. PAY-200 and PAY-202 were verified complete from S5 (no change).
 
 - 2026-11-11 (F3): `PUT /v1/pay-runs/{id}/hours` (`services/hours.py`) and `DELETE /v1/pay-runs/{id}` (`services/create_run.py`) implemented, with `HoursEntry`, `HoursIn` and `HoursOut` in the OpenAPI contract. Settled here: hours checks run in the order `employee_not_in_run`, `not_hourly`, bounds over the whole body, and a refused body stores nothing; a duplicate `employee_id` is issue `duplicate_employee_id` at `body.entries`; the upsert keeps rows of employees not in the body; above 74,400 the request model refuses the value (`less_than_equal`), and between the biweekly bound and 74,400 the domain gives `out_of_range` (§4.4). Delete locks the run, 404s a deleted run, keeps payslips and hours, and counts no metric. The calculate and read tests moved out of `test_pay_runs.py` into `test_hours_calculate.py`, which adds the end-to-end hourly path, the hours/approve and delete/approve races, and the dual-approval rule after a revert (§9.2, §9.5). PAY-300, PAY-302, PAY-303, PAY-401 and PAY-NFR-01 were verified against their acceptance criteria with no code change.
+
+- 2026-11-11 (F4a): retry (PAY-500), resolve (PAY-502), re-publish (PAY-407, PAY-409), the collection-time gauges (R26, C18) and the maintenance purges (PAY-608) implemented: new `domain/retry.py`, `domain/resolve.py`, `services/retry.py`, `services/resolve.py`, `events/republish.py`, `maintenance.py`, and the domain errors `PayoutNotRetryable`, `RetryLimitReached`, `PayoutNotBlocked`, `ResolveTooEarly` (with `Retry-After`).
+  - **Settled here:**
+    - `check_retry` takes `employee_id` and a nullable attempt status (§3.5).
+    - `check_mark_rejected_wait` is a pure domain function, run under the attempt lock instead of a time condition in the UPDATE (§3.5a, §4.4).
+    - Retry's key is optional (`api.deps.optional_idem_request`), so retry documents no 400.
+    - Re-publish and resolve take "now" from `Runtime.clock` for both their comparisons and their writes (§5.3).
+    - The re-publish update runs before its outbox insert.
+    - Metrics and logs go out after commit.
+    - The bank-purge "no non-final attempt" re-check is a separate statement after the employee lock (§5.4.1).
+    - The gauges use one query on a private-loop asyncpg engine, not a psycopg sync engine (§1, §7.2).
+    - `Runtime.maintenance` is always built, and `build_app(maintenance=False)` stops only the loop (§5.4).
+    - `PayoutRepo.lock_in_run` 404s a payout of another run; `services.common.payout_view` is shared by the payout list, retry and resolve.
+  - **PAY-501** (payout list with history) was verified against C5 and the requirement with no field change.
+  - **OpenAPI:** adds the retry and resolve paths and `ResolveIn`.
+  - **Tests:** unit `test_retry_rules.py`, `test_resolve_rules.py`, `test_metrics.py` and the completed `test_payout_model.py` (§9.4 "As built"); integration `test_retry.py`, `test_resolve.py`, `test_republish.py`, `test_maintenance.py` and `test_collection_gauges.py`; `test_secret_not_logged.py` now covers retry and resolve, including the note text.
 
 **Open:**
 

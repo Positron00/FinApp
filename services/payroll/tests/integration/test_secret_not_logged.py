@@ -21,15 +21,18 @@ EMAIL = "zelda.quixote@example.com"
 ACCOUNT = "98765432109"
 SALARY = 7_777_777_31
 STAFF_NAMES = ("Carl Calculator", "Grace Approver")
+NOTE = "Called Zelda's bank, ticket QX-55102, transfer absent"
 
 
 async def test_full_flow_logs_no_personal_data_or_secrets(
     api: Api, caplog_json: JsonLogCapture
 ) -> None:
     """PAY-NFR-07, PAY-203: over settings PUT → create employee → PATCH (name and bank) →
-    create run → calculate → approve → instruction → result (and a rejected request with a
-    body), the captured JSON logs hold no salary or amount, employee or staff name (old or
-    new), email, routing or account number (old or new), field key, DB password or JWT."""
+    create run → calculate → approve → instruction → rejected result → retry → poison →
+    resolve (redrive, with a note) → settled result (and a rejected request with a body), the
+    captured JSON logs hold no salary or amount, employee or staff name (old or new), email,
+    routing or account number (old or new), resolve note text, field key, DB password or JWT
+    (PAY-500, PAY-502 joined in F4a)."""
     r = await api.client.put(
         "/v1/company/settings",
         json={
@@ -69,7 +72,14 @@ async def test_full_flow_logs_no_personal_data_or_secrets(
         f"/v1/internal/payouts/{payout['id']}/instruction?attempt=1", headers=worker
     )
     assert instr.json()["account"] == ACCOUNT  # the test really served the secret values
-    settled = {"attempt": 1, "outcome": "settled", "bank_reference": "BR-1"}
+    rejected = {"attempt": 1, "outcome": "rejected", "reason": "account_closed"}
+    assert (await api.result(payout["id"], rejected)).status_code == 200
+    assert (await api.retry(run["id"], payout["id"], key="retry-1")).status_code == 200
+    poison = {"attempt": 2, "outcome": "poison", "reason": "schema_invalid"}
+    assert (await api.result(payout["id"], poison)).status_code == 200
+    r = await api.resolve(run["id"], payout["id"], "redrive", NOTE)
+    assert r.status_code == 200, r.text
+    settled = {"attempt": 2, "outcome": "settled", "bank_reference": "BR-1"}
     assert (await api.result(payout["id"], settled)).status_code == 200
 
     gross = salaried_gross(SALARY, 1, 12)
@@ -86,6 +96,8 @@ async def test_full_flow_logs_no_personal_data_or_secrets(
         "routing": VALID_ROUTING,
         "account": ACCOUNT,
         "db password": STRONG_SECRET,
+        "resolve note": NOTE,
+        "note fragment": "QX-55102",
         "jwt": approve_headers["Authorization"].removeprefix("Bearer "),
         "worker jwt": worker["Authorization"].removeprefix("Bearer "),
         **{f"staff name {n}": n for n in STAFF_NAMES},
@@ -93,5 +105,8 @@ async def test_full_flow_logs_no_personal_data_or_secrets(
     }
     text = caplog_json.text
     assert caplog_json.events("payrun.approved"), "the flow was logged at all"
+    assert caplog_json.events("payout.retry_requested")
+    [resolved] = caplog_json.events("payout.operator_resolved")
+    assert resolved["note_len"] == len(NOTE)
     leaked = sorted(label for label, value in forbidden.items() if value in text)
     assert leaked == []

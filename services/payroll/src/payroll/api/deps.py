@@ -28,6 +28,7 @@ __all__ = [
     "IdempotencyHeader",
     "get_runtime",
     "idem_request",
+    "optional_idem_request",
     "require_roles",
     "require_web_user",
     "require_worker",
@@ -95,6 +96,19 @@ def idem_request(
     """Absent → 400 ``idempotency_key_required``; scope and hash per §4.8."""
     if key is None:
         raise IdempotencyKeyRequired()
+    return _idem(request, principal, key, rt, body)
+
+
+def optional_idem_request(
+    request: Request, principal: Principal, key: str | None, rt: Runtime
+) -> IdemRequest | None:
+    """Retry's optional key (§4.8, C52): honoured when present, ``None`` when absent."""
+    return None if key is None else _idem(request, principal, key, rt, None)
+
+
+def _idem(
+    request: Request, principal: Principal, key: str, rt: Runtime, body: Any | None
+) -> IdemRequest:
     route = str(getattr(request.scope.get("route"), "path", request.url.path))
     params = {k: str(v) for k, v in request.path_params.items()}
     return IdemRequest(

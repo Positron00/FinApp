@@ -14,6 +14,7 @@ from payroll.api.schemas import (
     EmployeeCreate,
     EmployeeUpdate,
     HoursIn,
+    ResolveIn,
     ResultIn,
 )
 from payroll.domain.validation import aba_checksum_ok, is_monday, is_valid_timezone
@@ -255,3 +256,30 @@ def test_hours_invalid(body: dict[str, Any], field: str, issue: str) -> None:
     assert {(".".join(str(p) for p in e["loc"]), str(e["type"])) for e in err.value.errors()} == {
         (field, issue)
     }
+
+
+@pytest.mark.parametrize(
+    "body", [{"action": "redrive", "note": "x"}, {"action": "mark_rejected", "note": "n" * 500}]
+)
+def test_resolve_valid(body: dict[str, Any]) -> None:
+    """PAY-502: both actions with a 1-500 character note."""
+    ResolveIn.model_validate(body)
+
+
+@pytest.mark.parametrize(
+    ("body", "issue"),
+    [
+        ({"action": "void", "note": "x"}, "literal_error"),
+        ({"action": "redrive"}, "missing"),
+        ({"action": "redrive", "note": ""}, "string_too_short"),
+        ({"action": "redrive", "note": "   "}, "string_too_short"),
+        ({"action": "redrive", "note": "n" * 501}, "string_too_long"),
+        ({"action": "redrive", "note": "a\x00b"}, "nul_character"),
+        ({"action": "redrive", "note": "x", "extra": 1}, "extra_forbidden"),
+    ],
+)
+def test_resolve_invalid(body: dict[str, Any], issue: str) -> None:
+    """PAY-502, C14: an unknown action, a missing, empty or 501-character note → 422."""
+    with pytest.raises(ValidationError) as err:
+        ResolveIn.model_validate(body)
+    assert issue in _issues(err.value)

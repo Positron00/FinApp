@@ -1,5 +1,5 @@
 """``/v1/pay-runs*`` (design §4.4): create, list, get, delete, hours, calculate, approve,
-payslips and payouts. Retry and resolve arrive with F4a.
+payslips, payouts, retry (PAY-500) and resolve (PAY-502).
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from payroll.api.deps import (
     IdempotencyHeader,
     get_runtime,
     idem_request,
+    optional_idem_request,
     require_roles,
     require_web_user,
 )
@@ -32,6 +33,7 @@ from payroll.api.schemas import (
     PayRunCreate,
     PayRunOut,
     PayslipOut,
+    ResolveIn,
     RunStatusName,
 )
 from payroll.services import approve as approve_svc
@@ -39,6 +41,8 @@ from payroll.services import calculate as calculate_svc
 from payroll.services import create_run as create_svc
 from payroll.services import hours as hours_svc
 from payroll.services import reads
+from payroll.services import resolve as resolve_svc
+from payroll.services import retry as retry_svc
 from payroll.services.runtime import Runtime
 
 __all__ = ["router"]
@@ -134,3 +138,34 @@ async def list_payouts(
     return await reads.list_payouts(
         rt, principal.cid, run_id, status=status, cursor=cursor, limit=limit
     )
+
+
+@router.post(
+    "/{run_id}/payouts/{payout_id}/retry", response_model=PayoutOut, responses=errors(404, 409)
+)
+async def retry_payout(
+    *,
+    run_id: UUID,
+    payout_id: UUID,
+    request: Request,
+    rt: RT,
+    principal: Approver,
+    idempotency_key: IdempotencyHeader = None,
+) -> JSONResponse:
+    """PAY-500. The ``Idempotency-Key`` is optional and honoured when present (§4.8, C52)."""
+    idem = optional_idem_request(request, principal, idempotency_key, rt)
+    result = await retry_svc.retry(rt, principal, run_id, payout_id, idem)
+    headers = {"Idempotent-Replayed": "true"} if result.replayed else None
+    return JSONResponse(result.body, status_code=result.status, headers=headers)
+
+
+@router.post(
+    "/{run_id}/payouts/{payout_id}/resolve",
+    response_model=PayoutOut,
+    responses=errors(400, 404, 409),
+)
+async def resolve_payout(
+    run_id: UUID, payout_id: UUID, body: ResolveIn, rt: RT, principal: Approver
+) -> PayoutOut:
+    """PAY-502, R8: redrive or mark_rejected a needs_operator attempt (C48 wait for the latter)."""
+    return await resolve_svc.resolve(rt, principal, run_id, payout_id, body)

@@ -45,6 +45,7 @@ __all__ = [
     "PayoutCounts",
     "PayoutOut",
     "PayslipOut",
+    "ResolveIn",
     "ResultIn",
     "ResultOut",
     "Routing",
@@ -387,6 +388,18 @@ class PayoutOut(BaseModel):
     no_transfer: bool
     current_attempt: int
     attempts: list[AttemptOut]  # ascending by attempt; [] when no_transfer (PAY-501)
+
+
+class ResolveIn(BaseModel):
+    """PAY-502, R8: the operator's action and a note (1 to 500 characters; only its length is ever
+    stored or logged, PAY-NFR-07)."""
+
+    model_config = _REQUEST
+
+    action: Literal["redrive", "mark_rejected"]
+    note: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500), NoNul
+    ]
 
 
 # --- internal (PAY-405, PAY-411) ---------------------------------------------------------------

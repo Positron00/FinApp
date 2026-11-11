@@ -230,6 +230,38 @@ class Api:
             f"/v1/internal/payouts/{payout_id}/result", json=body, headers=h
         )
 
+    async def retry(
+        self,
+        run_id: str,
+        payout_id: str,
+        *,
+        key: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        h = dict(headers or self.approver())
+        if key is not None:
+            h["Idempotency-Key"] = key
+        return await self.client.post(f"/v1/pay-runs/{run_id}/payouts/{payout_id}/retry", headers=h)
+
+    async def resolve(
+        self,
+        run_id: str,
+        payout_id: str,
+        action: str,
+        note: str = "checked the bank: no transfer",
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        return await self.client.post(
+            f"/v1/pay-runs/{run_id}/payouts/{payout_id}/resolve",
+            json={"action": action, "note": note},
+            headers=headers or self.approver(),
+        )
+
+    async def mark_outbox_sent(self, db: Any) -> None:
+        """Stand in for the relay: every unsent outbox row counts as published."""
+        await db.execute("UPDATE payroll.outbox SET sent_at = now() WHERE sent_at IS NULL")
+
 
 ApiFactory = Callable[..., Awaitable[Api]]
 
@@ -240,9 +272,15 @@ async def api_factory(
 ) -> AsyncIterator[ApiFactory]:
     async with contextlib.AsyncExitStack() as stack:
 
-        async def make(*, relay: bool = False, instrument: bool = False, **over: Any) -> Api:
+        async def make(
+            *,
+            relay: bool = False,
+            instrument: bool = False,
+            maintenance: bool = False,
+            **over: Any,
+        ) -> Api:
             settings = settings_for(migrated, redis_acl, token_factory, **over)
-            app = build_app(settings, instrument=instrument, relay=relay)
+            app = build_app(settings, instrument=instrument, relay=relay, maintenance=maintenance)
             await stack.enter_async_context(app.router.lifespan_context(app))
             transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
             client = await stack.enter_async_context(

@@ -25,10 +25,7 @@ REQUIRED=(
   redis_stream_length                        # redis_exporter --check-single-streams
   pg_up                                      # postgres-exporter
   otelcol_exporter_sent_spans                # Collector self-metrics: 0.164 has no _total (C65)
-)
-# The scrape-free payroll gauges arrive with task F4a (C65). Listed so the gap stays visible;
-# move them into REQUIRED when F4a lands.
-NOT_YET=(
+  outbox_unsent                              # payroll collection-time gauges (F4a; R26, C18)
   outbox_oldest_age_seconds
   payroll_payouts_stuck
   payroll_runs_processing_oldest_age_seconds
@@ -66,13 +63,6 @@ while :; do
   sleep 10
 done
 
-for name in "${NOT_YET[@]}"; do
-  if present "$name"; then
-    log "note: $name is present now; move it into REQUIRED (F4a)"
-  else
-    log "not expected yet (F4a): $name"
-  fi
-done
 
 if ((${#missing[@]} > 0)); then
   log "missing required series:"
