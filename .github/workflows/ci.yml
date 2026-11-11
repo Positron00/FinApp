@@ -1,6 +1,7 @@
 # PR and main gates (platform LLD §11.1, §12; PAY-NFR-12). Every job calls scripts/ci/<job>.sh, which
 # runs the same way locally. No repository secrets: jobs that need keys run scripts/dev-env.sh,
-# which generates throwaway ones (ADR 0008). Required checks: all seven jobs.
+# which generates throwaway ones (ADR 0008). All seven jobs are meant to be required checks on `main`; that is a branch-protection setting the
+# repository owner applies (not set by this repo).
 # Actions are pinned to full commit SHAs (version in the comment); Dependabot proposes updates.
 name: ci
 

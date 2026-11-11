@@ -39,7 +39,7 @@ An employee may have been paid twice, or was paid while payroll shows the payout
    {service_name="payroll"} | event="payout.late_settlement"
    ```
 
-   Or, as an admin, call `GET /v1/audit-events?event=payout.late_settlement` (web: Audit page). Note `payout_id`, `pay_run_id`, `attempt`, `bank_reference`, `later_attempt_settled` and `later_settled_attempt`.
+   Or, as an admin, call `GET /v1/audit-events?event=payout.late_settlement`. The web Audit page lists payroll events too, but can't filter by event (C69), so look for `payout.late_settlement` rows by hand. Note `payout_id`, `pay_run_id`, `attempt`, `bank_reference`, `later_attempt_settled` and `later_settled_attempt`.
 2. **How many in the window** (Queues dashboard, "Late settlements"; per series, the rise over the window, across a data gap too, or a new series's full value):
 
    ```promql

@@ -10,7 +10,7 @@ All notable changes to PayRun are documented in this file. The format is based o
 
 The first release of PayRun: payroll for small and medium businesses, with journeys J1–J5
 end to end. Decisions are recorded in the spec README
-(`docs/specs/payrun-0.1/README.md`, R1–R37 and C1–C77) and ADRs 0001–0013.
+(`docs/specs/payrun-0.1/README.md`, R1–R37 and C1–C78) and ADRs 0001–0013.
 
 ### Added
 
@@ -80,8 +80,9 @@ end to end. Decisions are recorded in the spec README
   login lockout, so an attacker can't keep an account (even the only admin) locked out; reset
   requests are padded to a 50 ms floor, so a known and an unknown email take the same time.
 - Issuer-bound internal JWT keysets, Redis ACL users per service, per-service DB roles,
-  redaction of secrets and personal data in logs and telemetry, non-root images, and 17 accepted
-  base-image CVEs recorded with owners and expiry dates in `SECURITY_DEPENDENCIES.md`.
+  redaction of secrets and personal data in logs and telemetry, non-root images, and 11 accepted
+  base-image CVEs (all HIGH, none CRITICAL) recorded with owners and expiry dates in
+  `SECURITY_DEPENDENCIES.md`; the web image runs on Debian 13 like the Python images (C78).
 
 [Unreleased]: https://github.com/Positron00/FinApp/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/Positron00/FinApp/releases/tag/v0.1.0

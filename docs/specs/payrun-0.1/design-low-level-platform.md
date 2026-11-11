@@ -26,7 +26,7 @@ FinApp/
   .editorconfig  .gitignore  .dockerignore  .pre-commit-config.yaml  .gitleaks.toml
   .python-version            # 3.14 (see §10.3)
   .nvmrc                     # 24
-  .trivyignore               # 17 accepted base-image CVEs (C66); each needs reason, owner, exp:YYYY-MM-DD
+  .trivyignore               # 11 accepted base-image CVEs (C66, C78); each needs reason, owner, exp:YYYY-MM-DD
   .env.example               # documents the keys scripts/dev-env.sh writes, one comment each; no values for
                              # secrets. Other keys (§4) take their code defaults
   CLAUDE.md                  # agent and contributor notes
@@ -2674,7 +2674,7 @@ CMD ["python", "-m", "pycommon.serve"]
 
 ```dockerfile
 # syntax=docker/dockerfile:1
-ARG NODE_IMAGE=node:24-slim@sha256:<digest>
+ARG NODE_IMAGE=node:24-trixie-slim@sha256:<digest>   # Debian 13, like the Python images (C78)
 
 FROM ${NODE_IMAGE} AS deps
 ENV PNPM_HOME=/pnpm COREPACK_ENABLE_DOWNLOAD_PROMPT=0

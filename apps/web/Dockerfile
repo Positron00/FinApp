@@ -2,7 +2,8 @@
 # The web image (platform LLD §10.2; C4). Build from the repo root:
 #   docker build -f apps/web/Dockerfile -t payrun/web:dev .
 # No secrets at build time: config is parsed lazily at server start (lib/config.ts).
-ARG NODE_IMAGE=node:24.22.0-slim
+# Debian 13 (trixie), like the Python images: Debian 12 had no fix for three zlib CVEs, one CRITICAL (C78).
+ARG NODE_IMAGE=node:24.22.0-trixie-slim
 
 FROM ${NODE_IMAGE} AS deps
 ENV PNPM_HOME=/pnpm COREPACK_ENABLE_DOWNLOAD_PROMPT=0 CI=1
