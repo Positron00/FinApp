@@ -31,6 +31,14 @@ REQUIRED=(
   payroll_runs_processing_oldest_age_seconds
   payroll_attempts_needs_operator
   payroll_late_settlements_total             # pre-initialised to 0 (PayoutLateSettlement, C71)
+  identity_emails_failed_total               # identity, pre-initialised (EmailOutboxStuck)
+  identity_email_oldest_pending_age_seconds  # identity collection-time gauge (EmailOutboxStuck)
+  redis_memory_used_bytes                    # redis_exporter (RedisMemoryHigh)
+  redis_memory_max_bytes
+  queue_dlq_messages                         # worker collection-time gauge (Queues, PayoutDLQ drill)
+  process_memory_usage_bytes                 # Python services' RSS (nightly soak resources gate)
+  auth_signins_total                         # identity; first sign-in (the seed signs in; SigninFailuresSpike)
+  external_request_duration_seconds_count    # pycommon ResilientClient histogram (Bank dashboard)
 )
 
 port="${PROMETHEUS_PORT:-$(env_val PROMETHEUS_PORT)}"

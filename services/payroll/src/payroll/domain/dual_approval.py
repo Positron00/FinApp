@@ -3,14 +3,20 @@
 With the run's ``require_dual_approval`` snapshot on, nobody may both prepare and release money:
 
 - **approve:** the approver is not the run's calculator, nor its creator, nor the last editor of any
-  hours row of the run, nor the last bank-detail editor of any employee in the run whose bank
-  details changed since they were last vetted under four-eyes (C73);
+  hours row of the run, nor the last bank-detail editor of any employee in the run who gets a
+  transfer (net above 0) and whose bank details changed since they were last vetted under
+  four-eyes (C73);
 - **retry:** the retrier is not the employee's last bank-detail editor under the same window, nor
   the operator who marked the current attempt rejected (C73).
 
 A bank edit is *vetted* once a payout attempt took a snapshot of it in a dual-approval run and the
 attempt was requested by someone other than the editor (``BankEdit.vetted_at``, computed by
-``EmployeeRepo.bank_edits``). An employee never paid that way has every edit unvetted.
+``DualApprovalRepo.bank_edits``). An employee never paid that way has every edit unvetted.
+
+Both times come from the database's ``clock_timestamp()`` read after the employee row lock (the
+edit at its UPDATE, the snapshot after approve's or retry's ``FOR SHARE``), so the locks order
+them: a snapshot that didn't see an edit is strictly earlier than it. A tie can only be clock
+resolution, where the order is unknown, so it counts as unvetted (fail closed).
 """
 
 from __future__ import annotations
@@ -46,11 +52,12 @@ class BankEdit:
     vetted_at: datetime | None = None
 
     def unvetted_by(self, actor_id: str) -> bool:
-        """``actor_id`` made the last bank edit and no four-eyes snapshot has covered it since."""
+        """``actor_id`` made the last bank edit and no four-eyes snapshot is later than it (a
+        snapshot at the same instant doesn't vet: the order is unknown)."""
         return (
             self.bank_updated_by == actor_id
             and self.bank_updated_at is not None
-            and (self.vetted_at is None or self.bank_updated_at > self.vetted_at)
+            and (self.vetted_at is None or self.bank_updated_at >= self.vetted_at)
         )
 
 

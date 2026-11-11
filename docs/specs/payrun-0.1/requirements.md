@@ -66,8 +66,10 @@ exactly one requirement; others refer to it by ID.
 - Acceptance:
   - An invalid token returns 400 `reset_invalid`.
   - Reset requests are rate-limited like login.
+  - The request pads everything after its rate limits (the lookup and, for a match, the write) to `REQUEST_FLOOR_S` (50 ms), including paths that raise; a 429 is answered before the timer. The median latency of a known and an unknown email differs by no more than 20% (integration `test_reset_request_timing`, C74).
+  - A confirmed reset (and an accepted invite, PAY-103) clears the account's login lockout: the lock, its level and the current window's failure count (C74).
   - After the reset, earlier sessions get 401 on their next request.
-- Check: integration, e2e.
+- Check: integration (`test_lockout.py::test_reset_confirm_clears_the_lockout`), e2e.
 
 **PAY-106 Sessions (must).**
 - **Storage:** sessions live in Redis at `web:sess:<HMAC-SHA256(SESSION_SECRET, 256-bit cookie id)>` holding `{user_id, cid, name, roles, roles_version, created_at, last_seen, roles_checked_at}`. The idle TTL is `SESSION_IDLE_TTL_S` (43200) and the absolute TTL `SESSION_ABS_TTL_S` (604800). Each session is also indexed in `web:user-sess:<user_id>`.
@@ -226,7 +228,7 @@ The run snapshots `tax_bps`, `retirement_bps` and `require_dual_approval`, sets 
   - Audit `payrun.approved`.
 - Check: unit, integration `test_approve_concurrency.py`.
 
-**PAY-401 Dual approval (must).** When the run's `require_dual_approval` snapshot is true, the approver must differ from `calculated_by`, from the run's creator, from anyone who entered or edited hours on the run, and from `bank_updated_by` of every employee in the run whose bank details haven't been *vetted* since they changed. A change is vetted once a payout for that employee is released under dual approval by someone other than the editor; an employee never paid that way has every change unvetted (C73). When the company setting is turned off, runs already calculated keep their snapshot.
+**PAY-401 Dual approval (must).** When the run's `require_dual_approval` snapshot is true, the approver must differ from `calculated_by`, from the run's creator, from the last editor of any hours row on the run, and from `bank_updated_by` of every employee who gets a transfer in the run (payslip net > 0) whose bank details haven't been *vetted* since they changed. A change is vetted once a payout attempt for that employee, in a run with dual approval on, took a snapshot of those details and was requested by someone other than the editor; an employee never paid that way has every change unvetted. Both times come from the database clock read after the employee row lock, so a snapshot that didn't see an edit is always earlier than it; a tie counts as unvetted (C73). When the company setting is turned off, runs already calculated keep their snapshot.
 - Acceptance: 403 `approver_must_differ`.
 - Check: unit, integration, e2e (two users).
 
@@ -337,7 +339,7 @@ It writes a new outbox row with a fresh `event_id`, increments `publish_count` a
 - it requires the payout to be `failed` (current attempt `rejected`);
 - it requires `current_attempt` < `PAYOUT_MAX_ATTEMPTS` (5, including the first);
 - it requires the employee to be active with bank details;
-- under dual approval, it requires the retrier ≠ the employee's `bank_updated_by` while that change is unvetted (PAY-401), and ≠ the operator who marked the payout's last attempt rejected (C73);
+- under dual approval, it requires the retrier ≠ the employee's `bank_updated_by` while that change is unvetted (PAY-401), and ≠ the operator who marked the current attempt rejected (C73). The resolver rule applies only to `operator_rejected`: an operator who redrove an attempt that the bank then rejected may retry it;
 - it creates attempt n+1 with a new bank snapshot, sets the payout to `requested`, writes the outbox row, and recomputes the run status (back to `processing`).
 - Acceptance:
   - 409 `payout_not_retryable` (including indeterminate and needs_operator attempts).
@@ -358,7 +360,9 @@ It writes a new outbox row with a fresh `event_id`, increments `publish_count` a
 - Acceptance:
   - 409 `payout_not_blocked` when the attempt isn't `needs_operator`;
   - 409 `resolve_too_early` with `Retry-After` for `mark_rejected` within `PAYOUT_MARK_REJECTED_MIN_WAIT_S` of entering `needs_operator`; `redrive` succeeds at once;
-  - 422 `validation_error` for an unknown action or a missing note.
+  - 422 `validation_error` for an unknown action or a missing note;
+  - 422 `validation_error` with details `[{field: "body.action", issue: "redrive_not_allowed"}]` for a `redrive` of an attempt whose `failure_reason` is `key_window_expired` (C73): the worker may only look the key up, and that keeps answering 404. Only `mark_rejected` after a bank-statement check remains (runbook PayoutNeedsOperator).
+- Redrive keeps `requested_at`. An attempt older than `BANK_KEY_SAFE_WINDOW_S` blocked for another reason can still be redriven, but the worker then only looks the key up and reports `key_window_expired`; the runbook has the operator check the attempt's age first.
 - Check: unit, integration, e2e (`recover.spec.ts` blocked case).
 
 ## 6. Cross-cutting

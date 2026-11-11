@@ -133,8 +133,9 @@ async def test_dual_approval_calculator_cannot_approve(api: Api) -> None:
     }
 
 
-async def test_dual_approval_bank_editor_after_created_at(api: Api, db: Any) -> None:
-    """PAY-401: a bank edit by the approver after the run's created_at → 403 bank_editor (IDs)."""
+async def test_dual_approval_unvetted_bank_editor(api: Api, db: Any) -> None:
+    """PAY-401, C73: the approver's bank edit that no second person has released (unvetted)
+    → 403 bank_editor (IDs)."""
     run = await api.calculated_run(2)
     emp = await db.fetchval("SELECT employee_id FROM payroll.payslips ORDER BY id LIMIT 1")
     await db.execute(

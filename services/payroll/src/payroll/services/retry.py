@@ -8,6 +8,8 @@ the details were last vetted, nor the operator who marked the attempt rejected (
 audited (``payout.retry_denied``) in its own transaction after the rollback. Attempt n+1 gets a
 fresh bank snapshot under the active kid, the payout goes back to ``requested``, an outbox row is
 written (``republish_seq = 0``) and the run status is recomputed (back to ``processing``).
+The new attempt's ``requested_at`` is ``clock_timestamp()`` read after the employee lock, not
+``now()``, so a bank edit this snapshot didn't see always has a later ``bank_updated_at`` (C73).
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ from payroll.db.repositories import (
     EmployeeRepo,
     PayoutRepo,
     PayRunRepo,
+    clock_timestamp,
     rowcount,
 )
 from payroll.db.session import session_scope
@@ -128,6 +131,7 @@ async def _retry_in_tx(
     current = await AttemptRepo.lock(session, cid, payout_id, payout.current_attempt)
     employees = await EmployeeRepo.for_share(session, cid, [payout.employee_id])
     emp = employees.get(payout.employee_id)
+    snapshot_at = await clock_timestamp(session)  # after the employee lock (C73)
     check_retry(
         payout_status=PayoutStatus(payout.status),
         attempt_status=AttemptStatus(current.status) if current is not None else None,
@@ -167,7 +171,7 @@ async def _retry_in_tx(
             id=new_id(), company_id=cid, payout_id=payout_id, attempt=attempt,
             status="requested",
             bank_snapshot_enc=rt.keyring.encrypt(snapshot, aad=snapshot_aad(payout_id, attempt)),
-            account_last4=account[-4:], requested_by=principal.sub, requested_at=func.now(),
+            account_last4=account[-4:], requested_by=principal.sub, requested_at=snapshot_at,
             last_published_at=func.now(), publish_count=1,
         )
     )  # fmt: skip

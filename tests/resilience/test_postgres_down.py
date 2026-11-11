@@ -9,22 +9,29 @@ without stuck pool connections once the proxy is back. Nightly.
 from __future__ import annotations
 
 import time
+from datetime import UTC, datetime
 
 import httpx
 import pytest
-from _stack import Payroll, Stack, Toxiproxy, error_code, wait_until
+from _stack import METRIC_WAIT_S, Payroll, Stack, Toxiproxy, error_code, log_events, wait_until
 
 FAST_S = 3.0  # a refused connection must not wait out the 4 s DB budget (+ HTTP margin)
 RECOVERY_S = 15.0
+FAILED_REQUESTS = (
+    'http_server_request_duration_seconds_count{service_name="payroll", '
+    'http_route="/v1/pay-runs", http_response_status_code="503"}'
+)
 
 
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(120 + METRIC_WAIT_S)
 def test_postgres_down_fails_fast_and_recovers(
     stack: Stack, toxiproxy: Toxiproxy, payroll: Payroll
 ) -> None:
     """PAY-605, HLD §4 "Postgres down": 503 db_unavailable fast and /readyz 503 while the DB is
     unreachable; every request succeeds again within 15 s of its return."""
     assert payroll.call("GET", "/v1/pay-runs", params={"limit": 5}).status_code == 200
+    t0 = datetime.now(UTC)
+    failed = stack.prom(FAILED_REQUESTS)
     toxiproxy.set_enabled("postgres", False)
 
     for _ in range(3):
@@ -60,3 +67,6 @@ def test_postgres_down_fails_fast_and_recovers(
             return httpx.get(url, timeout=5).status_code == 200
 
         wait_until(f"{port} ready", is_ready, RECOVERY_S, interval=0.5)
+    # HLD §4: `db.unavailable` / http_server_request_duration_seconds (the three 503s)
+    assert log_events(stack.logs_since("payroll", t0), "db.unavailable") >= 3
+    stack.wait_increase("payroll 503s", FAILED_REQUESTS, failed, 3)

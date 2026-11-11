@@ -65,7 +65,7 @@ group "dependencies"
 uv sync --locked --all-packages
 pnpm install --frozen-lockfile
 if [[ "${PLAYWRIGHT_SKIP_INSTALL:-0}" != 1 ]]; then
-  pnpm --filter web exec playwright install chromium # CI installs it with --with-deps first
+  pnpm --filter web exec playwright install chromium # CI installs it in a workflow step first
 fi
 
 group "dev-env and images"

@@ -281,7 +281,7 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "(sum(increase(queue_messages_total{outcome=\"dlq\"}[15m]) and queue_messages_total{outcome=\"dlq\"} offset 15m) or vector(0)) + (sum(queue_messages_total{outcome=\"dlq\"} unless queue_messages_total{outcome=\"dlq\"} offset 15m) or vector(0))",
+          "expr": "(sum(increase(queue_messages_total{outcome=\"dlq\"}[15m]) and max_over_time(queue_messages_total{outcome=\"dlq\"}[1h] offset 15m)) or vector(0)) + (sum(queue_messages_total{outcome=\"dlq\"} unless max_over_time(queue_messages_total{outcome=\"dlq\"}[1h] offset 15m)) or vector(0))",
           "legendFormat": "dlq in last 15 m (PayoutDLQ)",
           "range": true,
           "exemplar": false
@@ -298,7 +298,7 @@
           "exemplar": false
         }
       ],
-      "description": "PayoutDLQ pages on any increase over 15 minutes. Follow docs/runbooks/PayoutDLQ.md to replay or purge.",
+      "description": "PayoutDLQ pages on any increase over 15 minutes, or on a new series already above 0 (no sample in the hour before the window; C75). Follow docs/runbooks/PayoutDLQ.md to replay or purge.",
       "gridPos": {
         "x": 0,
         "y": 9,
@@ -596,7 +596,7 @@
             "uid": "prometheus"
           },
           "refId": "B",
-          "expr": "(sum(increase(identity_emails_failed_total[1h]) and identity_emails_failed_total offset 1h) or vector(0)) + (sum(identity_emails_failed_total unless identity_emails_failed_total offset 1h) or vector(0))",
+          "expr": "(sum(increase(identity_emails_failed_total[1h]) and max_over_time(identity_emails_failed_total[2h] offset 1h)) or vector(0)) + (sum(identity_emails_failed_total unless max_over_time(identity_emails_failed_total[2h] offset 1h)) or vector(0))",
           "legendFormat": "failed in last 1 h (C20)",
           "range": true,
           "exemplar": false
@@ -613,7 +613,7 @@
           "exemplar": false
         }
       ],
-      "description": "EmailOutboxStuck: oldest pending > 900 s, or any failure in the last hour.",
+      "description": "EmailOutboxStuck: oldest pending > 900 s, or any failure in the last hour (a new failure series counts in full; C75).",
       "gridPos": {
         "x": 16,
         "y": 18,
@@ -934,13 +934,13 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "(sum(increase(payroll_late_settlements_total[15m]) and payroll_late_settlements_total offset 15m) or vector(0)) + (sum(payroll_late_settlements_total unless payroll_late_settlements_total offset 15m) or vector(0))",
+          "expr": "(sum(increase(payroll_late_settlements_total[15m]) and max_over_time(payroll_late_settlements_total[1h] offset 15m)) or vector(0)) + (sum(payroll_late_settlements_total unless max_over_time(payroll_late_settlements_total[1h] offset 15m)) or vector(0))",
           "legendFormat": "late settlements in last 15 m",
           "range": true,
           "exemplar": false
         }
       ],
-      "description": "payroll_late_settlements_total (C71). PayoutLateSettlement pages on any increase.",
+      "description": "payroll_late_settlements_total (C71). PayoutLateSettlement pages on any increase over 15 minutes, or on a new series already above 0 (C75).",
       "gridPos": {
         "x": 8,
         "y": 35,

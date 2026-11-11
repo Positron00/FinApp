@@ -110,7 +110,11 @@ jobs:
         with:
           k6-version: "1.8.2"
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter web exec playwright install --with-deps chromium
+      # No --with-deps: that step runs apt, and the runner's Ubuntu mirror failed DNS in every nightly
+      # on 2026-11-11 (the tests never started). ubuntu-latest ships Google Chrome, so Chromium's
+      # system libraries are already present; the browser itself comes from Playwright's CDN. A
+      # missing library fails loudly at browser launch.
+      - run: pnpm --filter web exec playwright install chromium
       - run: mkdir -p ci-logs && scripts/ci/nightly-e2e.sh 2>&1 | tee ci-logs/e2e-repeat.log
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
@@ -194,10 +198,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RESULTS: ${{ toJSON(needs) }}
+        # An artifact is rooted at the common ancestor of its upload paths: `load` uploads ci-logs/
+        # and load/results/, so its log lands at log-load/ci-logs/load.log, while the single-path
+        # jobs land at log-<job>/<job>.log. Search the job's artifact rather than assume a layout.
         run: |
           for job in load resilience e2e-repeat schemathesis-deep audit; do
             result="$(jq -r --arg j "$job" '.[$j].result' <<<"$RESULTS")"
             if [[ "$result" == failure ]]; then
-              scripts/ci/report_failure.sh "$job" "nightly-logs/log-$job/$job.log"
+              logfile=""
+              [[ -d "nightly-logs/log-$job" ]] &&
+                logfile="$(find "nightly-logs/log-$job" -name "$job.log" -print -quit)"
+              scripts/ci/report_failure.sh "$job" "${logfile:-nightly-logs/log-$job/$job.log}"
             fi
           done

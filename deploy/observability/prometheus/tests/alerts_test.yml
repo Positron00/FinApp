@@ -189,6 +189,23 @@ tests:
       - alertname: PayoutDLQ
         eval_time: 25m
         exp_alerts: []
+  - name: PayoutDLQ stays quiet on an old series after a 10-minute data gap (C75)
+    # An old counter at 3 loses 10 minutes of samples (a Prometheus or Collector restart, or
+    # metric_expiration dropping a stalled exporter). From 50 to 56 minutes the instant
+    # `X offset 15m` falls in the gap, more than the 5 m lookback after the last sample, so the old
+    # `unless X offset 15m` arm read the series as new and paged; max_over_time over the hour
+    # before the window still finds it.
+    interval: 1m
+    input_series:
+      - series: 'queue_messages_total{service_name="payout-worker", stream="c", outcome="dlq"}'
+        values: "3x30 _x10 3x30"
+    alert_rule_test:
+      - alertname: PayoutDLQ
+        eval_time: 52m
+        exp_alerts: []
+      - alertname: PayoutDLQ
+        eval_time: 55m
+        exp_alerts: []
 
   # ------------------------------------------------------------------ PayoutNeedsOperator (page)
   - name: PayoutNeedsOperator fires when one replica reports an attempt waiting (max over replicas)
@@ -269,6 +286,18 @@ tests:
       - alertname: PayoutLateSettlement
         eval_time: 30m
         exp_alerts: []
+  - name: PayoutLateSettlement stays quiet on an old series after a 10-minute data gap (C75)
+    interval: 1m
+    input_series:
+      - series: 'payroll_late_settlements_total{service_name="payroll", instance="old"}'
+        values: "3x30 _x10 3x30"
+    alert_rule_test:
+      - alertname: PayoutLateSettlement
+        eval_time: 52m
+        exp_alerts: []
+      - alertname: PayoutLateSettlement
+        eval_time: 55m
+        exp_alerts: []
 
   # ------------------------------------------------------------------ PayoutsStuck (page)
   - name: PayoutsStuck fires after 10 minutes of stuck attempts
@@ -344,7 +373,7 @@ tests:
               summary: "Identity emails are stuck or failing"
               description: "The oldest pending email is old, or emails failed permanently in the last hour (1000). Check SMTP connectivity and identity logs."
               runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/EmailOutboxStuck.md"
-              dashboard_url: "http://127.0.0.1:4101/d/payrun-service-overview"
+              dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
   - name: EmailOutboxStuck fires 5 minutes after a permanent failure (counter 0 -> 1, R25, C20)
     interval: 1m
     input_series:
@@ -364,7 +393,7 @@ tests:
               summary: "Identity emails are stuck or failing"
               description: "The oldest pending email is old, or emails failed permanently in the last hour (1). Check SMTP connectivity and identity logs."
               runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/EmailOutboxStuck.md"
-              dashboard_url: "http://127.0.0.1:4101/d/payrun-service-overview"
+              dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
   - name: EmailOutboxStuck stays quiet at 300 s with a flat counter, and clears 1 h after the last failure
     interval: 1m
     input_series:
@@ -378,6 +407,49 @@ tests:
         exp_alerts: []
       - alertname: EmailOutboxStuck
         eval_time: 125m
+        exp_alerts: []
+  - name: EmailOutboxStuck fires on a failure series that first appears at 1, and clears after the window (C75)
+    # A restarted identity counts a permanent failure before its first export: increase() reads the
+    # series as 0; the new-series arm is pending from 2 minutes and fires at 7 (for: 5m).
+    interval: 1m
+    input_series:
+      - series: 'identity_email_oldest_pending_age_seconds{service_name="identity"}'
+        values: "0x130"
+      - series: 'identity_emails_failed_total{service_name="identity", instance="new"}'
+        values: "_ _ 1x80"
+    alert_rule_test:
+      - alertname: EmailOutboxStuck
+        eval_time: 6m
+        exp_alerts: []
+      - alertname: EmailOutboxStuck
+        eval_time: 7m
+        exp_alerts:
+          - exp_labels: { severity: warning, service_name: identity }
+            exp_annotations:
+              summary: "Identity emails are stuck or failing"
+              description: "The oldest pending email is old, or emails failed permanently in the last hour (1). Check SMTP connectivity and identity logs."
+              runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/EmailOutboxStuck.md"
+              dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
+      - alertname: EmailOutboxStuck
+        eval_time: 125m
+        exp_alerts: []
+  - name: EmailOutboxStuck stays quiet on an old failure series after a 20-minute data gap (C75)
+    # The window is 1 h, so the old `unless X offset 1h` arm read the series as new while the
+    # instant an hour back fell more than 5 m into the gap (95 to 111 minutes here), and fired
+    # from 100.5 m (for: 5m). The gap is 20 minutes, not 10, so that the old arm would have
+    # outlasted `for`; max_over_time over the 2 h before the window still finds the series.
+    interval: 1m
+    input_series:
+      - series: 'identity_email_oldest_pending_age_seconds{service_name="identity"}'
+        values: "0x150"
+      - series: 'identity_emails_failed_total{service_name="identity", instance="old"}'
+        values: "3x30 _x20 3x100"
+    alert_rule_test:
+      - alertname: EmailOutboxStuck
+        eval_time: 105m
+        exp_alerts: []
+      - alertname: EmailOutboxStuck
+        eval_time: 110m
         exp_alerts: []
 
   # ------------------------------------------------------------------ RateLimiterErrors (warning)
@@ -613,6 +685,38 @@ tests:
     input_series:
       - series: 'otelcol_exporter_sent_spans{exporter="otlp_grpc/tempo"}'
         values: "0+100x20"
+    alert_rule_test:
+      - alertname: CollectorDropping
+        eval_time: 16m
+        exp_alerts: []
+  - name: CollectorDropping stays quiet when the unsuffixed failure counters exist but are flat
+    interval: 1m
+    input_series:
+      - series: 'otelcol_exporter_send_failed_spans{exporter="otlp_grpc/tempo"}'
+        values: "3x20"
+      - series: 'otelcol_exporter_send_failed_metric_points{exporter="prometheus"}'
+        values: "0x20"
+      - series: 'otelcol_exporter_send_failed_log_records{exporter="otlp_http/loki"}'
+        values: "1x20"
+      - series: 'otelcol_receiver_refused_spans{receiver="otlp"}'
+        values: "2x20"
+    alert_rule_test:
+      - alertname: CollectorDropping
+        eval_time: 16m
+        exp_alerts: []
+  - name: CollectorDropping stays quiet when the _total failure counters exist but are flat
+    # One name per series set: the two names with the same labels at once (a Collector upgrade
+    # window) make rate() over the regex fail with "same labelset" (a rule evaluation error).
+    interval: 1m
+    input_series:
+      - series: 'otelcol_exporter_send_failed_spans_total{exporter="otlp_grpc/tempo"}'
+        values: "3x20"
+      - series: 'otelcol_exporter_send_failed_metric_points_total{exporter="prometheus"}'
+        values: "0x20"
+      - series: 'otelcol_exporter_send_failed_log_records_total{exporter="otlp_http/loki"}'
+        values: "1x20"
+      - series: 'otelcol_receiver_refused_spans_total{receiver="otlp"}'
+        values: "2x20"
     alert_rule_test:
       - alertname: CollectorDropping
         eval_time: 16m

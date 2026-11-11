@@ -11,24 +11,35 @@ ends paid with exactly one settled bank transfer.
 - After the bank call: the toxic sits on the response path, so the bank settles every transfer
   but the worker never hears back; the redelivery reuses the bank key ``<payout_id>:<attempt>``
   and the bank returns the original transfer.
+
+Each test also checks the HLD §4 row's log event and metric, from the restarted process: its
+``queue_messages_total`` / ``payouts_bank_transfers_total`` series are new (a new
+``service.instance.id``), so they count in full.
 """
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 from _stack import (
     CLAIM_IDLE_S,
+    METRIC_WAIT_S,
     Containers,
     Payroll,
     Stack,
     Toxiproxy,
     assert_paid_once,
     disbursements,
+    log_events,
     payout_ids,
     settled_count,
     transfers,
     wait_until,
 )
+
+PROCESSED = 'queue_messages_total{service_name="payout-worker", outcome="ok"}'
+SETTLED = 'payouts_bank_transfers_total{service_name="payout-worker", outcome="settled"}'
 
 REDELIVERY_S = CLAIM_IDLE_S + 90  # pending-first on restart; XAUTOCLAIM as the fallback
 
@@ -49,7 +60,7 @@ def _in_flight(stack: Stack, payroll: Payroll, toxiproxy: Toxiproxy, stream: str
     return [run["id"], *ids]
 
 
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(300 + METRIC_WAIT_S)
 def test_worker_crash_before_the_bank_call_is_redelivered_and_paid_once(
     stack: Stack, toxiproxy: Toxiproxy, containers: Containers, payroll: Payroll
 ) -> None:
@@ -58,16 +69,22 @@ def test_worker_crash_before_the_bank_call_is_redelivered_and_paid_once(
     assert stack.pending() >= len(ids)
     assert transfers(stack, ids) == {i: [] for i in ids}  # the bank never saw a request
 
+    processed = stack.prom(PROCESSED)
     containers.kill("payout-worker")
     toxiproxy.remove("bank-stub", "hold")
+    restarted = datetime.now(UTC)
     containers.start("payout-worker")
 
     payroll.wait_final(run_id, REDELIVERY_S)
     assert_paid_once(stack, payroll, run_id)
     assert stack.pending() == 0
+    # HLD §4: `queue.message.processed` / queue_messages_total, from the restarted worker
+    logs = stack.logs_since("payout-worker", restarted)
+    assert log_events(logs, "queue.message.processed") >= len(ids)
+    stack.wait_increase("redelivered messages processed", PROCESSED, processed, len(ids))
 
 
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(300 + METRIC_WAIT_S)
 def test_worker_crash_after_the_bank_call_reuses_the_key_and_pays_once(
     stack: Stack, toxiproxy: Toxiproxy, containers: Containers, payroll: Payroll
 ) -> None:
@@ -78,12 +95,21 @@ def test_worker_crash_after_the_bank_call_reuses_the_key_and_pays_once(
     wait_until("the bank settles every transfer", lambda: settled_count(stack, ids) == len(ids), 30)
     before = transfers(stack, ids)
 
+    settled = stack.prom(SETTLED)
     containers.kill("payout-worker")
     toxiproxy.remove("bank-stub", "hold")
+    restarted = datetime.now(UTC)
     containers.start("payout-worker")
 
     payroll.wait_final(run_id, REDELIVERY_S)
     assert_paid_once(stack, payroll, run_id)
     assert transfers(stack, ids) == before  # no new transfer: the original was returned
+    # HLD §4: `bank.transfer.submitted` / payouts_bank_transfers_total, from the restarted worker;
+    # the bank answered each repeated key with the stored transfer (bank_stub.transfer.replayed)
+    logs = stack.logs_since("payout-worker", restarted)
+    assert log_events(logs, "bank.transfer.submitted") >= len(ids)
+    replayed = log_events(stack.logs_since("bank-stub", restarted), "bank_stub.transfer.replayed")
+    assert replayed >= len(ids)
+    stack.wait_increase("settled bank answers", SETTLED, settled, len(ids))
     for p in payroll.payouts(run_id):
         assert [a["attempt"] for a in p["attempts"]] == [1]  # same attempt, same key

@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 import httpx
 import pytest
-from _stack import Bff, Containers, Stack, log_events, wait_until
+from _stack import METRIC_WAIT_S, Bff, Containers, Stack, log_events, wait_until
 
 SEND_WAIT_S = 120.0  # first retry after 30 s ± 10%, then the 2 s poll
 
@@ -28,7 +28,7 @@ def _outbox(stack: Stack, email: str) -> tuple[str, int] | None:
     return (rows[0][0], int(rows[0][1])) if rows else None
 
 
-@pytest.mark.timeout(SEND_WAIT_S + 120)
+@pytest.mark.timeout(SEND_WAIT_S + METRIC_WAIT_S + 120)
 def test_smtp_down_queues_the_invite_and_sends_after_recovery(
     stack: Stack, containers: Containers, bff: Bff
 ) -> None:
@@ -53,6 +53,12 @@ def test_smtp_down_queues_the_invite_and_sends_after_recovery(
 
     wait_until("the first send attempt failed", failed_once, 30)
     assert log_events(stack.logs_since("identity", t0), "email.send_failed") >= 1
+    # HLD §4: identity_emails_pending counts the queued email while SMTP is away
+    stack.wait_prom(
+        "the queued email in identity_emails_pending",
+        'max(identity_emails_pending{service_name="identity"})',
+        lambda v: v >= 1,
+    )
 
     containers.start("mailpit")
     mailpit = f"{stack.url('MAILPIT_PORT')}/api/v1/search?query={quote(f'to:"{email}"')}"

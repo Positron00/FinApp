@@ -16,6 +16,7 @@ import pytest
 from _stack import (
     DLQ,
     DLQ_WAIT_S,
+    METRIC_WAIT_S,
     REPUBLISH_WAIT_S,
     Payroll,
     Stack,
@@ -27,8 +28,10 @@ from _stack import (
     wait_until,
 )
 
+DEAD_LETTERED = 'queue_messages_total{service_name="payout-worker", outcome="dlq"}'
 
-@pytest.mark.timeout(DLQ_WAIT_S + REPUBLISH_WAIT_S + 120)
+
+@pytest.mark.timeout(DLQ_WAIT_S + REPUBLISH_WAIT_S + METRIC_WAIT_S + 120)
 def test_payroll_down_dead_letters_then_republish_redrives(
     stack: Stack, toxiproxy: Toxiproxy, payroll: Payroll
 ) -> None:
@@ -37,6 +40,7 @@ def test_payroll_down_dead_letters_then_republish_redrives(
     t0 = datetime.now(UTC)
     run = payroll.calculated_run()
     dlq_before = stack.redis_int("XLEN", DLQ)
+    dead_lettered = stack.prom(DEAD_LETTERED)
     toxiproxy.set_enabled("payroll", False)
     payroll.approve(run["id"])
     ids = payout_ids(stack, run["id"])
@@ -56,6 +60,8 @@ def test_payroll_down_dead_letters_then_republish_redrives(
     assert payroll.run(run["id"])["status"] == "processing"
     worker_logs = stack.logs_since("payout-worker", t0)
     assert log_events(worker_logs, "queue.message.failed") >= 5 * len(ids)
+    # HLD §4: queue_messages_total{outcome="dlq"} (what PayoutDLQ pages on)
+    stack.wait_increase("dead-lettered messages", DEAD_LETTERED, dead_lettered, len(ids))
 
     toxiproxy.set_enabled("payroll", True)
     payroll.wait_final(run["id"], REPUBLISH_WAIT_S)

@@ -40,6 +40,8 @@ Gaps in traces, logs or metrics. Dashboards may show holes and alerts based on m
 
 3. **The Collector's own log** (it writes to stdout, not Loki): `scripts/stack.sh logs otel-collector`; look for `Exporting failed` and `memory_limiter` messages.
 
+**Known limit (C77):** if the unsuffixed and `_total` counters exist at the same time with the same labels (for example during a Collector upgrade), the rule's `{__name__=~"…(_total)?"}` match fails with "vector cannot contain metrics with the same labelset". That is a rule evaluation error (visible in Prometheus → Alerts), not a page; query each name on its own until the old series expire.
+
 ## Likely causes
 
 - Tempo or Loki is down, restarting or out of disk.

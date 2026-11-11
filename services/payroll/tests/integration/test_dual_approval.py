@@ -8,13 +8,15 @@ calculate the run on Tuesday, and approve it alone.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
 import pytest
+from pycommon.testing import PgBootstrapped
 
 from tests.helpers import employee_body
-from tests.integration.conftest import PAYROLL_ADMIN, Api
+from tests.integration.conftest import PAYROLL_ADMIN, Api, admin_connect
 
 pytestmark = pytest.mark.integration
 
@@ -230,3 +232,76 @@ async def test_retry_after_a_vetted_edit_is_allowed_to_its_editor(api: Api, db: 
     assert (row["actor_id"], str(row["entity_id"])) == (ALICE, p["id"])
     assert json.loads(row["d"]) == {"rule": "bank_editor", "employee_count": 1, "pay_run_id": jan}
     assert (await api.retry(jan, p["id"], headers=api.approver())).status_code == 200
+
+
+async def test_no_transfer_employee_edit_does_not_block(api: Api, db: Any) -> None:
+    """PAY-401 (d), C73: only employees who get a transfer count. Alice's own employee earns
+    1 cent a year, so their January payout is no_transfer (no attempt, nothing released, never
+    vetted): it doesn't block Alice. Her edit of an employee who is paid still does, and only
+    that employee is listed."""
+    await _employee(api, 0, headers=_alice(api), annual_salary_cents=1)
+    paid = await _employee(api, 1)
+    jan = await _run(api, "2026-01-01")
+    r = await api.approve(jan, headers=_alice(api))
+    assert r.status_code == 200, r.text
+    assert r.json()["counts"]["no_transfer"] == 1
+    await _redirect_bank(api, paid, _alice(api))
+    feb = await _run(api, "2026-02-01")
+    r = await api.approve(feb, headers=_alice(api))
+    assert _err(r) == (
+        403, "approver_must_differ", {"rule": "bank_editor", "employee_ids": [paid]},
+    )  # fmt: skip
+
+
+async def _until_a_patch_waits_on_the_row_lock(db: Any) -> None:
+    for _ in range(1000):
+        if await db.fetchval(
+            "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+            "AND query ILIKE '%payroll.employees%FOR UPDATE%'"
+        ):
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("the PATCH never waited on the employee lock")
+
+
+async def test_edit_waiting_on_an_approve_lock_is_not_vetted_by_it(
+    api: Api, db: Any, migrated: PgBootstrapped
+) -> None:
+    """PAY-401 (d), C73, the timestamp race: approve #1 holds the employee FOR SHARE; Alice's
+    PATCH starts and waits for FOR UPDATE; Grace's approve #2 starts later, takes FOR SHARE too
+    (compatible) and snapshots the OLD details; then the PATCH commits. bank_updated_at is
+    clock_timestamp() at the UPDATE and requested_at is read after the FOR SHARE lock, so the edit
+    is later than Grace's snapshot and stays unvetted: Alice can't approve February alone. (With
+    now(), the PATCH's transaction start was earlier than approve #2's, so it counted as vetted.)"""
+    emp = await _employee(api, 0)
+    jan = await _run(api, "2026-01-01")
+    holder = await admin_connect(migrated)  # stands in for approve #1
+    try:
+        tx = holder.transaction()
+        await tx.start()
+        await holder.execute("SELECT 1 FROM payroll.employees WHERE id = $1 FOR SHARE", emp)
+        patch = asyncio.create_task(
+            api.client.patch(
+                f"/v1/employees/{emp}", json={"bank_account": ALICE_ACCOUNT}, headers=_alice(api)
+            )
+        )
+        await _until_a_patch_waits_on_the_row_lock(db)
+        async with asyncio.timeout(10):
+            r = await api.approve(jan)  # Grace: FOR SHARE is granted past the waiting PATCH
+        assert r.status_code == 200, r.text
+        assert not patch.done()
+        await tx.commit()
+    finally:
+        await holder.close()
+    assert (await patch).status_code == 200
+    snap = await db.fetchrow(
+        "SELECT a.account_last4, a.requested_at, e.bank_updated_at FROM payroll.payout_attempts a "
+        "JOIN payroll.payouts p ON p.id = a.payout_id JOIN payroll.employees e "
+        "ON e.id = p.employee_id WHERE e.id = $1",
+        emp,
+    )
+    assert snap["account_last4"] == "6789"  # Grace released the old details
+    assert snap["bank_updated_at"] > snap["requested_at"]
+    feb = await _run(api, "2026-02-01")
+    r = await api.approve(feb, headers=_alice(api))
+    assert _err(r) == (403, "approver_must_differ", {"rule": "bank_editor", "employee_ids": [emp]})

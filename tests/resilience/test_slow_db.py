@@ -13,12 +13,16 @@ import time
 
 import httpx
 import pytest
-from _stack import Stack, Toxiproxy
+from _stack import METRIC_WAIT_S, Stack, Toxiproxy
 
 LATENCY_MS = 2000
 DB_BUDGET_S = 4.0  # pycommon: DB_STATEMENT_TIMEOUT_MS / 1000 + DB_POOL_TIMEOUT_S (2 s + 2 s)
 BUDGET_S = DB_BUDGET_S + 1.0  # margin for the HTTP hop through Docker port forwarding
 RECOVERY_S = 15.0
+TIMED_OUT = (
+    'http_server_request_duration_seconds_count{service_name="payroll", '
+    'http_route="/v1/pay-runs", http_response_status_code="503"}'
+)
 
 
 def _list_runs(stack: Stack, timeout: float = 60.0) -> tuple[httpx.Response, float]:
@@ -50,6 +54,7 @@ def _wait_recovered(stack: Stack) -> float:
 
 
 @pytest.mark.smoke
+@pytest.mark.timeout(120 + METRIC_WAIT_S)
 def test_slow_db_request_times_out_at_budget_and_recovers(
     stack: Stack, toxiproxy: Toxiproxy
 ) -> None:
@@ -58,6 +63,7 @@ def test_slow_db_request_times_out_at_budget_and_recovers(
     the toxic is removed (the toxiproxy fixture resets all toxics in teardown either way)."""
     baseline, _ = _list_runs(stack)
     assert baseline.status_code == 200  # the pool now holds warm connections
+    timed_out = stack.prom(TIMED_OUT)
 
     toxiproxy.add("postgres", "slow-db", "latency", latency=LATENCY_MS, jitter=0)
     for _ in range(3):
@@ -73,3 +79,5 @@ def test_slow_db_request_times_out_at_budget_and_recovers(
 
     toxiproxy.reset()
     assert _wait_recovered(stack) < RECOVERY_S
+    # HLD §4: http_server_request_duration_seconds counts the three 503s
+    stack.wait_increase("payroll 503s", TIMED_OUT, timed_out, 3)

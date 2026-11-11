@@ -190,13 +190,25 @@ Measured locally on the development machine (an Apple-silicon Mac) with the Comp
 
 | What                                  | Result                                                                                       |
 | ------------------------------------- | -------------------------------------------------------------------------------------------- |
-| Full local e2e (`scripts/ci/e2e.sh`)  | Green: 27 Playwright tests, 8 seed tests, Schemathesis identity 1085, payroll 2159 and bank-stub 172 generated cases all passing, 18 of 18 metric series present |
+| Full local e2e (`scripts/ci/e2e.sh`)  | Green: 27 Playwright tests, 8 seed tests, Schemathesis identity 1085, payroll 2159 and bank-stub 172 generated cases all passing, 18 of 18 metric series present (`check_metrics.sh` now requires 26, C77) |
 | Settlement, 500-employee run          | p95 5.7 s (SLO ≤ 60 s; `load/settlement.js`)                                                 |
 | k6 smoke                              | p95 about 30 ms                                                                              |
 | Service startup                       | about 1.2 s per service from container start to ready (limit 20 s, PAY-NFR-15)               |
-| Nightly resilience suite              | 13 tests passed in 27.6 min (job timeout 60 min)                                             |
-| Alert drills                          | All 6 paging alerts delivered to alert-sink `/page`; timings in spec C75 ([spec README](specs/payrun-0.1/README.md)) |
+| Nightly resilience suite              | 13 tests passed in 27.6 min; 29.5 min after each test gained its log-event and metric checks (C77); 33 min on the CI runner (job timeout 60 min) |
+| Alert drills                          | All 6 paging alerts delivered to alert-sink `/page`; timings in spec C75 ([spec README](specs/payrun-0.1/README.md)). The DLQ drill now dead-letters while the worker is stopped (the C75 new-series path): paged in 43 s (C77) |
 
 ### Nightly load and soak
 
-<!-- NIGHTLY_RESULTS -->
+First full pass: nightly run [43040233170](https://github.com/Positron00/FinApp/actions/runs/43040233170) on `e3789dd` (2026-11-11), GitHub `ubuntu-latest` runner, 500 seeded employees. Results are in the `log-load` artifact (`load/results/*.json`, `ci-logs/load.log`).
+
+| Scenario | Load | Result | Threshold |
+| --- | --- | --- | --- |
+| `full` | 30 it/s for 10 min (~44 req/s) | p95 39 ms simple, 56 ms heavy; 0 failed of 29,364 requests | p95 < 300 ms / 1.5 s, errors < 1% |
+| `soak` | 30 min | p95 24 ms, no drift (24.9 → 23.9 ms); RSS slope ≤ +0.2%; consumer lag 0 | drift, RSS slope ≤ 5%, lag not growing |
+| `settlement` | 5 runs × 500 employees | p95 16.6 s approval → final | p95 ≤ 60 s |
+
+The same run's `resilience` (13 tests, 33 min), `schemathesis-deep` and `audit` jobs passed. `e2e-repeat` could not start: the runner failed to resolve Ubuntu's apt mirror while installing Chromium's system packages (both nightly runs that day). That failure is infrastructure; see the job's issue.
+
+The first nightly run (43037260723) found a real bug in the k6 scripts: the per-VU cookie jar leaked the approver's session into the load user's requests (403 then 401s). Fixed in `e3789dd` by giving every k6 request a throwaway jar.
+
+Follow-up: the bottleneck was not reached at 2.2× peak; a stepped ramp beyond 30 it/s would find the ceiling.

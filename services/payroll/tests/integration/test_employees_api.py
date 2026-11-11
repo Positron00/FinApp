@@ -358,10 +358,10 @@ async def test_patch_email_taken_404_and_roles(api: Api, db: Any) -> None:
     assert r.json()["error"]["details"] == [{"field": "body.name", "issue": "null_not_allowed"}]
 
 
-async def test_bank_edit_after_run_creation_blocks_the_editor_from_approving(api: Api) -> None:
-    """PAY-203 → PAY-401, ADR 0005: an approver who also edited an employee's bank details after
-    the run was created can't approve it (403 approver_must_differ, rule bank_editor); another
-    approver can."""
+async def test_unvetted_bank_edit_blocks_the_editor_from_approving(api: Api) -> None:
+    """PAY-203 → PAY-401, ADR 0005, C73: an approver who also edited an employee's bank details,
+    not yet released by a second person, can't approve the run (403 approver_must_differ, rule
+    bank_editor); another approver can."""
     emp = await api.create_employee()
     run = await api.create_run()
     r = await _patch(

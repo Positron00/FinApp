@@ -1,6 +1,6 @@
 # Architecture plan: PayRun
 
-Status: v1.3, 2026-11-10 (v1.2 accepted 2026-11-10: the user signed off the service map, the J1–J5 scope and all ADRs; v1.3 folds in spec decisions C46–C63 after S1–S7) · Repo: `/Users/danc/Repos/FinApp` (remote `github.com/Positron00/FinApp`, public) · First release: 0.1.0 · Specs: `docs/specs/payrun-0.1/` (aligned 2026-11-10, through C63)
+Status: v1.4, 2026-11-11 (v1.2 accepted 2026-11-10: the user signed off the service map, the J1–J5 scope and all ADRs; v1.3 folded in spec decisions C46–C63 after S1–S7; v1.4 folds in C64–C77: hardening, the security review, alert drills, measured capacity and the alignment review) · Repo: `/Users/danc/Repos/FinApp` (remote `github.com/Positron00/FinApp`, public) · First release: 0.1.0 · Specs: `docs/specs/payrun-0.1/` (aligned 2026-11-11, through C77)
 
 ## 1. Summary
 
@@ -326,7 +326,7 @@ Each schema has a migrator role and a runtime role (`architecture.md` §6).
 | Schema | Main tables | Personal data | Retention (0.1.0) |
 | --- | --- | --- | --- |
 | `identity` | `users` (email, name, roles[], roles_version, status, company_id), `credentials` (argon2id hash), `invites`/`password_resets` (token hash, expiry), `audit_log` (user_id, event, ip_hash = HMAC-SHA256 keyed with `AUDIT_IP_HASH_KEY`, at), `email_outbox` (recipient, template, token reference; the rendered body with the link is never stored) | email, name, IP hash | Users are deactivated, not deleted. Tokens are purged 7 days after expiry. Audit log 400 days. Sent and failed emails purged after 7 days |
-| `payroll` | `company_settings` (incl. timezone, biweekly_anchor, require_dual_approval), `employees` (name, email, type, annual_salary_cents/hourly_rate_cents, schedule, bank_routing_enc, bank_account_enc, account_last4, bank_updated_by, bank_updated_at, status, deactivated_at), `pay_runs` (period, status, tax_bps, retirement_bps, require_dual_approval snapshot, totals, calculated_by, approved_by, approved_at, processing_since, first_final_at), `pay_run_hours`, `payslips` (snapshot of name and pay basis, gross/tax/deduction/net cents), `payouts` (one per payslip: current_attempt, status requested/paid/failed, no_transfer), `payout_attempts` (`UNIQUE(payout_id, attempt)`, status requested/indeterminate/needs_operator/settled/rejected, failure_reason, bank_reference, bank_snapshot_enc, requested_at, last_published_at, publish_count, needs_operator_at, final_at), `audit_events`, `outbox`, `idempotency_keys` | name, email, salary, bank details (encrypted) | Payroll records are kept (statutory retention is a post-0.1 ADR). **Bank details of deactivated employees are purged 30 days after deactivation**, if no attempt for them is non-final. The purge also nulls `bank_snapshot_enc` on their final attempts (maintenance task, with a test). Audit diffs for bank edits record only `account_last4` and the names of the changed fields. Sent outbox rows purged after 7 days. Idempotency keys expire after 24 h |
+| `payroll` | `company_settings` (incl. timezone, biweekly_anchor, require_dual_approval), `employees` (name, email, type, annual_salary_cents/hourly_rate_cents, schedule, bank_routing_enc, bank_account_enc, account_last4, bank_updated_by, bank_updated_at, status, deactivated_at), `pay_runs` (period, status, tax_bps, retirement_bps, require_dual_approval snapshot, totals, calculated_by, approved_by, approved_at, processing_since, first_final_at), `pay_run_hours`, `payslips` (snapshot of name and pay basis, gross/tax/deduction/net cents), `payouts` (one per payslip: current_attempt, status requested/paid/failed, no_transfer), `payout_attempts` (`UNIQUE(payout_id, attempt)`, status requested/indeterminate/needs_operator/settled/rejected, failure_reason, bank_reference, bank_snapshot_enc, requested_at, last_published_at, publish_count, needs_operator_at, resolved_by, final_at), `audit_events` (append-only for `payroll_app`, C73), `outbox`, `idempotency_keys` | name, email, salary, bank details (encrypted) | Payroll records are kept (statutory retention is a post-0.1 ADR). **Bank details of deactivated employees are purged 30 days after deactivation**, if no attempt for them is non-final. The purge also nulls `bank_snapshot_enc` on their final attempts (maintenance task, with a test). Audit diffs for bank edits record only `account_last4` and the names of the changed fields. Sent outbox rows purged after 7 days. Idempotency keys expire after 24 h |
 | `payouts` | `disbursements` (payout_id, attempt, company_id, status submitting/done, outcome, reason, bank_reference, last_event_id, deliveries), `processed_events` | none (no account numbers are stored by the worker) | processed_events 30 days; disbursements kept |
 | `bank_stub` | `transfers` (id, idempotency_key unique, amount_cents, currency, account_last4, status, reason, bank_reference, timestamps) | last 4 digits only | dev and uat only; truncated by `stack.sh reset` |
 
@@ -406,7 +406,7 @@ payroll's internal API rather than as events ([ADR 0003](../adr/0003-payout-flow
   | Edit company settings, view payroll audit | ✓ | | |
   | Manage employees and bank details | | ✓ | |
   | Create, edit hours, calculate, delete runs | | ✓ | |
-  | Approve runs, retry payouts, resolve blocked payouts (PAY-502) | | | ✓ (with dual approval on: not the run's creator, calculator or an hours editor, nor the editor of an affected employee's unvetted bank change; ADR 0005 as amended by C73) |
+  | Approve runs, retry payouts, resolve blocked payouts (PAY-502) | | | ✓ (with dual approval on: approve: not the run's creator, its calculator, the last editor of any of its hours rows, nor the editor of an unvetted bank change on an employee who gets a transfer; retry: not the unvetted bank editor, nor the operator who marked the attempt rejected; resolve: any approver. ADR 0005 as amended by C73) |
   | View runs, payslips, employees (including salaries) | ✓ | ✓ | ✓ |
 
   All three roles can see salaries; this is recorded as a decision in [ADR 0002](../adr/0002-sign-in-and-roles.md).
@@ -478,6 +478,16 @@ There are no real third-party APIs. **bank-stub** stands in for a payment proces
 | Recovery | RPO 5 min (managed Postgres point-in-time recovery in prod); RTO 1 h. Redis AOF means queued payouts survive a restart |
 | Startup | Each service ready within 20 s after its migrations |
 
+**Measured capacity (first nightly pass, 2026-11-11, run 43040233170 on a GitHub `ubuntu-latest` runner, Compose stack, 500 employees).** Every scenario met its SLO with 0 failed requests and 0 failed checks:
+
+| Scenario | Load | Result |
+| --- | --- | --- |
+| Full (`load/full.js`) | 30 iterations/s for 10 min, ~44 req/s at the BFF (2.2× the 20 req/s peak) | p95 39 ms simple, 56 ms heavy |
+| Soak (`load/soak.js`) | 30 min, ~6 req/s | p95 24 ms; first vs last window 24.9 → 23.9 ms (no drift); RSS slope ≤ +0.2% per service (limit 5%); consumer lag 0 |
+| Settlement (`load/settlement.js`) | 5 runs of 500 employees | approval → all payouts final p95 16.6 s (SLO 60 s); approve p95 600 ms, calculate 182 ms |
+
+The first bottleneck was not reached within the tested range: at 2.2× peak, latency is far below the targets and no resource limit showed. The settlement path is the slowest. It took 16.6 s on the CI runner against 5.7 s on a developer machine; the gap tracks the smaller machine, but it was not profiled, so which stage dominates is not yet known. Finding the actual ceiling needs a stepped ramp beyond 30 iterations/s; that is out of scope for 0.1.0 (recorded as a follow-up in `docs/TESTING.md`).
+
 ## 11. Observability
 
 As in `observability.md`: OTel in the BFF and every service → Collector → Tempo, Prometheus and
@@ -510,12 +520,12 @@ Loki → Grafana, plus Alertmanager. The BFF records the journey SLI with an exp
   | `BffAvailabilityFastBurn` | page | paging receiver |
   | `BffAvailabilitySlowBurn` | ticket | ticket receiver |
   | `PayoutSettlementSlow` (`max(payroll_runs_processing_oldest_age_seconds) > 60` for 2 m) | page | paging receiver |
-  | `PayoutDLQ` (`increase(queue_messages_total{outcome="dlq"}[15m]) > 0`, or a new series already above 0, C75) | page (money stuck) | paging receiver |
+  | `PayoutDLQ` (`increase(queue_messages_total{outcome="dlq"}[15m]) > 0`, or a series above 0 with no sample in the hour before the window, C75, C77) | page (money stuck) | paging receiver |
   | `PayoutNeedsOperator` (`max(payroll_attempts_needs_operator) > 0`) | page | paging receiver |
-  | `PayoutLateSettlement` (`increase(payroll_late_settlements_total[15m]) > 0`, or a new series above 0 (C75); a late `settled` for a rejected or superseded attempt, possible double payment) | page | paging receiver |
+  | `PayoutLateSettlement` (`increase(payroll_late_settlements_total[15m]) > 0`, or a series above 0 with no sample in the hour before the window (C75, C77); a late `settled` for a rejected or superseded attempt, possible double payment) | page | paging receiver |
   | `PayoutsStuck` (`max(payroll_payouts_stuck) > 0` for 10 m) | page | paging receiver |
   | `PayoutStreamNearMaxlen` (length > 80% of MAXLEN) | warning | ticket receiver |
-  | `EmailOutboxStuck` (oldest pending > 15 m, or `increase(identity_emails_failed_total[1h]) > 0`) | warning | ticket receiver |
+  | `EmailOutboxStuck` (oldest pending > 15 m, or `increase(identity_emails_failed_total[1h]) > 0`, or a failure series above 0 with no sample in the two hours before the window, C75, C77) | warning | ticket receiver |
   | `RateLimiterErrors` (> 0 for 5 m) | warning | ticket receiver |
   | `OutboxStuck` (oldest > 60 s) | warning | ticket receiver |
   | `ConsumerLagGrowing` | warning | ticket receiver |
@@ -573,7 +583,7 @@ the alert's `runbook_url`.
 | Worker crash after the bank call, before the result | Redelivered, same key, bank returns the original transfer, paid once | integration + resilience | `bank.transfer.submitted` | `payouts_bank_transfers_total` | — |
 | Bank timeout after it actually settled | Retry with the same key returns settled; or `indeterminate`, then re-publish, then settled | integration + resilience (Toxiproxy `timeout` on the response path) | `payout.indeterminate` | `payroll_payouts_republished_total` | `PayoutsStuck` if prolonged |
 | Bank down | Breaker opens; attempts `indeterminate`; run `processing` (awaiting bank); recovers when the bank returns | resilience | `external.breaker.opened`, `payout.indeterminate` | `circuit_breaker_state{target="bank"}` | `BankBreakerOpen`, `PayoutSettlementSlow` |
-| bank-stub restart mid-run | Persistent ledger keeps idempotency; ≤ 1 settled transfer per payout | resilience | — | — | — |
+| bank-stub restart mid-run | Persistent ledger keeps idempotency; ≤ 1 settled transfer per payout | resilience | `bank_stub.transfer.replayed` | `payouts_bank_transfers_total{outcome="settled"}` | — |
 | Redelivered old attempt after a retry | Instruction 409 `attempt_not_current`; no bank call; ACK | integration | `payout.attempt_not_current` | `queue_messages_total{outcome}` | — |
 | Two consumers on one message (XAUTOCLAIM while the first is alive) | Unique disbursement plus bank key: one transfer | integration | — | — | — |
 | payroll down during processing | Pending, then DLQ after the budget; re-publish redrives after recovery | resilience | `queue.message.failed` | `queue_messages_total{outcome="dlq"}` | `PayoutDLQ`, `PayoutsStuck` |
@@ -582,13 +592,16 @@ the alert's `runbook_url`.
 | Slow DB (2 s latency) | Requests time out at budget with 503 `db_timeout` | resilience (PR fault smoke) | `http.request` | `http_server_request_duration_seconds` | `BffAvailabilityFastBurn` |
 | Poison message (schema-invalid, amount mismatch, `payout_not_found`) | DLQ at once; `needs_operator` where the payout is known; operator resolves (PAY-502) | integration | `payout.needs_operator` | `payroll_attempts_needs_operator` | `PayoutDLQ`, `PayoutNeedsOperator` |
 | Key window expired (attempt older than `BANK_KEY_SAFE_WINDOW_S`) | GET by key only, never a new POST; not found → `needs_operator` | integration | `payout.key_window_expired` | `payroll_attempts_needs_operator` | `PayoutNeedsOperator` |
-| SMTP down | Email queued; invite returns 201; failed after 10 attempts | integration | `email.send_failed` | `identity_emails_pending` | `EmailOutboxStuck` |
+| SMTP down | Email queued; invite returns 201; failed after 10 attempts | integration + resilience | `email.send_failed` | `identity_emails_pending` | `EmailOutboxStuck` |
+| Redis restart (PAY-NFR-15) | AOF reload; the stream and consumer group survive; no re-publish needed | resilience (`test_redis_restart.py`) | Redis log "DB loaded from append only file" | `redis_start_time_seconds` | — |
 | Re-publish racing a live consumer | Fresh `event_id`; both deliveries pass the instruction check; same bank key, so one transfer; the second result gets 200 with the stored outcome | integration | `payout.republished` | `payroll_payouts_republished_total` | — |
 | `indeterminate` posted after `settled` (or the reverse) | After `settled`: no change, 200. After `indeterminate`: `settled` applies | integration | `payout.result_recorded` | `payroll_payouts_total` | — |
 | Late definite answer for a `needs_operator` attempt | `settled`/`rejected` applies (the bank's answer wins); `indeterminate`/`poison` → 200, no change (spec R7, C42) | integration | `payout.result_recorded` | `payroll_payouts_total` | — |
 | Poison message looping through re-publish | Attempt `needs_operator`; re-publish stops; UI shows "blocked" | integration | `payout.needs_operator` | `payroll_attempts_needs_operator` | `PayoutNeedsOperator` |
 | Consumer group lost (NOGROUP after FLUSHALL) | The worker recreates the group from `0` with MKSTREAM; re-publish redrives | integration + resilience | `queue.group.recreated`, `payout.republished` | `payroll_payouts_republished_total` | `PayoutsStuck` if prolonged |
-| Outbox relay crash | Unsent rows stay; another replica's relay (SKIP LOCKED) or the restart sends them | integration | `outbox.relay.error` | `outbox_oldest_age_seconds` | `OutboxStuck` |
+| Late `settled` answer for a rejected or superseded attempt (possible double payment) | Response unchanged; audit `payout.late_settlement` once per attempt; the operator checks the bank and recalls (C71) | integration (`test_resolve.py`, late-settlement cases) | `payout.late_settlement` (error) | `payroll_late_settlements_total` | `PayoutLateSettlement` (page) |
+| Relay refuses an envelope (`EnvelopeInvalidError`) | The row stays unsent and is never re-claimed; re-publish moves the attempt to `needs_operator` / `envelope_invalid`; the operator resolves it, then removes the row (C76) | integration (`test_outbox.py`) | `outbox.relay.error`, `payout.needs_operator` | `outbox_oldest_age_seconds` | `OutboxStuck`, `PayoutNeedsOperator` |
+| Outbox relay crash | Unsent rows stay; another replica's relay (SKIP LOCKED) or the restart sends them | integration (`test_relay_loop.py`, C77) | `outbox.relay.error` | `outbox_oldest_age_seconds` | `OutboxStuck` |
 | Postgres down or failing over | `/readyz` fails; 503 `db_unavailable` fast; recovery without stuck pool connections | resilience | `db.unavailable` | `http_server_request_duration_seconds` | `BffAvailabilityFastBurn` |
 | identity down at login | BFF 503 `service_unavailable`; breaker; other journeys still work for signed-in users | resilience (PR fault smoke) | `bff.upstream_error` | `circuit_breaker_state{target="identity"}` | `BffAvailabilityFastBurn` |
 | JWT clock skew | 5 s leeway accepted; skew beyond the 60 s exp gives 401 `invalid_token` | unit | `auth.token.rejected` | — | — |
@@ -648,7 +661,7 @@ the alert's `runbook_url`.
 | [0002](../adr/0002-sign-in-and-roles.md) | Sign-in pattern A, invite-only, three roles | accepted 2026-11-10 |
 | [0003](../adr/0003-payout-flow.md) | Payout flow: event out, API back; double-payment guard | accepted 2026-11-10 |
 | [0004](../adr/0004-bank-details-at-rest.md) | Bank details encrypted at rest; last 4 digits only in the API | accepted 2026-11-10 |
-| [0005](../adr/0005-four-eyes-approval.md) | Dual approval (four-eyes) as a company setting, default on | accepted 2026-11-10 |
+| [0005](../adr/0005-four-eyes-approval.md) | Dual approval (four-eyes) as a company setting, default on | accepted 2026-11-10; amended 2026-11-11 (C73) |
 | [0006](../adr/0006-money-and-rounding.md) | Money as integer cents; rounding rules | accepted 2026-11-10 |
 | [0007](../adr/0007-data-stores.md) | Data stores: one Postgres, one Redis; managed in uat and prod | accepted 2026-11-10 |
 | [0008](../adr/0008-secrets.md) | Secrets: `.env` in dev and CI, External Secrets in Kubernetes | accepted 2026-11-10 |
@@ -686,3 +699,8 @@ The layout follows `architecture.md` §2:
 | 2026-11-10 | Spec Step 2: final decision-application review (6 breaking, 12 minor; all held) | The C48 wait was half-wired (column never set, error code missing, e2e conflict); the C50 revoke broke the audit purge; payroll's relay didn't fit pycommon's protocol; `check_metrics.sh` required series that don't exist on a healthy stack; plus label, scope and convention drift | Fixed in the design bodies; C56 (validation field paths) and C57 (example files) added; identity audit purge via a `SECURITY DEFINER` function |
 | 2026-11-10 | Implementation follow-ups S2–S7 (spec C58–C62) | Tool and dependency hygiene; dev accounts on `.local` rejected by email-validator; `lock_timeout` not mapped; SQLAlchemy instrumentation gated on its version; OTel globals leaking between test suites; Next 16 `X-Forwarded-For` behaviour | C58 (two-week rule in uv and pnpm, pytest-socket flags), C59 (`payrun.example.com`, `check_secrets` skips optional secrets), C60 (`55P03` → 503, idempotency scope), C61 (`skip_dep_check`, UUIDv7 `jti`), C62 (client IP from `n − hops`, refuse hops < 1 in uat/prod, one per-attempt timeout) |
 | 2026-11-10 | Step 5 alignment review (five independent reviews of S1–S7; spec C63) | ADR 0003 (c) and J4 dropped late definite answers on `needs_operator` attempts, and ADRs sat outside the precedence chain; gauges with unit `1` would be renamed `_ratio`; bare `OSError`/`TimeoutError` mapped to DB errors; no `fail_under`; bootstrap re-run restored `alembic_version` writes; Redis users could enumerate keys with SCAN; a missing JWT keyset only warned in dev; static test secrets; stale §2.2, §4, §6, §11, §12.1 and §17 entries | ADRs join the precedence chain (C > R > requirements > ADRs > designs > plan); ADR 0003 (c) and J4 apply a late `settled`/`rejected`; ADRs 0002, 0004 and 0008 corrected; §2.2 adds `PAYOUT_MARK_REJECTED_MIN_WAIT_S`, `PAYOUT_CONSUMER_GC_IDLE_S`, `PAYROLL_VALIDATE_EVENTS` and the SMTP keys; §4, §6, §11 labels, §12.1 (mirrors HLD §4), §17 updated; code fixes per C63 |
+| 2026-11-11 | Step 5 release review (F1–F6; four checklist-C reviews) | 3 breaking, ~40 minor | All fixed; spec C71 (late-settlement detection, PayoutLateSettlement) |
+| 2026-11-11 | H3 independent security review | 0 critical/high; 2 medium (four-eyes bypass via earlier bank edits; mark-rejected-then-retry double payment after key expiry), 4 low (payroll audit not append-only, attacker lockout, reset timing, denials not audited) | C73, C74; ADR 0005 amended |
+| 2026-11-11 | H2 live alert drills | PayoutDLQ didn't page (a counter series that starts above 0 reads as no increase) | C75 |
+| 2026-11-11 | First nightly runs | k6 cookie jar leaked the approver's session into the load user's requests; e2e-repeat blocked by the runner's apt mirror | k6 throwaway jars (`e3789dd`); Chromium installed without `--with-deps` (C77) |
+| 2026-11-11 | Alignment review of code, specs and plan since `c3ae71b` (three independent reviewers: services; platform and tests; docs and web) | Services 14 (vetted timing used transaction start; no-transfer edits blocked approvers; untraced relay rule; runbook gaps; reset floor skipped error paths); platform 20 (nightly issue had no log; web replicas collided in metrics; two Collector replicas; C75 arm false-paged after data gaps; missing check_metrics series, promtool cases and resilience metric checks); docs 19 (stale status lines, requirements, LLD bodies, runbook queries, test-profile limits undocumented) | All held fully or partly and were fixed except: Redis crash-kill variant (not added; AOF everysec loss is covered by re-publish); salary and rate edits outside four-eyes (accepted risk, C73 follow-up); CollectorDropping same-labelset limit (documented). C73, C74 additions; C76, C77 |

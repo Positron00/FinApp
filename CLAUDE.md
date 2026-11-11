@@ -70,9 +70,10 @@ Details and per-suite pytest commands: [docs/TESTING.md](docs/TESTING.md).
 - **No test literals that look like credentials.** Generate passwords, keys and tokens at runtime
   (`secrets`, `crypto.randomBytes`, `scripts/mint_token.py`). Dev accounts use
   `@payrun.example.com`. `.env` is git-ignored; `.env.example` holds names and empty secrets only.
-- **Before every commit, run the secret scan** and commit only when it prints `matches: none`:
-  `python3 ~/.claude/skills/feature-dev/scripts/secret_scan.py`. gitleaks runs in
-  `scripts/ci/security.sh` (Docker; set `GITLEAKS_BASE=<sha>`).
+- **Before every commit, scan for secrets.** Run gitleaks through `scripts/ci/security.sh`
+  (Docker; `GITLEAKS_BASE=<sha>` limits it to new commits). Where the optional local scanner
+  `~/.claude/skills/feature-dev/scripts/secret_scan.py` is installed, also run it on the staged
+  changes and commit only when it prints `matches: none`.
 - **Shared files** (`libs/pycommon`, `contracts/`, `scripts/`, `deploy/`, `.github/`, root files,
   lock files) belong to the lead in multi-agent work.
 - Kubernetes copies of shared assets are generated: edit the sources, then run

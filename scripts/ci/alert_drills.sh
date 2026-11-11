@@ -10,8 +10,9 @@
 #   1. waits until the alert is not firing in Prometheus (a notification for an alert that is
 #      already firing would not be sent again within the drill), then clears alert-sink;
 #   2. causes it on the stack:
-#        PayoutDLQ               a poison stream entry (unparseable envelope) XADDed as the payroll
-#                                Redis user: the worker dead-letters it at once
+#        PayoutDLQ               payout-worker stopped, a poison stream entry (unparseable
+#                                envelope) XADDed as the payroll Redis user, the worker started: it
+#                                dead-letters the entry in its first export interval (C75 new series)
 #        PayoutNeedsOperator     payout-worker stopped, a run approved, then a poison result for one
 #                                attempt posted to payroll with a worker token from mint_token
 #        PayoutLateSettlement    payout-worker stopped, a run approved, one attempt reported
@@ -309,11 +310,17 @@ approved_run() {
 # ---------------------------------------------------------------- drills
 drill_PayoutDLQ() {
   local entry ok=1
+  # The entry goes in while payout-worker is stopped; the restarted worker (a new process, so a new
+  # series) dead-letters it within its first export interval. Its first exported sample is then
+  # already 1, so every drill exercises the C75 new-series arm, the case the first drill missed.
+  service_stop payout-worker
   entry="$(redis_cli payroll REDIS_PAYROLL_PASSWORD XADD stream:payout.requested '*' \
     event_id "drill-$(date +%s)" type payout.requested envelope 'alert-drill: not json')" || return 1
-  log "poison entry $entry added to stream:payout.requested"
+  log "poison entry $entry added to stream:payout.requested (payout-worker stopped)"
+  service_up payout-worker || return 1
+  log "payout-worker started"
   delivered PayoutDLQ "$DRILL_TIMEOUT_S" &&
-    check_query "Queues: dead-lettered in 15 m" '(sum(increase(queue_messages_total{outcome="dlq"}[15m]) and queue_messages_total{outcome="dlq"} offset 15m) or vector(0)) + (sum(queue_messages_total{outcome="dlq"} unless queue_messages_total{outcome="dlq"} offset 15m) or vector(0)) > 0' &&
+    check_query "Queues: dead-lettered in 15 m" '(sum(increase(queue_messages_total{outcome="dlq"}[15m]) and max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m)) or vector(0)) + (sum(queue_messages_total{outcome="dlq"} unless max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m)) or vector(0)) > 0' &&
     check_query "Queues: DLQ length" 'max(queue_dlq_messages) > 0' && ok=0
   # reset: drop the drill's DLQ entry (matched by source_id) as the admin user
   redis_cli default REDIS_ADMIN_PASSWORD --json XRANGE stream:payout.requested.dlq - + |
@@ -358,7 +365,7 @@ drill_PayoutLateSettlement() {
   payroll_api result "$payout" "$attempt" settled "DRILL-$(date +%s)" >/dev/null || return 1
   log "payout $payout attempt $attempt: rejected, then settled (late settlement)"
   delivered PayoutLateSettlement "$DRILL_TIMEOUT_S" &&
-    check_query "Queues: late settlements in 15 m" '(sum(increase(payroll_late_settlements_total[15m]) and payroll_late_settlements_total offset 15m) or vector(0)) + (sum(payroll_late_settlements_total unless payroll_late_settlements_total offset 15m) or vector(0)) > 0' && ok=0
+    check_query "Queues: late settlements in 15 m" '(sum(increase(payroll_late_settlements_total[15m]) and max_over_time(payroll_late_settlements_total[1h] offset 15m)) or vector(0)) + (sum(payroll_late_settlements_total unless max_over_time(payroll_late_settlements_total[1h] offset 15m)) or vector(0)) > 0' && ok=0
   log "the cause in Loki: {service_name=\"payroll\"} | event=\"payout.late_settlement\" | payout_id=\"$payout\""
   service_up payout-worker || ok=1
   wait_until "$DRILL_RECOVERY_WAIT_S" "run $rid final" run_final "$rid" || log "WARNING: run $rid not final yet"

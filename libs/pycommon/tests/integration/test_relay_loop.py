@@ -13,6 +13,7 @@ import pytest
 from pycommon.db import create_engine, new_id, session_factory
 from pycommon.redis_client import create_redis
 from pycommon.streams import Envelope, RelayLoop, StreamItem, StreamProducer
+from pycommon.testing import JsonLogCapture
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -206,3 +207,116 @@ async def test_full_batch_then_immediate_loop(
     (t1, n1), (t2, n2) = repo.claims[:2]
     assert (n1, n2) == (100, 50)
     assert t2 - t1 < 1.0
+
+
+class CrashedError(Exception):
+    """Stands in for the relay process dying: what its claim sees once the connection is gone."""
+
+
+class CrashingRepo(OutboxRepo):
+    """Claims a batch, then stops before publishing (no ``mark_sent``) until ``die`` is set; then
+    stops its loop and fails, so the claiming transaction ends without a commit."""
+
+    def __init__(self, stop: asyncio.Event) -> None:
+        super().__init__()
+        self.claimed = asyncio.Event()
+        self.die = asyncio.Event()
+        self.backend_pid: int | None = None
+        self._stop = stop
+
+    async def claim_unsent(self, session: AsyncSession, *, limit: int) -> Sequence[StreamItem]:
+        await super().claim_unsent(session, limit=limit)
+        self.backend_pid = (await session.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+        self.claimed.set()
+        await self.die.wait()  # the rows stay locked and unpublished meanwhile
+        self._stop.set()  # a dead process claims nothing more
+        raise CrashedError
+
+
+async def _terminate(pg: Pg, pid: int) -> bool:
+    conn = await _admin(pg)
+    try:
+        return bool(await conn.fetchval("SELECT pg_terminate_backend($1)", pid))
+    finally:
+        await conn.close()
+
+
+async def _oldest_unsent_age_s(pg: Pg) -> float:
+    """What the services' ``outbox_oldest_age_seconds`` gauge reads: 0 when nothing is unsent."""
+    conn = await _admin(pg)
+    try:
+        age = await conn.fetchval(
+            "SELECT coalesce(extract(epoch FROM now() - min(created_at)), 0) "
+            "FROM pyc.outbox WHERE sent_at IS NULL"
+        )
+        return float(age)
+    finally:
+        await conn.close()
+
+
+async def test_relay_crash_mid_batch_another_relay_sends_each_row_once(
+    pg: Pg, redis_server: RedisServer, clean: None, caplog_json: JsonLogCapture
+) -> None:
+    """HLD §4 "Outbox relay crash" (PAY-402, NFR-02): a relay claims a batch (rows locked FOR
+    UPDATE) and dies before publishing or ``mark_sent``. While its transaction is open the rows stay
+    unsent and a second relay skips them (SKIP LOCKED), so the oldest-unsent age grows. The server
+    then drops the dead relay's connection (as when its process is killed), which rolls the claim
+    back; the second relay publishes every row exactly once and the oldest-unsent age returns
+    to 0."""
+    await _insert(pg, 7)
+    with redis_server.client() as admin:
+        admin.delete(STREAM)
+    dead_stop = asyncio.Event()
+    crashing = CrashingRepo(dead_stop)
+    dead, dead_res = _loop(pg, redis_server, crashing, batch_size=100)
+    dead_task = asyncio.create_task(dead.run(dead_stop))
+    survivor_repo = OutboxRepo()
+    survivor, survivor_res = _loop(pg, redis_server, survivor_repo, poll_interval_s=0.1)
+    stop = asyncio.Event()
+    task: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(crashing.claimed.wait(), timeout=10)
+        assert crashing.backend_pid is not None
+        task = asyncio.create_task(survivor.run(stop))
+
+        # The survivor polls but claims nothing while the dead relay holds the row locks.
+        async def polled_empty() -> bool:
+            return len(survivor_repo.claims) >= 3
+
+        await _wait(polled_empty)
+        assert all(n == 0 for _, n in survivor_repo.claims)
+        assert all(r["sent_at"] is None for r in await _status(pg))
+        assert await _oldest_unsent_age_s(pg) > 0
+        with redis_server.client() as admin:
+            assert admin.xlen(STREAM) == 0
+
+        # The crash: the connection drops; Postgres rolls the claim back and frees the rows.
+        assert await _terminate(pg, crashing.backend_pid)
+        crashing.die.set()
+        await asyncio.wait_for(dead_task, timeout=10)
+
+        async def all_sent() -> bool:
+            return all(r["sent_at"] is not None for r in await _status(pg))
+
+        await _wait(all_sent)
+    finally:
+        stop.set()
+        crashing.die.set()  # a failed assertion above: end the claim, free the locks for teardown
+        await asyncio.wait_for(asyncio.gather(dead_task, return_exceptions=True), timeout=10)
+        if task is not None:
+            await task
+        await _close(survivor_res)
+        await _close(dead_res)
+
+    with redis_server.client() as admin:
+        entries = admin.xrange(STREAM)
+    ids = [fields[b"event_id"] for _, fields in entries]
+    assert len(ids) == 7
+    assert len(set(ids)) == 7
+    # The dead relay's claim left no trace: one attempt per row, all by the survivor.
+    assert {r["relay_attempts"] for r in await _status(pg)} == {1}
+    assert await _oldest_unsent_age_s(pg) == 0
+    # HLD §4's log event: the dying loop logs its failed batch as outbox.relay.error (the error is
+    # the dropped connection's, raised while the claim's transaction ends)
+    (error,) = caplog_json.events("outbox.relay.error")
+    assert error["error_type"]

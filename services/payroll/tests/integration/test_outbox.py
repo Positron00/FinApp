@@ -182,7 +182,7 @@ async def test_relay_revalidates_and_holds_back_an_invalid_envelope(
     assert str(bad) not in published
     [event] = caplog_json.events("outbox.relay.error")
     assert (event["error_type"], event["failed"]) == ("EnvelopeInvalidError", 1)
-    # Validation off: a corrupted row the relay never refused goes out (the C71 exclusion keys on
+    # Validation off: a corrupted row the relay never refused goes out (the C76 exclusion keys on
     # last_error, not on the payload).
     other = await db.fetchval(
         "SELECT id FROM payroll.outbox WHERE id <> $1 ORDER BY id LIMIT 1", bad
@@ -201,7 +201,7 @@ async def test_relay_revalidates_and_holds_back_an_invalid_envelope(
 async def test_relay_never_reclaims_a_refused_row(
     api: Api, db: Any, redis_admin: aioredis.Redis, caplog_json: JsonLogCapture
 ) -> None:
-    """PAY-NFR-03, PAY-402, C71: a row refused as EnvelopeInvalidError is skipped by every later
+    """PAY-NFR-03, PAY-402, C76: a row refused as EnvelopeInvalidError is skipped by every later
     poll: it is logged once, its relay_attempts stays 1, and with a batch of one it can't crowd
     out the valid rows behind it. It stays unsent, so outbox_unsent and OutboxStuck still see it."""
     await api.approved_run(3)

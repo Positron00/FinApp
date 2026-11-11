@@ -1,4 +1,4 @@
-# maxUnavailable 1 works with 1 replica (dev) and 2 (uat, prod) (platform LLD §9.2).
+# maxUnavailable 1: the Collector is a single-replica gateway in every overlay (platform LLD §8.1, §9.2).
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

@@ -368,6 +368,29 @@ async def test_resolver_cannot_retry_what_they_marked_rejected(api: Api, db: Any
     assert (await api.retry(run["id"], p["id"], headers=api.approver2())).status_code == 200
 
 
+async def test_redriver_may_retry_after_a_bank_rejection(api: Api, db: Any) -> None:
+    """PAY-500, PAY-502, C73: the resolver rule applies only to an operator_rejected attempt. X
+    redrives a blocked attempt (resolved_by = X), the bank then rejects it (account_closed), and
+    X's retry with dual approval on is 200: the bank, not X, decided the failure."""
+    run, p = await _blocked(api, db)
+    await api.mark_outbox_sent(db)
+    assert (await api.resolve(run["id"], p["id"], "redrive", NOTE)).status_code == 200
+    rejected = {"attempt": 1, "outcome": "rejected", "reason": "account_closed"}
+    assert (await api.result(p["id"], rejected)).json()["outcome"] == "rejected"
+    a = await _attempt(db, p["id"])
+    assert (a["status"], a["failure_reason"], a["resolved_by"]) == (
+        "rejected", "account_closed", APPROVER,
+    )  # fmt: skip
+    assert await db.fetchval(
+        "SELECT require_dual_approval FROM payroll.pay_runs WHERE id = $1", run["id"]
+    )
+    r = await api.retry(run["id"], p["id"])
+    assert r.status_code == 200, r.text
+    assert r.json()["current_attempt"] == 2
+    assert await db.fetchval("SELECT count(*) FROM payroll.audit_events "
+                             "WHERE event = 'payout.retry_denied'") == 0  # fmt: skip
+
+
 async def test_redrive_refused_after_key_window_expired(api: Api, db: Any) -> None:
     """PAY-410, PAY-502, C73: a redrive keeps requested_at, so the worker would GET the same key
     again, 404 and report key_window_expired again. Resolve refuses redrive for such an attempt

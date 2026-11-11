@@ -108,7 +108,7 @@ jobs:
     timeout-minutes: 40
     env:
       E2E_SUITE: full # C51: J1–J5 journeys on the full seed since task F6
-      PLAYWRIGHT_SKIP_INSTALL: "1" # installed below with the OS dependencies
+      PLAYWRIGHT_SKIP_INSTALL: "1" # installed below (browser only; see the step)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -136,7 +136,11 @@ jobs:
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}
-      - run: pnpm --filter web exec playwright install --with-deps chromium
+      # No --with-deps: that step runs apt, and the runner's Ubuntu mirror failed DNS in every nightly
+      # on 2026-11-11 (the tests never started). ubuntu-latest ships Google Chrome, so Chromium's
+      # system libraries are already present; the browser itself comes from Playwright's CDN. A
+      # missing library fails loudly at browser launch.
+      - run: pnpm --filter web exec playwright install chromium
       - run: scripts/ci/e2e.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()

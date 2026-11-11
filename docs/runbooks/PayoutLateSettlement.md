@@ -4,7 +4,7 @@
 |---|---|
 | **Severity** | page (possible double payment) |
 | **Service** | payroll |
-| **Alert** | `increase(payroll_late_settlements_total[15m]) > 0 or (payroll_late_settlements_total > 0 unless payroll_late_settlements_total offset 15m)` (`deploy/observability/prometheus/rules/alerts.yml`) |
+| **Alert** | `increase(payroll_late_settlements_total[15m]) > 0 or (payroll_late_settlements_total > 0 unless max_over_time(payroll_late_settlements_total[1h] offset 15m))` (`deploy/observability/prometheus/rules/alerts.yml`) |
 | **Requirement** | PAY-NFR-02 (a paid payout has exactly one settled transfer); C71 |
 | **Design** | `docs/specs/payrun-0.1/design-low-level-payroll.md` §4.7 "Late settlement" |
 | **Dashboard** | Queues and workers, `http://127.0.0.1:4101/d/payrun-queues` ("Late settlements") |
@@ -25,7 +25,7 @@ Payroll does not change the payout's state. The worker still gets the normal ans
 - an error log `payout.late_settlement` with the same fields plus `payout_id`, `pay_run_id` and `recorded` (`false` when the same answer arrived again and was not counted twice);
 - one increment of `payroll_late_settlements_total` (pre-initialised at 0, so the first one fires).
 
-The alert clears 15 minutes after the last increment. **Clearing does not mean the problem is resolved.**
+A restarted payroll that records a late settlement before its first metric export shows up as a new series that starts at 1, which `increase()` reads as 0; the rule's second arm (C75) pages on a series above 0 that had no sample in the hour before the window, so that case pages too, and a data gap on an old series does not. The alert clears 15 minutes after the last increment. **Clearing does not mean the problem is resolved.**
 
 ## Impact
 
@@ -40,10 +40,10 @@ An employee may have been paid twice, or was paid while payroll shows the payout
    ```
 
    Or, as an admin, call `GET /v1/audit-events?event=payout.late_settlement` (web: Audit page). Note `payout_id`, `pay_run_id`, `attempt`, `bank_reference`, `later_attempt_settled` and `later_settled_attempt`.
-2. **How many in the window** (Queues dashboard):
+2. **How many in the window** (Queues dashboard, "Late settlements"; new series count in full):
 
    ```promql
-   sum(increase(payroll_late_settlements_total[15m]))
+   (sum(increase(payroll_late_settlements_total[15m]) and max_over_time(payroll_late_settlements_total[1h] offset 15m)) or vector(0)) + (sum(payroll_late_settlements_total unless max_over_time(payroll_late_settlements_total[1h] offset 15m)) or vector(0))
    ```
 
 3. **Look at the payout.** Call `GET /v1/pay-runs/{pay_run_id}/payouts` and find the payout. Note each attempt's status and `bank_reference`, and the payout status.
@@ -73,7 +73,7 @@ An employee may have been paid twice, or was paid while payroll shows the payout
 - The alert resolves 15 minutes after the last increment; that only means no **new** late settlement arrived:
 
   ```promql
-  sum(increase(payroll_late_settlements_total[15m]))
+  (sum(increase(payroll_late_settlements_total[15m]) and max_over_time(payroll_late_settlements_total[1h] offset 15m)) or vector(0)) + (sum(payroll_late_settlements_total unless max_over_time(payroll_late_settlements_total[1h] offset 15m)) or vector(0))
   ```
 
 - Recovery is the incident ticket closed: each `payout.late_settlement` audit row has a bank confirmation and a recall or record outcome.

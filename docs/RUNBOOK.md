@@ -23,9 +23,11 @@ first if `.env` is missing.
 | Seed the dev data                        | `scripts/stack.sh seed` (see [Seeding](#seeding))           |
 | psql as a role                           | `scripts/stack.sh psql <role>`: `postgres`, `identity_app`, `identity_migrator`, `payroll_app`, `payroll_migrator`, `payouts_app`, `payouts_migrator`, `bank_stub_app`, `bank_stub_migrator` |
 
-`up` builds the images, runs the one-shots in order (Postgres bootstrap SQL from
-`deploy/compose/init/`, `migrate-identity`, `migrate-payroll`, `migrate-payouts`,
-`migrate-bank-stub`, then `bootstrap-owner`), starts the services and writes per-service startup
+The `test` profile (on by default) raises every rate limit and the login lockout to 1,000,000 and routes Postgres and Redis through Toxiproxy. Production values apply only with `--profiles core,obs`.
+
+`up` builds the images, runs the Postgres bootstrap SQL from `deploy/compose/init/`, then the
+four one-shots `migrate-identity`, `migrate-payroll`, `migrate-payouts` and `migrate-bank-stub`
+in parallel, then `bootstrap-owner` (after `migrate-identity`), starts the services and writes per-service startup
 times to `ci-logs/startup.json`. If the stack doesn't become healthy within
 `STACK_WAIT_TIMEOUT` (300 s), it prints the status and the last 100 log lines of each failing
 container.
@@ -44,8 +46,8 @@ Compose service names: `postgres`, `redis`, `mailpit`, `identity`, `payroll`, `p
 | payout-worker             | `GET /livez`        | `GET /readyz`                                     | `http://127.0.0.1:4112/readyz` (test profile) |
 | bank-stub                 | `GET /livez`        | `GET /readyz` (DB and migrations only, spec R6)   | `http://127.0.0.1:4113/readyz` (test profile) |
 | Grafana                   |                     | `GET /api/health`                                 | `http://127.0.0.1:4101/api/health`     |
-| Prometheus / Alertmanager |                     | `GET /-/ready`                                    | `:4132/-/ready`, `:4133/-/ready`       |
-| alert-sink                |                     | `GET /healthz`                                    | `http://127.0.0.1:4135/healthz`        |
+| Prometheus / Alertmanager |                     | `GET /-/ready`                                    | `:4132/-/ready`, `:4133/-/ready` (test profile) |
+| alert-sink                |                     | `GET /healthz`                                    | `http://127.0.0.1:4135/healthz` (test profile) |
 
 Python services listen on 8000 inside their containers and the web on 3000; Compose healthchecks
 and Kubernetes probes use the same paths. `/livez` does no I/O; `/readyz` runs every check
@@ -66,7 +68,7 @@ Files are in `deploy/observability/grafana/dashboards/`.
 | Bank (stub) dependency | `/d/payrun-bank`             | Bank calls by outcome, breaker state, payroll calls from the worker |
 | Platform           | `/d/payrun-platform`             | Postgres, Redis memory, Collector throughput and drops        |
 
-Prometheus is at <http://127.0.0.1:4132>, Alertmanager at <http://127.0.0.1:4133>. Traces (Tempo)
+Prometheus is at <http://127.0.0.1:4132>, Alertmanager at <http://127.0.0.1:4133> (both published by the `test` profile only). Traces (Tempo)
 and logs (Loki) are browsed through Grafana Explore; logs are JSON with an `event` field, e.g.
 `{service_name="payroll"} | event="payout.needs_operator"`.
 
@@ -101,7 +103,8 @@ Rules: `deploy/observability/prometheus/rules/alerts.yml` (17 alerts) and the Ku
 | PodRestarts (Kubernetes)  | warning  | ticket  | any            | —     | [PodRestarts](runbooks/PodRestarts.md)                         |
 
 Each rule's `runbook_url` annotation points at the same file on GitHub, and `dashboard_url` at the
-dashboard to open first. The rules have promtool tests in
+dashboard to open first. `dashboard_url` is the dev Grafana host (`127.0.0.1:4101`); uat and prod
+must template it (an external label or the Alertmanager template, C77). The rules have promtool tests in
 `deploy/observability/prometheus/tests/` and `deploy/k8s/observability/alerts-kubernetes_test.yml`.
 
 ## Common operations

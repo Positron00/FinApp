@@ -1,7 +1,8 @@
 """Password reset request and confirm (identity LLD §6.6; PAY-105, PAY-107, R17, R19, C31).
 
 The request always answers 202 after one user lookup, whether or not the email matched, and
-pads its database work to ``REQUEST_FLOOR_S`` so a match isn't slower than a miss (C74). The
+pads its database work to ``REQUEST_FLOOR_S`` so a match isn't slower than a miss (C74). The pad
+runs in ``finally``, so a database error or lock timeout also takes at least the floor. The
 relay issues the token at send time, so the request stores no token. Confirm checks the token
 before the password policy, then marks the reset used, replaces the credential and bumps
 ``roles_version`` in one transaction, so the BFF's re-check ends any session it missed; it then
@@ -23,6 +24,7 @@ from pycommon.otel import inject_traceparent, tracer
 
 from identity.api.errors import PasswordTooWeak, ResetInvalid
 from identity.api.schemas import ResetConfirmOut
+from identity.db.models import User
 from identity.db.repositories import AuditRepo, CredentialRepo, OutboxRepo, ResetRepo, UserRepo
 from identity.domain import audit_events
 from identity.domain.passwords import PasswordTooWeakError, check_password_policy
@@ -64,39 +66,43 @@ async def request_reset(rt: IdentityRuntime, cmd: RequestCommand) -> None:
         raise RateLimited(retry_after_s=retry)
     loop = asyncio.get_running_loop()
     with tracer("identity").start_as_current_span("identity.reset.request") as span:
-        started = loop.time()
-        async with rt.sessions() as session:
-            found = await UserRepo(session).find_by_email(cid, cmd.email)
+        started = loop.time()  # after the limits: a 429 is not padded
         reset_id: UUID | None = None
         email_id: UUID | None = None
-        if found is not None and found.status == "active":
-            async with transaction(rt.sessions) as session:
-                # Lock the user so a concurrent deactivation or request is serialised (§6.5).
-                user = await UserRepo(session).lock(cid, found.id)
-                if user is not None and user.status == "active":
-                    resets, outbox = ResetRepo(session), OutboxRepo(session)
-                    revoked = await resets.revoke_pending_for_user(cid, user.id)
-                    if revoked is not None:
-                        await outbox.cancel_pending(password_reset_id=revoked)
-                    reset_id = await resets.insert(cid=cid, user_id=user.id)
-                    email_id = await outbox.queue(
-                        cid=cid,
-                        template="password_reset",
-                        recipient=user.email,
-                        password_reset_id=reset_id,
-                        traceparent=inject_traceparent(),
-                    )
-                    await AuditRepo(session).append(
-                        cid=cid,
-                        event=audit_events.AUTH_PASSWORD_RESET_REQUESTED,
-                        target_user_id=user.id,
-                        ip_hash=ih,
-                        details={"reset_id": str(reset_id)},
-                    )
-        if reset_id is not None and found is not None:
-            span.set_attribute("identity.user_id", str(found.id))
-        # Same latency for a match and a miss (C74): sleep out the rest of the floor.
-        await asyncio.sleep(max(0.0, REQUEST_FLOOR_S - (loop.time() - started)))
+        found: User | None = None
+        try:
+            async with rt.sessions() as session:
+                found = await UserRepo(session).find_by_email(cid, cmd.email)
+            if found is not None and found.status == "active":
+                async with transaction(rt.sessions) as session:
+                    # Lock the user so a concurrent deactivation or request is serialised (§6.5).
+                    user = await UserRepo(session).lock(cid, found.id)
+                    if user is not None and user.status == "active":
+                        resets, outbox = ResetRepo(session), OutboxRepo(session)
+                        revoked = await resets.revoke_pending_for_user(cid, user.id)
+                        if revoked is not None:
+                            await outbox.cancel_pending(password_reset_id=revoked)
+                        reset_id = await resets.insert(cid=cid, user_id=user.id)
+                        email_id = await outbox.queue(
+                            cid=cid,
+                            template="password_reset",
+                            recipient=user.email,
+                            password_reset_id=reset_id,
+                            traceparent=inject_traceparent(),
+                        )
+                        await AuditRepo(session).append(
+                            cid=cid,
+                            event=audit_events.AUTH_PASSWORD_RESET_REQUESTED,
+                            target_user_id=user.id,
+                            ip_hash=ih,
+                            details={"reset_id": str(reset_id)},
+                        )
+            if reset_id is not None and found is not None:
+                span.set_attribute("identity.user_id", str(found.id))
+        finally:
+            # Same latency for a match and a miss (C74), and for a database error or lock
+            # timeout on either path: sleep out the rest of the floor before answering.
+            await asyncio.sleep(max(0.0, REQUEST_FLOOR_S - (loop.time() - started)))
     fields: dict[str, Any] = {"matched": reset_id is not None, "ip_hash": ih}
     if reset_id is not None and found is not None:
         fields["user_id"] = str(found.id)

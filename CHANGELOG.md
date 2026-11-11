@@ -4,11 +4,13 @@ All notable changes to PayRun are documented in this file. The format is based o
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
 ## [0.1.0] - 2026-11-11
 
 The first release of PayRun: payroll for small and medium businesses, with journeys J1–J5
 end to end. Decisions are recorded in the spec README
-(`docs/specs/payrun-0.1/README.md`, R1–R37 and C1–C75) and ADRs 0001–0013.
+(`docs/specs/payrun-0.1/README.md`, R1–R37 and C1–C77) and ADRs 0001–0013.
 
 ### Added
 
@@ -45,6 +47,10 @@ end to end. Decisions are recorded in the spec README
   failure; alert drills (`scripts/ci/alert_drills.sh`).
 - **Docs:** README, architecture, runbook, testing and API guides, `CLAUDE.md`, and
   `.env.example`.
+- Counter alerts (`PayoutDLQ`, `PayoutLateSettlement`, `EmailOutboxStuck`) and their dashboard
+  panels also fire on a counter series that first appears above 0, such as a dead letter inside a
+  restarted worker's first export interval (C75, found by the live PayoutDLQ drill). All six
+  paging alerts pass their drills.
 
 ### Security
 
@@ -60,8 +66,5 @@ end to end. Decisions are recorded in the spec README
   redaction of secrets and personal data in logs and telemetry, non-root images, and 17 accepted
   base-image CVEs recorded with owners and expiry dates in `SECURITY_DEPENDENCIES.md`.
 
-### Fixed
-
-- Counter alerts missed a series that first appears above 0 (C75): `PayoutDLQ`,
-  `PayoutLateSettlement` and `EmailOutboxStuck`, and their dashboard panels, now also fire on a
-  new series, found by the live PayoutDLQ drill. All six paging alerts pass their drills.
+[Unreleased]: https://github.com/Positron00/FinApp/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Positron00/FinApp/releases/tag/v0.1.0

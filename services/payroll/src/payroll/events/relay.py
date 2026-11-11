@@ -8,7 +8,7 @@ With ``validate`` on (``PAYROLL_VALIDATE_EVENTS``), the envelope is re-validated
 Schema after the traceparent rewrite (C60, C63). An invalid row is never published: it is marked
 failed (``relay_attempts``, ``last_error``), logged as ``outbox.relay.error`` once and left
 unsent, so ``OutboxStuck`` fires, while the rest of the batch still goes out. ``claim_unsent``
-skips such rows from then on (C71). Re-publish then moves the
+skips such rows from then on (C76). Re-publish then moves the
 attempt to ``needs_operator`` (``envelope_invalid``), so the payout is never stuck for good
 (§5.3, PAY-NFR-03).
 
@@ -39,7 +39,7 @@ __all__ = ["PayrollOutboxSource", "RelayRef", "build_relay"]
 SPAN_NAME: Final = "payroll.outbox.publish"
 _log: Final = get_logger("payroll.outbox")
 
-# A row the relay refused (``last_error = 'EnvelopeInvalidError'``) is never claimed again (C71):
+# A row the relay refused (``last_error = 'EnvelopeInvalidError'``) is never claimed again (C76):
 # re-validating it on every poll would only log ``outbox.relay.error`` again and take a batch
 # slot from a valid row. It stays unsent, so ``outbox_unsent`` and ``OutboxStuck`` still see it,
 # and re-publish moves its attempt to ``needs_operator`` (``envelope_invalid``). Rows that failed

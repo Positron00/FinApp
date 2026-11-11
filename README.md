@@ -54,6 +54,9 @@ Then open <http://127.0.0.1:4100> and sign in (see [Seeded sign-ins](#seeded-sig
 `PUBLIC_BASE_URL` (spec C12).
 
 - `scripts/stack.sh up --profiles core` starts only the app, Postgres, Redis and Mailpit.
+
+> **The default stack is a test stack.** `scripts/stack.sh up` turns on the `test` profile, which routes Postgres and Redis through Toxiproxy, publishes the service, Prometheus, Alertmanager and alert-sink ports, and raises every rate limit and the login lockout to 1,000,000 (`deploy/compose/compose.test.yaml`). To try the production limits (PAY-104, PAY-603, C74) by hand, use `scripts/stack.sh up --profiles core,obs`; those ports are then not published.
+
 - `scripts/stack.sh seed --employees 500` adds monthly employees up to 500 (for k6);
   `scripts/stack.sh seed --skeleton` seeds only the walking-skeleton set.
 - `scripts/stack.sh down` stops everything; `scripts/stack.sh reset` drops the volumes and starts
@@ -130,7 +133,7 @@ docs/                    plan, specs, ADRs, runbooks, and the guides below
 - [`docs/RUNBOOK.md`](docs/RUNBOOK.md): operating the stack, alerts and runbooks, common operations.
 - [`docs/plan/architecture-plan.md`](docs/plan/architecture-plan.md): the architecture plan.
 - [`docs/specs/payrun-0.1/`](docs/specs/payrun-0.1/README.md): requirements, designs, tasks and the
-  decision tables (R1–R37, C1–C75).
+  decision tables (R1–R37, C1–C77).
 - [`docs/adr/`](docs/adr/): ADRs 0001–0013.
 - [`docs/runbooks/`](docs/runbooks/): one runbook per alert.
 - [`SECURITY_DEPENDENCIES.md`](SECURITY_DEPENDENCIES.md): accepted dependency and image CVEs.

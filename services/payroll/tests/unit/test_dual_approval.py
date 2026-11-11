@@ -91,13 +91,16 @@ def test_bank_edit_never_vetted_blocks_however_old() -> None:
 
 
 def test_bank_edit_window_is_since_last_vetted_snapshot() -> None:
-    """PAY-401 (d), C73: an edit after the employee's last four-eyes snapshot blocks; an edit
-    covered by a later snapshot doesn't; another editor's edits and no edit don't."""
-    late = [uuid4(), uuid4()]
+    """PAY-401 (d), C73: an edit after the employee's last four-eyes snapshot blocks, and so does
+    one at the same instant (both are clock_timestamp() after the row lock, so a tie is clock
+    resolution with an unknown order: fail closed); an edit covered by a later snapshot doesn't;
+    another editor's edits and no edit don't."""
+    late = [uuid4(), uuid4(), uuid4()]
     edits = [
         BankEdit(late[0], APPROVER, T0 + timedelta(seconds=1), vetted_at=T0),
         BankEdit(late[1], APPROVER, T0, vetted_at=None),
-        BankEdit(uuid4(), APPROVER, T0, vetted_at=T0),  # snapshot at the edit: vetted
+        BankEdit(late[2], APPROVER, T0, vetted_at=T0),  # snapshot at the edit: not vetted
+        BankEdit(uuid4(), APPROVER, T0, vetted_at=T0 + timedelta(microseconds=1)),
         BankEdit(uuid4(), APPROVER, T0, vetted_at=T0 + timedelta(days=1)),
         BankEdit(uuid4(), APPROVER, None),
         BankEdit(uuid4(), OTHER, T0 + timedelta(days=1)),
@@ -105,7 +108,7 @@ def test_bank_edit_window_is_since_last_vetted_snapshot() -> None:
     with pytest.raises(ApproverMustDiffer) as err:
         _approve(bank_edits=edits)
     assert _rule(err) == {"rule": "bank_editor", "employee_ids": sorted(map(str, late))}
-    _approve(bank_edits=edits[2:])
+    _approve(bank_edits=edits[3:])
 
 
 def test_approve_rule_order() -> None:

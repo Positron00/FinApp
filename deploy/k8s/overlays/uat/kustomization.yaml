@@ -36,7 +36,7 @@ replicas:
   - { name: payroll, count: 2 }
   - { name: payout-worker, count: 2 }
   - { name: bank-stub, count: 2 }
-  - { name: otel-collector, count: 2 }
+  - { name: otel-collector, count: 1 } # platform LLD §8.1: one gateway, so tail sampling sees whole traces
 patches:
   - path: patches/config.yaml
   - path: patches/delete-bank-stub-placeholders.yaml

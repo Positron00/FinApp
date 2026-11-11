@@ -7,11 +7,12 @@ sleeps for a fixed time to let a fault "settle".
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -27,14 +28,59 @@ from scripts.mint_token import mint  # noqa: E402  (repo root added just above)
 
 FINAL_RUN: Final = frozenset({"paid", "partially_failed"})
 POLL_S: Final = 1.0
-# Payout timing stays at production values in the test profile (C53): the worker reclaims after
-# 60 s idle, dead-letters at delivery 5, and payroll re-publishes 360 s after the last publish on
-# a 60 s maintenance tick. These bound the waits below.
-CLAIM_IDLE_S: Final = 60
-REPUBLISH_AFTER_S: Final = 360
-MAINTENANCE_S: Final = 60
+COMPOSE_ARGS: Final = (
+    "docker", "compose", "--env-file", str(REPO_ROOT / ".env"),
+    "-f", str(REPO_ROOT / "deploy/compose/compose.yaml"),
+    "-f", str(REPO_ROOT / "deploy/compose/compose.test.yaml"),
+    "--profile", "core", "--profile", "obs", "--profile", "test",
+)  # fmt: skip
+# Payout timing stays at production values in the test profile (C53). The defaults below are
+# Compose's `x-payout-timing` values; when the Compose config can be read (it needs .env, as the
+# stack does) the waits use the values it resolves for payroll and payout-worker instead.
+TIMING_DEFAULTS: Final = {
+    "payout-worker": {
+        "PAYOUT_CLAIM_MIN_IDLE_MS": 60000, "PAYOUT_MAX_DELIVERIES": 5, "BANK_TOTAL_DEADLINE_S": 15,
+    },
+    "payroll": {"PAYOUT_REPUBLISH_AFTER_S": 360, "MAINTENANCE_INTERVAL_S": 60},
+}  # fmt: skip
+
+
+def compose_timing(config: Mapping[str, Any] | None = None) -> dict[str, int]:
+    """The payout timing keys from ``docker compose config --format json`` (or ``config``), per
+    TIMING_DEFAULTS. Only those keys are read: the services' environments also hold secrets. A key
+    the config does not resolve keeps its default."""
+    if config is None:
+        try:
+            out = subprocess.run(
+                [*COMPOSE_ARGS, "config", "--format", "json"],
+                capture_output=True, text=True, check=True, timeout=60, cwd=REPO_ROOT,
+            ).stdout  # fmt: skip
+            config = json.loads(out)
+        except OSError, subprocess.SubprocessError, ValueError:
+            config = {}
+    services = config.get("services", {})
+    timing: dict[str, int] = {}
+    for service, defaults in TIMING_DEFAULTS.items():
+        env = services.get(service, {}).get("environment") or {}
+        for key, default in defaults.items():
+            timing[key] = int(env.get(key, default))
+    return timing
+
+
+_TIMING: Final = compose_timing()
+# The worker reclaims a message after CLAIM_IDLE_S idle and dead-letters it at MAX_DELIVERIES;
+# each delivery's bank call has BANK_DEADLINE_S; payroll re-publishes REPUBLISH_AFTER_S after the
+# last publish, on its MAINTENANCE_S tick. These bound the waits below.
+CLAIM_IDLE_S: Final = _TIMING["PAYOUT_CLAIM_MIN_IDLE_MS"] // 1000
+MAX_DELIVERIES: Final = _TIMING["PAYOUT_MAX_DELIVERIES"]
+BANK_DEADLINE_S: Final = _TIMING["BANK_TOTAL_DEADLINE_S"]
+REPUBLISH_AFTER_S: Final = _TIMING["PAYOUT_REPUBLISH_AFTER_S"]
+MAINTENANCE_S: Final = _TIMING["MAINTENANCE_INTERVAL_S"]
 REPUBLISH_WAIT_S: Final = REPUBLISH_AFTER_S + 2 * MAINTENANCE_S + 60
-DLQ_WAIT_S: Final = 5 * CLAIM_IDLE_S + 90
+DLQ_WAIT_S: Final = MAX_DELIVERIES * CLAIM_IDLE_S + 90
+# Telemetry reaches Prometheus within one SDK export (15 s) plus one scrape (15 s); the waits on a
+# metric allow three of each.
+METRIC_WAIT_S: Final = 90
 STREAM: Final = "stream:payout.requested"
 DLQ: Final = "stream:payout.requested.dlq"
 
@@ -63,6 +109,14 @@ def error_code(r: httpx.Response) -> str | None:
         return None
 
 
+Series = dict[frozenset[tuple[str, str]], float]
+
+
+def counter_increase(before: Series, after: Series) -> float:
+    """The rise of a counter from one ``Stack.prom`` snapshot to the next, summed per series."""
+    return sum(max(0.0, v - before.get(k, 0.0)) for k, v in after.items())
+
+
 @dataclass(frozen=True)
 class Stack:
     env: dict[str, str]
@@ -82,15 +136,10 @@ class Stack:
 
     # ------------------------------------------------------------------------------ Compose
     def compose(self, *args: str, timeout: float = 180) -> str:
-        cmd = [
-            "docker", "compose", "--env-file", str(REPO_ROOT / ".env"),
-            "-f", str(REPO_ROOT / "deploy/compose/compose.yaml"),
-            "-f", str(REPO_ROOT / "deploy/compose/compose.test.yaml"),
-            "--profile", "core", "--profile", "obs", "--profile", "test", *args,
-        ]  # fmt: skip
         out = subprocess.run(
-            cmd, capture_output=True, text=True, check=True, timeout=timeout, cwd=REPO_ROOT
-        )
+            [*COMPOSE_ARGS, *args],
+            capture_output=True, text=True, check=True, timeout=timeout, cwd=REPO_ROOT,
+        )  # fmt: skip
         return out.stdout
 
     def psql(self, sql: str) -> list[list[str]]:
@@ -118,6 +167,50 @@ class Stack:
 
     def logs_since(self, service: str, since: datetime) -> str:
         return self.compose("logs", "--no-color", "--since", since.isoformat(), service)
+
+    # --------------------------------------------------------------------------- Prometheus
+    def prom(self, expr: str) -> Series:
+        """An instant query on the stack's Prometheus (PROMETHEUS_PORT, published by the test
+        profile): each sample's labels (``__name__`` dropped) and value."""
+        r = httpx.get(
+            f"{self.url('PROMETHEUS_PORT')}/api/v1/query", params={"query": expr}, timeout=10
+        )
+        r.raise_for_status()
+        data = r.json()["data"]
+        if data["resultType"] == "scalar":
+            return {frozenset(): float(data["result"][1])}
+        return {
+            frozenset((k, v) for k, v in s["metric"].items() if k != "__name__"): float(
+                s["value"][1]
+            )
+            for s in data["result"]
+        }
+
+    def wait_prom(
+        self, what: str, expr: str, ok: Callable[[float], bool], timeout: float = METRIC_WAIT_S
+    ) -> float:
+        """Polls ``expr`` until its largest sample satisfies ``ok``; returns that value."""
+
+        def probe() -> tuple[float] | None:
+            values = self.prom(expr).values()
+            top = max(values) if values else None
+            return (top,) if top is not None and ok(top) else None
+
+        return wait_until(f"{what} ({expr})", probe, timeout, interval=3.0)[0]
+
+    def wait_increase(
+        self, what: str, expr: str, before: Series, at_least: float, timeout: float = METRIC_WAIT_S
+    ) -> float:
+        """Polls a counter ``expr`` until it rose by ``at_least`` since the ``before`` snapshot
+        (``prom(expr)``), summed per series: a series that is new since then (a restarted
+        process has a new ``instance``) counts in full, one that expired (a dead process's
+        series leave after the Collector's 2 m metric_expiration) counts as no change."""
+
+        def probe() -> tuple[float] | None:
+            grown = counter_increase(before, self.prom(expr))
+            return (grown,) if grown >= at_least else None
+
+        return wait_until(f"{what} (+{at_least:g} in {expr})", probe, timeout, interval=3.0)[0]
 
 
 class Toxiproxy:

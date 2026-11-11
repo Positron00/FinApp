@@ -1,8 +1,9 @@
 """identity down at login (HLD §4 row "identity down"; plan §12.1, PR fault smoke; platform LLD
 §7.4: web -> identity stays direct, so the test stops the container; PAY-602, PAY-605).
 
-Expected: sign-in through the BFF gets 503 ``service_unavailable`` in the PAY-602 error format
-and the breaker logs ``bff.upstream_error``; a user who is already signed in keeps working (their
+Expected: sign-in through the BFF gets 503 ``service_unavailable`` in the PAY-602 error format,
+the BFF logs ``bff.upstream_error`` and its identity breaker opens (``circuit_breaker_state`` 2
+after BREAKER_FAILURES = 5 failed calls); a user who is already signed in keeps working (their
 session lives in Redis and payroll answers); sign-in works again once identity is back.
 """
 
@@ -11,13 +12,15 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
-from _stack import Bff, Containers, Stack, error_code, log_events, wait_until
+from _stack import METRIC_WAIT_S, Bff, Containers, Stack, error_code, log_events, wait_until
 
 RECOVERY_S = 60.0
+BREAKER_FAILURES = 5  # the web's BREAKER_FAILURES default
+BREAKER = 'circuit_breaker_state{service_name="web", target="identity"}'
 
 
 @pytest.mark.smoke
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(180 + METRIC_WAIT_S)
 def test_identity_down_login_503_signed_in_journeys_still_work(
     stack: Stack, containers: Containers, bff: Bff
 ) -> None:
@@ -27,11 +30,14 @@ def test_identity_down_login_503_signed_in_journeys_still_work(
     cookie = bff.login()
     containers.stop("identity")
 
-    for _ in range(3):
+    for _ in range(BREAKER_FAILURES + 1):  # enough failed calls to open the breaker
         r = bff.login_response()
         assert (r.status_code, error_code(r)) == (503, "service_unavailable")
         assert r.json()["error"]["request_id"]
     assert log_events(stack.logs_since("web", t0), "bff.upstream_error") >= 1
+    # HLD §4: circuit_breaker_state; the breaker stays open (2) until the next sign-in after
+    # BREAKER_RESET_S, and nothing below calls identity
+    stack.wait_prom("the BFF's identity breaker open", f"max({BREAKER})", lambda v: v == 2)
 
     # Signed in before the outage: the session lives in Redis and payroll answers, so the payroll
     # journeys keep working (the 60 s role re-check defers while identity is down, C63). Only

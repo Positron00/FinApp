@@ -3,7 +3,8 @@
 Each overlay (dev, uat, prod) is rendered with kustomize (no load-restrictor flag, C36) and checked:
 pod security, probes and resources, the C1 env contract, sampling (C23), the OTLP flush bound
 (C67; Compose's x-py-env is checked alongside), the web's port and probes (C4), NetworkPolicies
-(ADR 0011), bank-stub placement and prod's payout-worker replicas (R14, C32),
+(ADR 0011), bank-stub placement, prod's payout-worker replicas (R14, C32), the single-replica
+Collector gateway (§8.1),
 and ExternalSecrets without plaintext Secrets in uat and prod (R29).
 
 ``scripts/ci/manifests.sh`` sets ``K8S_RENDERED_DIR`` to the output it already validated with
@@ -306,6 +307,13 @@ def test_prod_payout_worker_has_zero_replicas(rendered: dict[str, list[Obj]]) ->
     assert _named(rendered["prod"], "Deployment", "payout-worker")["spec"]["replicas"] == 0
     assert _named(rendered["uat"], "Deployment", "payout-worker")["spec"]["replicas"] == 2
     assert _named(rendered["dev"], "Deployment", "payout-worker")["spec"]["replicas"] == 1
+
+
+@pytest.mark.parametrize("env", ENVS)
+def test_collector_is_a_single_replica_gateway(rendered: dict[str, list[Obj]], env: str) -> None:
+    """Platform LLD §8.1: one Collector per environment, so every span of a trace reaches the same
+    tail sampler (prod) and each series has one exporter."""
+    assert _named(rendered[env], "Deployment", "otel-collector")["spec"]["replicas"] == 1
 
 
 def test_prod_bank_base_url_is_a_placeholder(rendered: dict[str, list[Obj]]) -> None:

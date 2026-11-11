@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 from _stack import (
+    METRIC_WAIT_S,
     REPUBLISH_WAIT_S,
     STREAM,
     Bff,
@@ -35,6 +36,9 @@ from _stack import (
 )
 
 RECOVERY_S = 120
+LIMITER_ERRORS = 'rate_limiter_errors_total{service_name="web", component="web"}'
+UNSENT = 'max(outbox_unsent{service_name="payroll"})'
+REPUBLISHED = 'payroll_payouts_republished_total{service_name="payroll"}'
 
 
 def _relay_tried(stack: Stack, run_id: str) -> bool:
@@ -47,7 +51,7 @@ def _relay_tried(stack: Stack, run_id: str) -> bool:
     return total > 0 and failed == total
 
 
-@pytest.mark.timeout(RECOVERY_S + 120)
+@pytest.mark.timeout(RECOVERY_S + 2 * METRIC_WAIT_S + 120)
 def test_redis_down_fails_closed_holds_the_outbox_and_recovers(
     stack: Stack, toxiproxy: Toxiproxy, payroll: Payroll, bff: Bff
 ) -> None:
@@ -55,6 +59,7 @@ def test_redis_down_fails_closed_holds_the_outbox_and_recovers(
     closed; payroll's /readyz fails; the service limiter fails open, so approve commits and the
     outbox keeps every row unsent; after recovery the relay sends them and the run is paid."""
     t0 = datetime.now(UTC)
+    limiter_errors = stack.prom(LIMITER_ERRORS)
     run = payroll.calculated_run()
     cookie = bff.login()
     assert bff.call("GET", "/api/pay-runs", cookie=cookie).status_code == 200
@@ -73,6 +78,9 @@ def test_redis_down_fails_closed_holds_the_outbox_and_recovers(
     wait_until("the relay tried and kept every row", lambda: _relay_tried(stack, run["id"]), 30)
     assert unsent_outbox(stack, run["id"]) == len(ids)
     assert log_events(stack.logs_since("web", t0), "ratelimit.backend_error") >= 1
+    # HLD §4: rate_limiter_errors_total and outbox_unsent, while Redis is still away
+    stack.wait_increase("web limiter errors", LIMITER_ERRORS, limiter_errors, 1)
+    stack.wait_prom("payroll's unsent outbox rows", UNSENT, lambda v: v >= len(ids))
 
     toxiproxy.set_enabled("redis", True)
     payroll.wait_final(run["id"], RECOVERY_S)
@@ -83,7 +91,7 @@ def test_redis_down_fails_closed_holds_the_outbox_and_recovers(
     assert bff.call("GET", "/api/pay-runs", cookie=cookie).status_code == 200
 
 
-@pytest.mark.timeout(REPUBLISH_WAIT_S + 180)
+@pytest.mark.timeout(REPUBLISH_WAIT_S + METRIC_WAIT_S + 180)
 def test_redis_flushall_mid_run_recreates_the_group_and_republish_completes(
     stack: Stack, containers: Containers, payroll: Payroll
 ) -> None:
@@ -92,6 +100,7 @@ def test_redis_flushall_mid_run_recreates_the_group_and_republish_completes(
     recreates its group (queue.group.recreated) and payroll's re-publish redrives every
     attempt, so the run is paid once."""
     t0 = datetime.now(UTC)
+    republished = stack.prom(REPUBLISHED)
     run = payroll.calculated_run()
     containers.pause("payout-worker")
     payroll.approve(run["id"])
@@ -116,3 +125,4 @@ def test_redis_flushall_mid_run_recreates_the_group_and_republish_completes(
     redriven = [c for c in publish_counts(stack, run["id"]) if c >= 2]
     assert len(redriven) >= len(ids) - 1
     assert log_events(stack.logs_since("payroll", t0), "payout.republished") >= len(redriven)
+    stack.wait_increase("re-published payouts", REPUBLISHED, republished, len(redriven))

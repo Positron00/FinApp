@@ -51,7 +51,7 @@ async def create_employee(rt: Runtime, principal: Principal, body: EmployeeCreat
         ),
         account_last4=body.bank_account[-4:],
         bank_updated_by=principal.sub,
-        bank_updated_at=func.now(),
+        bank_updated_at=func.clock_timestamp(),
         status="active",
         created_by=principal.sub,
     )
@@ -146,7 +146,10 @@ def _apply_bank(
         )
         emp.account_last4 = body.bank_account[-4:]
     emp.bank_updated_by = actor
-    emp.bank_updated_at = func.now()
+    # clock_timestamp() at the UPDATE, after EmployeeRepo.lock, not now() (the transaction start):
+    # a PATCH that waited on an approve's FOR SHARE lock must date its edit after that approve's
+    # snapshot, or the new details would count as vetted by it (C73, design §3.4).
+    emp.bank_updated_at = func.clock_timestamp()
     emp.bank_purged_at = None
     changed.update(supplied)
     return {"old": old_last4, "new": emp.account_last4}
@@ -160,7 +163,8 @@ async def update_employee(
     - Plain fields and the merged pay basis are compared with the row; only real changes are
       written and audited (field names only).
     - A supplied bank field is always a bank change: it is re-encrypted with the active kid and
-      sets ``bank_updated_by`` and ``bank_updated_at`` (PAY-203, ADR 0005). The stored value is
+      sets ``bank_updated_by`` and ``bank_updated_at`` (``clock_timestamp()`` at the UPDATE,
+      after the row lock; PAY-203, ADR 0005, C73). The stored value is
       never decrypted to compare (ADR 0004), so re-sending the same number still counts.
     - ``status: inactive`` sets ``deactivated_at``; ``status: active`` clears it (and
       ``bank_purged_at`` once new details arrive).

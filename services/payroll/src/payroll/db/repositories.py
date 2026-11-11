@@ -8,6 +8,7 @@ company and parent scope (an unknown ``after`` is 422 ``invalid_cursor``), then 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
 
@@ -39,12 +40,21 @@ __all__ = [
     "PayoutRepo",
     "PayslipRepo",
     "SettingsRepo",
+    "clock_timestamp",
     "rowcount",
 ]
 
 
 def rowcount(result: Any) -> int:
     return int(cast(CursorResult[Any], result).rowcount)
+
+
+async def clock_timestamp(session: AsyncSession) -> datetime:
+    """The database's ``clock_timestamp()``: the wall clock at this statement, not ``now()`` (the
+    transaction start). Approve and retry read it after their employee locks to date a bank
+    snapshot (``payout_attempts.requested_at``, C73, design §3.4)."""
+    value: datetime = (await session.execute(select(func.clock_timestamp()))).scalar_one()
+    return value
 
 
 async def _anchor(session: AsyncSession, stmt: Executable) -> tuple[Any, ...]:
@@ -173,7 +183,11 @@ class DualApprovalRepo:
         ``actor_id``, each with ``vetted_at``, the latest ``requested_at`` of an attempt of
         theirs in a dual-approval run requested by someone other than that editor (the last
         time a second person released a snapshot of these bank details). Call it with the
-        employee rows already locked, so the edit can't change underneath."""
+        employee rows already locked, so the edit can't change underneath.
+
+        Pass only employees that get a transfer (approve: payslip ``net_cents > 0``; retry: the
+        payout's employee). A no-transfer employee gets no payout attempt, so their edit is
+        neither released nor ever vetted by this run, and must not block its editor (C73)."""
         vetted = (
             select(func.max(PayoutAttempt.requested_at))
             .select_from(Payout)
