@@ -26,10 +26,14 @@ from payroll.domain.validation import aba_checksum_ok, is_monday, is_valid_timez
 __all__ = [
     "Account",
     "AttemptOut",
+    "AuditEventName",
+    "AuditEventOut",
     "CompanySettingsIn",
     "CompanySettingsOut",
     "EmployeeCreate",
     "EmployeeOut",
+    "EmployeeUpdate",
+    "EntityType",
     "IdemKey",
     "InstructionOut",
     "Page",
@@ -120,7 +124,7 @@ class CompanySettingsOut(BaseModel):
     updated_by: str | None
 
 
-# --- employees (PAY-201, PAY-202) --------------------------------------------------------------
+# --- employees (PAY-201, PAY-202, PAY-203) -----------------------------------------------------
 
 
 class EmployeeCreate(BaseModel):
@@ -157,6 +161,44 @@ class EmployeeCreate(BaseModel):
         return self
 
 
+class EmployeeUpdate(BaseModel):
+    """PATCH body (PAY-203): any PAY-201 field, or ``status``. At least one field; an explicit
+    ``null`` is refused (omit the field instead). The merged pay basis is checked by the service
+    against the stored row (design §4.3)."""
+
+    model_config = _REQUEST
+
+    name: Name | None = None
+    email: Email | None = None
+    pay_type: PayType | None = None
+    annual_salary_cents: SalaryCents | None = None
+    hourly_rate_cents: RateCents | None = None
+    schedule: Schedule | None = None
+    bank_routing: Routing | None = None
+    bank_account: Account | None = None
+    status: Literal["active", "inactive"] | None = None
+
+    @field_validator("*")
+    @classmethod
+    def _not_null(cls, v: Any) -> Any:
+        if v is None:  # validators run only on supplied values, so None was an explicit null
+            raise PydanticCustomError("null_not_allowed", "Omit the field instead of null.")
+        return v
+
+    @field_validator("bank_routing")
+    @classmethod
+    def _aba(cls, v: str) -> str:
+        if not aba_checksum_ok(v):
+            raise PydanticCustomError("aba_checksum", "The routing number checksum is invalid.")
+        return v
+
+    @model_validator(mode="after")
+    def _not_empty(self) -> Self:
+        if not self.model_fields_set:
+            raise PydanticCustomError("no_fields", "The update has no fields.")
+        return self
+
+
 class EmployeeOut(BaseModel):
     model_config = _RESPONSE
 
@@ -185,6 +227,33 @@ class EmployeeOut(BaseModel):
         values = {n: getattr(data, n) for n in names if hasattr(data, n)}
         values["has_bank_details"] = values.pop("bank_account_enc", None) is not None
         return values
+
+
+# --- audit events (design §4.5) ----------------------------------------------------------------
+
+EntityType = Literal["company_settings", "employee", "pay_run", "payout"]
+AuditEventName = Annotated[str, StringConstraints(pattern=r"^[a-z_]+\.[a-z_]+$", max_length=64)]
+
+
+class AuditEventOut(BaseModel):
+    """C5 ``PayrollAuditEvent``; ``details`` holds IDs, counts, codes and ``account_last4`` only."""
+
+    model_config = _RESPONSE
+
+    id: UUID
+    at: datetime  # created_at
+    actor_id: str
+    event: str
+    entity_type: EntityType
+    entity_id: UUID
+    details: dict[str, Any]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_row(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            return data
+        return {n: getattr(data, "created_at" if n == "at" else n) for n in cls.model_fields}
 
 
 # --- pay runs (PAY-300, PAY-302, PAY-303, PAY-400) ---------------------------------------------

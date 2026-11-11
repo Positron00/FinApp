@@ -20,6 +20,8 @@ EXPECTED: dict[tuple[str, str], tuple[str | None, str, str]] = {
     ("get", "/v1/employees"): (None, "200", "Page_EmployeeOut_"),
     ("post", "/v1/employees"): ("EmployeeCreate", "201", "EmployeeOut"),
     ("get", "/v1/employees/{employee_id}"): (None, "200", "EmployeeOut"),
+    ("patch", "/v1/employees/{employee_id}"): ("EmployeeUpdate", "200", "EmployeeOut"),
+    ("get", "/v1/audit-events"): (None, "200", "Page_AuditEventOut_"),
     ("get", "/v1/pay-runs"): (None, "200", "Page_PayRunOut_"),
     ("post", "/v1/pay-runs"): ("PayRunCreate", "201", "PayRunOut"),
     ("get", "/v1/pay-runs/{run_id}"): (None, "200", "PayRunOut"),
@@ -47,8 +49,8 @@ def test_committed_spec_is_current(spec: dict[str, Any]) -> None:
 
 
 def test_routes_models_and_error_responses(spec: dict[str, Any]) -> None:
-    """PAY-NFR-12, PAY-602: exactly the S5 routes, each with its models, and every error status
-    documented with the shared ErrorBody schema."""
+    """PAY-NFR-12, PAY-602, PAY-203: exactly the S5 and F2 routes, each with its models, and
+    every error status documented with the shared ErrorBody schema."""
     paths = {p: ops for p, ops in spec["paths"].items() if p not in HEALTH}
     assert {(m, p) for p, ops in paths.items() for m in ops} == set(EXPECTED)
     for (method, path), (body, ok, out) in EXPECTED.items():

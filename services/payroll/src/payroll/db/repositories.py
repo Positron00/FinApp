@@ -93,6 +93,20 @@ class EmployeeRepo:
         return row
 
     @staticmethod
+    async def lock(session: AsyncSession, company_id: UUID, employee_id: UUID) -> Employee:
+        """``FOR UPDATE`` (lock order 6, §4.10): the PATCH never locks ``pay_runs``."""
+        stmt = (
+            select(Employee)
+            .where(Employee.id == employee_id, Employee.company_id == company_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        row = (await session.scalars(stmt)).first()
+        if row is None:
+            raise NotFound("employee_not_found")
+        return row
+
+    @staticmethod
     async def page(
         session: AsyncSession,
         company_id: UUID,
@@ -415,3 +429,33 @@ class AuditRepo:
                 trace_id=f"{ctx.trace_id:032x}" if ctx.is_valid else None,
             )
         )
+
+    @staticmethod
+    async def page(
+        session: AsyncSession,
+        company_id: UUID,
+        *,
+        entity_type: str | None,
+        entity_id: UUID | None,
+        event: str | None,
+        after: UUID | None,
+        limit: int,
+    ) -> list[AuditEvent]:
+        """Newest first (``id DESC``; UUIDv7 is time-ordered), ``limit + 1`` rows (§4.5, §4.9)."""
+        stmt = select(AuditEvent).where(AuditEvent.company_id == company_id)
+        if entity_type is not None:
+            stmt = stmt.where(AuditEvent.entity_type == entity_type)
+        if entity_id is not None:
+            stmt = stmt.where(AuditEvent.entity_id == entity_id)
+        if event is not None:
+            stmt = stmt.where(AuditEvent.event == event)
+        if after is not None:
+            key = await _anchor(
+                session,
+                select(AuditEvent.id).where(
+                    AuditEvent.id == after, AuditEvent.company_id == company_id
+                ),
+            )
+            stmt = stmt.where(_after((AuditEvent.id,), key, descending=True))
+        stmt = stmt.order_by(AuditEvent.id.desc()).limit(limit + 1)
+        return list((await session.scalars(stmt)).all())

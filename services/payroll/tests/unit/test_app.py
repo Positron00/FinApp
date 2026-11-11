@@ -96,6 +96,8 @@ ROUTES: list[tuple[str, str, tuple[str, ...]]] = [
     ("GET", "/v1/employees", ANY),
     ("POST", "/v1/employees", ("payroll_admin",)),
     ("GET", f"/v1/employees/{PID}", ANY),
+    ("PATCH", f"/v1/employees/{PID}", ("payroll_admin",)),
+    ("GET", "/v1/audit-events", ("admin",)),
     ("GET", "/v1/pay-runs", ANY),
     ("POST", "/v1/pay-runs", ("payroll_admin",)),
     ("GET", f"/v1/pay-runs/{RID}", ANY),

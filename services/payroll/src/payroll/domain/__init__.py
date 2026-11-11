@@ -24,6 +24,7 @@ __all__ = [
     "HoursMissing",
     "HoursOutOfBounds",
     "InvalidCursor",
+    "InvalidFields",
     "InvalidPeriodStart",
     "NoEmployees",
     "NotFound",
@@ -159,6 +160,23 @@ class InvalidCursor(DomainError):
     @property
     def details(self) -> Sequence[Mapping[str, Any]]:
         return [{"field": "query.cursor", "issue": "invalid_cursor"}]
+
+
+class InvalidFields(DomainError):
+    """422 ``validation_error`` for a rule that needs the stored row, such as the merged pay basis
+    of a PATCH (design §4.3). ``issues`` are ``(field, issue)`` pairs; values are never echoed."""
+
+    status = 422
+    code = "validation_error"
+    message = "The request failed validation."
+
+    def __init__(self, issues: Iterable[tuple[str, str]]) -> None:
+        super().__init__()
+        self.issues = list(dict.fromkeys(issues))
+
+    @property
+    def details(self) -> Sequence[Mapping[str, Any]]:
+        return [{"field": f, "issue": i} for f, i in self.issues]
 
 
 class HoursMissing(_EmployeeIdsError):

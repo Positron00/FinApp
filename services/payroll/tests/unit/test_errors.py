@@ -24,6 +24,7 @@ from payroll.domain import (
     HoursMissing,
     HoursOutOfBounds,
     InvalidCursor,
+    InvalidFields,
     InvalidPeriodStart,
     NoEmployees,
     NotFound,
@@ -71,6 +72,8 @@ CASES: list[tuple[DomainError, int, str, Any]] = [
     (EmployeeEmailTaken(), 409, "employee_email_taken", None),
     (NotFound("payout_not_found"), 404, "payout_not_found", None),
     (InvalidCursor(), 422, "validation_error", [{"field": "query.cursor", "issue": "invalid_cursor"}]),
+    (InvalidFields([("body.bank_account", "required_on_reactivation")] * 2), 422, "validation_error",
+     [{"field": "body.bank_account", "issue": "required_on_reactivation"}]),
 ]  # fmt: skip
 
 

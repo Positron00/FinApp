@@ -8,7 +8,7 @@ from datetime import date
 from typing import Any
 
 import pytest
-from payroll.api.schemas import CompanySettingsIn, EmployeeCreate, ResultIn
+from payroll.api.schemas import CompanySettingsIn, EmployeeCreate, EmployeeUpdate, ResultIn
 from payroll.domain.validation import aba_checksum_ok, is_monday, is_valid_timezone
 from pydantic import ValidationError
 
@@ -106,6 +106,48 @@ def test_employee_invalid(overrides: dict[str, Any], issue: str) -> None:
     with pytest.raises(ValidationError) as err:
         EmployeeCreate.model_validate(body)
     assert issue in _issues(err.value)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"name": "Ada King"},
+        {"status": "inactive"},
+        {"status": "active", "bank_routing": VALID_ROUTING, "bank_account": "1234"},
+        {"pay_type": "hourly", "hourly_rate_cents": 2500},
+        {"schedule": "biweekly"},
+    ],
+)
+def test_employee_update_valid(body: dict[str, Any]) -> None:
+    """PAY-203: any single PAY-201 field, or status, is a valid PATCH body."""
+    assert EmployeeUpdate.model_validate(body).model_fields_set == set(body)
+
+
+@pytest.mark.parametrize(
+    ("body", "field", "issue"),
+    [
+        ({}, "", "no_fields"),
+        ({"name": None}, "name", "null_not_allowed"),
+        ({"status": None}, "status", "null_not_allowed"),
+        ({"status": "deleted"}, "status", "literal_error"),
+        ({"bank_routing": "021000022"}, "bank_routing", "aba_checksum"),
+        ({"bank_account": "12"}, "bank_account", "string_pattern_mismatch"),
+        ({"hourly_rate_cents": 0}, "hourly_rate_cents", "greater_than_equal"),
+        ({"name": "A\x00B"}, "name", "nul_character"),
+        ({"deactivated_at": "2026-01-01T00:00:00Z"}, "deactivated_at", "extra_forbidden"),
+    ],
+)
+def test_employee_update_invalid(body: dict[str, Any], field: str, issue: str) -> None:
+    """PAY-203, PAY-602, C14: an empty PATCH, an explicit null, an unknown key or a bad value is
+    422 with the field's location; the value is never echoed."""
+    with pytest.raises(ValidationError) as err:
+        EmployeeUpdate.model_validate(body)
+    errors = err.value.errors()
+    assert {(".".join(str(p) for p in e["loc"]), str(e["type"])) for e in errors} == {
+        (field, issue)
+    }
+    if "bank_routing" in body:
+        assert body["bank_routing"] not in str([e["msg"] for e in errors])
 
 
 @pytest.mark.parametrize(

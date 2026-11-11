@@ -15,6 +15,8 @@ from tests.integration.conftest import Api
 pytestmark = pytest.mark.integration
 
 NAME = "Zelda Quixote"
+FIRST_NAME = "Yolanda Prior"
+FIRST_ACCOUNT = "12121212343"
 EMAIL = "zelda.quixote@example.com"
 ACCOUNT = "98765432109"
 SALARY = 7_777_777_31
@@ -24,10 +26,10 @@ STAFF_NAMES = ("Carl Calculator", "Grace Approver")
 async def test_full_flow_logs_no_personal_data_or_secrets(
     api: Api, caplog_json: JsonLogCapture
 ) -> None:
-    """PAY-NFR-07: over settings PUT → create employee → create run → calculate → approve →
-    instruction → result (and a rejected request with a body), the captured JSON logs hold no
-    salary or amount, employee or staff name, email, routing or account number, field key,
-    DB password or JWT."""
+    """PAY-NFR-07, PAY-203: over settings PUT → create employee → PATCH (name and bank) →
+    create run → calculate → approve → instruction → result (and a rejected request with a
+    body), the captured JSON logs hold no salary or amount, employee or staff name (old or
+    new), email, routing or account number (old or new), field key, DB password or JWT."""
     r = await api.client.put(
         "/v1/company/settings",
         json={
@@ -38,9 +40,16 @@ async def test_full_flow_logs_no_personal_data_or_secrets(
         headers=api.admin(),
     )  # fmt: skip
     assert r.status_code == 200
-    await api.create_employee(
-        name=NAME, email=EMAIL, annual_salary_cents=SALARY, bank_account=ACCOUNT
+    emp = await api.create_employee(
+        name=FIRST_NAME, email=EMAIL, annual_salary_cents=SALARY, bank_account=FIRST_ACCOUNT
     )
+    r = await api.client.patch(
+        f"/v1/employees/{emp['id']}",
+        json={"name": NAME, "bank_account": ACCOUNT, "bank_routing": VALID_ROUTING},
+        headers=api.payroll_admin(),
+    )
+    assert r.status_code == 200
+    assert caplog_json.events("employee.updated"), "the PATCH was logged"
     dup = await api.client.post(
         "/v1/employees",
         json={"name": NAME, "email": EMAIL.upper(), "pay_type": "salaried",
@@ -71,6 +80,8 @@ async def test_full_flow_logs_no_personal_data_or_secrets(
         "gross": str(gross),
         "net": str(net),
         "employee name": NAME,
+        "first employee name": FIRST_NAME,
+        "first account": FIRST_ACCOUNT,
         "email": EMAIL.split("@", maxsplit=1)[0],
         "routing": VALID_ROUTING,
         "account": ACCOUNT,

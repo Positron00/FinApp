@@ -1,6 +1,6 @@
 # Low-level design: payroll service
 
-Status: draft v3, 2026-11-11 (S5 review fixes, C63) · Sources: [architecture plan](../../plan/architecture-plan.md) v1.2 (accepted 2026-11-10), [requirements](requirements.md), [high-level design](design-high-level.md), the [spec README](README.md) "Spec resolutions" (R1–R37) and "Contract decisions" (C1–C63) tables, ADRs [0003](../../adr/0003-payout-flow.md), [0004](../../adr/0004-bank-details-at-rest.md), [0005](../../adr/0005-four-eyes-approval.md), [0006](../../adr/0006-money-and-rounding.md) · Event contracts: [`contracts/events/payout.requested.v1.json`](../../../contracts/events/payout.requested.v1.json), [`contracts/events/payout.requested.dlq.v1.json`](../../../contracts/events/payout.requested.dlq.v1.json) (written by payout-worker)
+Status: draft v4, 2026-11-11 (F2 payroll setup; S5 review fixes, C63) · Sources: [architecture plan](../../plan/architecture-plan.md) v1.2 (accepted 2026-11-10), [requirements](requirements.md), [high-level design](design-high-level.md), the [spec README](README.md) "Spec resolutions" (R1–R37) and "Contract decisions" (C1–C63) tables, ADRs [0003](../../adr/0003-payout-flow.md), [0004](../../adr/0004-bank-details-at-rest.md), [0005](../../adr/0005-four-eyes-approval.md), [0006](../../adr/0006-money-and-rounding.md) · Event contracts: [`contracts/events/payout.requested.v1.json`](../../../contracts/events/payout.requested.v1.json), [`contracts/events/payout.requested.dlq.v1.json`](../../../contracts/events/payout.requested.dlq.v1.json) (written by payout-worker)
 
 This document is the contract between the payroll implementers, the payout-worker team (§4.6, §4.7, §5)
 and the web team (§4.2–§4.5). Precedence: the README C-table, then the R-table, then `requirements.md`,
@@ -49,6 +49,7 @@ All paths are under `services/payroll/`. The package is `payroll`.
 | `src/payroll/domain/retry.py` | new | `check_retry`, `republish_backoff_s` and `republish_decision` (PAY-500, PAY-407) (§3.5). |
 | `src/payroll/domain/resolve.py` | new | `ResolveAction`, `check_resolve` and `resolve_transition` (PAY-502) (§3.5a). |
 | `src/payroll/domain/validation.py` | new | `aba_checksum_ok`, `is_monday` and the IANA timezone check. |
+| `src/payroll/domain/employees.py` | new (F2) | The PATCH rules that need the stored row (§4.3): `merge_pay_basis` (merged pay basis, the other type's amount cleared) and `check_bank_completeness` (all-or-none bank columns, `required_on_reactivation`). Raise `InvalidFields`. |
 | `src/payroll/db/models.py` | new | SQLAlchemy 2.0 declarative models for the 10 tables in §2 (`__table_args__ = {"schema": "payroll"}`). |
 | `src/payroll/db/session.py` | new | `session_scope(sessions, operation)`: one READ COMMITTED transaction, with pycommon's DB error mapping. The async engine and sessionmaker come from `pycommon.create_app` (asyncpg; `DB_*` keys; `statement_timeout` = `DB_STATEMENT_TIMEOUT_MS`, pool timeout `DB_POOL_TIMEOUT_S`). The sync engine for the collection-time gauges (psycopg, pool size 1) arrives with them in F4a. |
 | `src/payroll/db/repositories.py` | new | `SettingsRepo`, `EmployeeRepo`, `PayRunRepo`, `PayslipRepo`, `HoursRepo`, `PayoutRepo`, `AttemptRepo`, `AuditRepo`, `OutboxRepo`, `IdempotencyRepo`. Every method takes `company_id` first and uses bound parameters only. |
@@ -133,7 +134,7 @@ CREATE INDEX ix_employees_purge    ON payroll.employees (deactivated_at)
   WHERE status = 'inactive' AND bank_account_enc IS NOT NULL;
 ```
 
-- `bank_updated_by` and `bank_updated_at` are set on create (creating an employee counts as a bank edit; R34) and on every PATCH that changes `bank_routing` or `bank_account` (PAY-203).
+- `bank_updated_by` and `bank_updated_at` are set on create (creating an employee counts as a bank edit; R34) and on every PATCH that **supplies** `bank_routing` or `bank_account` (PAY-203). The stored numbers are never decrypted to compare (ADR 0004), so re-sending the same number still counts as a bank edit for dual approval (ADR 0005) **[decision, F2]**.
 - The purge (§5.4) sets the three bank columns to NULL and sets `bank_purged_at`.
 
 ### 2.3 `pay_runs`
@@ -345,7 +346,7 @@ Audit events and the shape of `details`:
 |---|---|---|
 | `settings.updated` | `{changed: {field: {old, new}}}` (no personal data) | PAY-200 |
 | `employee.created` | `{fields: [names], account_last4}` | PAY-201 |
-| `employee.updated` | `{fields: [names]}`, plus `{account_last4: {old, new}}` on bank changes, plus `{status: {old, new}}` | PAY-203 |
+| `employee.updated` | `{fields: [names]}` (sorted; only fields whose value changed, plus every supplied bank field; a pay-type switch also lists the cleared amount), plus `{account_last4: {old, new}}` when a bank field is supplied (`old` is `null` after a purge; equal on a routing-only change), plus `{status: {old, new}}` when the status changes. A PATCH that changes nothing writes no row | PAY-203 |
 | `employee.bank_details_purged` | `{deactivated_at, attempts_nulled: n}` | PAY-608 |
 | `payrun.created` | `{schedule, period_start, employee_count}` | PAY-300 |
 | `payrun.hours_updated` | `{entries: n, reverted_to_draft: bool}` | PAY-301 |
@@ -736,6 +737,7 @@ def snapshot_aad(payout_id: UUID, attempt: int) -> str:
 - **`PAYROLL_FIELD_KEYS`** is JSON `{kid: base64(32 bytes)}`. Kids match `^[A-Za-z0-9_-]{1,32}$`, so a kid never contains `:`. A key that isn't exactly 32 bytes refuses startup.
 - **`decrypt`** splits on the first two `:`, looks the kid up in the keyring (so old kids keep working after rotation), and decrypts. Any failure raises `FieldDecryptError(kid)`: an unknown kid, a bad format, a base64 error or `InvalidTag`.
 - **Snapshot plaintext** is compact JSON `{"routing":"<9 digits>","account":"<4–17 digits>"}`, encrypted with `snapshot_aad`.
+- **Rotation (F2):** add the new kid to `PAYROLL_FIELD_KEYS` and point `PAYROLL_FIELD_ACTIVE_KID` at it. Existing values keep their kid until a bank field is re-written (PATCH) or snapshotted at approve and retry (always under the active kid). There's no re-key pass in 0.1.0, so an old kid must stay in the keyring while any ciphertext uses it; removing one early makes approve and the instruction fail closed with 500 `internal_error` (`integration/test_key_rotation.py`).
 - **Handling a decrypt error:** callers catch `FieldDecryptError`, log `crypto.decrypt_failed` at error level (fields: `kid`, `entity`, `entity_id`) and raise `InternalError`, which becomes 500 `internal_error` (PAY-204).
 
 ### 3.7 Domain errors (`domain/__init__.py`)
@@ -761,6 +763,7 @@ def snapshot_aad(payout_id: UUID, attempt: int) -> str:
 | `ResolveTooEarly` | 409 | `resolve_too_early` | `{retry_after_s}`; the response also sets `Retry-After` (C48) |
 | `AnchorLocked` | 409 | `anchor_locked` | — |
 | `EmployeeEmailTaken` | 409 | `employee_email_taken` | — |
+| `InvalidFields` (F2) | 422 | `validation_error` | `[{field, issue}]` (C14): a rule that needs the stored row, such as the PATCH pay basis or bank completeness (§4.3) |
 | `NotFound(code)` | 404 | `employee_not_found`, `pay_run_not_found`, `payslip_not_found`, `payout_not_found`, `company_settings_not_found` | — |
 
 ---
@@ -888,11 +891,19 @@ class EmployeeOut(BaseModel):
     updated_at: datetime
 ```
 
-Rules:
-- **PATCH validation:** PATCH merges the update onto the current row, then validates the merged pay basis. Changing `pay_type` without the matching amount gives 422, and the other amount field is set to NULL.
-- **Reactivation** (`status: active`, PAY-203) of an employee whose bank details were purged needs both `bank_routing` and `bank_account` in the same PATCH, or the response is 422 `validation_error` with `details = [{field: "body.bank_account", issue: "required_on_reactivation"}]` **[decision]**. It clears `deactivated_at` (and `bank_purged_at` when new details are given).
-- **Deactivation** sets `deactivated_at = now()`.
-- **Bank changes:** a PATCH that sets `bank_routing` or `bank_account` re-encrypts that field with the active kid, updates `account_last4` (when the account changes), and sets `bank_updated_by = sub` and `bank_updated_at = now()`.
+Rules (settled in F2):
+- **PATCH body:** `EmployeeUpdate` forbids extra keys. An empty body is 422 `[{field: "body", issue: "no_fields"}]`. An explicit `null` is 422 `null_not_allowed` at the field (omit the field instead); the OpenAPI schema still shows the fields as nullable, because that's how Pydantic renders `X | None = None`. `bank_routing` gets the ABA check, as on create.
+- **Only real changes count:** plain fields (`name`, `email`, `schedule`) and the merged pay basis are compared with the row, and only differing values are written and listed. A PATCH that changes nothing returns 200 with the row and writes no audit row or log.
+- **PATCH validation (pay basis):** PATCH merges the update onto the current row, then validates the merged pay basis (`domain/employees.py::merge_pay_basis`):
+  - the amount for the merged `pay_type` comes from the body, or is kept from the row when the type doesn't change;
+  - changing `pay_type` without the matching amount → 422 `body.annual_salary_cents` `salary_required` or `body.hourly_rate_cents` `rate_required`;
+  - supplying the other type's amount → 422 `pay_basis` at that field;
+  - the other type's amount is set to NULL.
+- **Reactivation** (`status: active`, PAY-203) of an employee whose bank details were purged needs both `bank_routing` and `bank_account` in the same PATCH, or the response is 422 `validation_error` with one `{field: "body.<missing field>", issue: "required_on_reactivation"}` per missing field **[decision]**. It clears `deactivated_at` (and `bank_purged_at` when new details are given).
+- **Bank completeness:** the bank columns are all-or-none (`ck_employees_bank_all_or_none`). With details on file either field may change alone. Without them (purged) and not reactivating, a single bank field is 422 `bank_details_incomplete` at the missing field; both together are accepted **[decision, F2]**.
+- **Deactivation** sets `deactivated_at = now()`. `status: inactive` on an inactive employee is a no-op.
+- **Bank changes:** a PATCH that supplies `bank_routing` or `bank_account` re-encrypts **that field only** with the active kid (the other keeps its kid; there's no re-key pass), updates `account_last4` (when the account changes), and sets `bank_updated_by = sub` and `bank_updated_at = now()`. These feed dual approval: an approver who edited bank details of any employee in the run after it was created gets 403 `approver_must_differ` (`bank_editor`; PAY-401, ADR 0005).
+- **Schedule changes** don't touch existing runs (changing a run's employee set is out of scope, R37). The create-time overlap check (§4.4 step 5) stops a move from creating a second payslip for the same days: the moved employee blocks an overlapping period on the new schedule until that run is deleted, or the employee is deactivated or moved back (R34). Creates serialise on the per-company advisory lock and read payslips under READ COMMITTED, so a PATCH racing creates can't defeat it either.
 - **Concurrency:** the PATCH transaction does `SELECT … FROM employees WHERE id=:id AND company_id=:cid FOR UPDATE`. It never locks `pay_runs` (§4.10).
 - **Email uniqueness:** a violation of `uq_employees_company_email` is mapped to 409 `employee_email_taken`.
 
@@ -1098,6 +1109,8 @@ class AuditEventOut(BaseModel):
     entity_id: UUID
     details: dict[str, Any]
 ```
+
+Query parameters (F2): `entity_type: Literal["company_settings", "employee", "pay_run", "payout"] | None`, `entity_id: UUID | None`, `event: str | None` (pattern `^[a-z_]+\.[a-z_]+$`, ≤ 64), `cursor: str | None` (≤ 512), `limit: Limit = 50`. A bad value is 422 `validation_error` at `query.<name>`. The cursor's `after` ID is resolved in the company only (not the filters); one from another company is 422 `invalid_cursor`. Errors: 401, 403 (`forbidden_role` for payroll_admin and approver), 422, 429, 500, 503. The OpenAPI tag is `audit`.
 
 ### 4.6 Internal: payout instruction (PAY-411)
 
@@ -1696,7 +1709,8 @@ issuer/kid mismatch → 401 `invalid_token` (C30). The route guards then apply:
 | `test_dual_approval.py` | Off → always passes; calculator == approver; a bank editor after `created_at` is blocked and one before it is allowed; several employees list all IDs; retry dual rule | PAY-401, PAY-500 |
 | `test_payout_model.py` | **Hypothesis `RuleBasedStateMachine`** (§9.4). Owned by payroll only (C44) | PAY-NFR-02, PAY-406, PAY-405, PAY-411, PAY-500, PAY-502 |
 | `test_field_crypto.py` | Round trip; token format `kid:nonce:ct`; a fresh nonce per call; a tampered ciphertext, nonce, kid or AAD (swapping between employees) raises `FieldDecryptError`; an unknown kid raises; decrypt with an old kid after rotation; bad key length refused; the error message holds no plaintext | PAY-204, ADR 0004 |
-| `test_validation.py` | ABA checksum (valid and invalid), account 4–17 digits, salary and rate bounds, the settings ranges, a non-Monday anchor, a bad timezone, `HoursIn` duplicate IDs, `ResultIn` per-outcome field rules and `bank_reference` ≤ 64 (C26), `ResolveIn` (unknown action, empty note, 501-character note), `EmployeeUpdate` with no fields; every 422 has `details = [{field, issue}]` with no input value (C14) | PAY-200, PAY-201, PAY-301, PAY-405, PAY-502, PAY-602 |
+| `test_employee_rules.py` (F2) | `merge_pay_basis`: keep or replace the amount, switch type with its amount and clear the other; `rate_required`, `salary_required`, `pay_basis`; `check_bank_completeness`: details on file, `required_on_reactivation` per missing field, `bank_details_incomplete` | PAY-203 |
+| `test_validation.py` | ABA checksum (valid and invalid), account 4–17 digits, salary and rate bounds, the settings ranges, a non-Monday anchor, a bad timezone, `HoursIn` duplicate IDs, `ResultIn` per-outcome field rules and `bank_reference` ≤ 64 (C26), `ResolveIn` (unknown action, empty note, 501-character note), `EmployeeUpdate` (valid single fields; no fields, explicit null, extra key, bad routing or account, NUL); every 422 has `details = [{field, issue}]` with no input value (C14) | PAY-200, PAY-201, PAY-301, PAY-405, PAY-502, PAY-602 |
 | `test_app.py` (the authorization matrix) | Parametrised over every route (resolve included) × {admin, payroll_admin, approver, no-role, web token on an internal route → 401, worker token on a public route → 401, `sub=service:web` on a public route → 403, worker-issued token with another `sub` on an internal route → 403, bad signature / expired / issuer-kid mismatch → 401}: the exact status and code of §8.1–§8.2 (C30); every non-health route has a guard | PAY-601, PAY-411, PAY-600 |
 | `test_errors.py` | Each `DomainError` maps to the status, code and details shape of §3.7 (including `anchor_locked` and `payout_not_blocked`); `ErrorCode` equals the list in §4.1; validation details are a `[{field, issue}]` list (C14); a 500 holds no traceback; `FieldDecryptError` → 500 `internal_error` plus the `crypto.decrypt_failed` log; 413 over `MAX_BODY_BYTES` | PAY-602, PAY-204, PAY-604 |
 | `test_idempotency_hash.py` | Canonical hash stable across key order and whitespace; it differs by path parameter, route and body; scope composition | PAY-400 |
@@ -1713,8 +1727,11 @@ issuer/kid mismatch → 401 `invalid_token` (C30). The route guards then apply:
 | `test_migrations.py` | Upgrade to head, downgrade one step, upgrade again; `0002` seeds `company_settings` for `COMPANY_ID` with the defaults (timezone, anchor 2026-01-05, dual approval true); re-running is a no-op; a missing `COMPANY_ID` fails | PAY-200, PAY-606 |
 | `test_grants.py` | `payroll_app` can't `SELECT` from `identity.users`, `payouts.disbursements` or `bank_stub.transfers` (`permission denied`), can't run DDL in `payroll`, and can read but not write `payroll.alembic_version` | PAY-606 |
 | `test_settings_api.py` | GET and PUT; out-of-range 422 with `[{field, issue}]` details; `settings.updated` audit with the changed fields; admin-only PUT; changing `biweekly_anchor` with a non-deleted biweekly run → 409 `anchor_locked` and no change, allowed again once that run is deleted, and allowed with only monthly runs; a PUT racing a biweekly create never leaves a run on the old anchor (R33) | PAY-200 |
-| `test_employees_api.py` | Create, list (cursor, status filter, order), get, patch; `employee_email_taken` (case-insensitive); another company → 404; responses never contain the routing or account digits (scanned); `bank_updated_by` and `bank_updated_at` set; audit diff has only field names and `account_last4`; reactivation after purge needs bank details | PAY-201, PAY-202, PAY-203, PAY-NFR-08 |
-| `test_pay_runs.py` (create) | Monthly and biweekly creation; `pay_run_exists`; recreate after delete succeeds; `invalid_period_start`; `no_employees`; `employee_in_overlapping_run` after a schedule change (with IDs); inactive employees excluded; snapshot fields; two concurrent creates for the same period → one 201 and one 409; the unique-index race path returns the real `pay_run_id` (C63) | PAY-300 |
+| `test_employees_api.py` | Create, list (cursor, status filter, order), get; `employee_email_taken` (case-insensitive); another company → 404; responses never contain the routing or account digits (scanned). PATCH (F2): plain fields audited by name only, no-op PATCH writes no audit row; bank change sets `bank_updated_by` and `bank_updated_at`, re-encrypts with the active kid and audits old/new `account_last4` only; routing-only change; deactivate and reactivate (`deactivated_at` set and cleared, status diff); reactivation after purge needs both bank fields and clears `bank_purged_at`; pay-type switch; email taken on PATCH, 404, roles, empty and null bodies; a bank edit after run creation blocks that approver (PAY-401) | PAY-201, PAY-202, PAY-203, PAY-401, PAY-NFR-08 |
+| `test_schedule_moves.py` (F2) | A PATCH schedule move monthly → biweekly → monthly and biweekly → monthly: overlapping periods refused with only the moved ID, cleared by deactivation (R34); a PATCH racing a monthly and a biweekly create (parallel tasks) never leaves two live payslips with shared days for one employee | PAY-203, PAY-300 |
+| `test_key_rotation.py` (F2) | Restart with a second kid made active while employees exist: old-kid rows are read, approved and paid (instruction decrypts); a PATCHed field and a new employee use the new kid, the untouched field keeps the old one; payout snapshots use the new kid; dropping a kid still in use → approve 500 `internal_error`, no payouts, no digits in the body | PAY-204 |
+| `test_audit_events_api.py` (F2) | Newest first in cursor pages with the C5 fields; filters by `entity_type`, `entity_id`, `event`; no personal data in `details`; admin only; another company sees nothing and can't use this company's cursor; 422 for bad cursor, filters and limit | PAY-200, PAY-203, PAY-601, PAY-602 |
+| `test_pay_runs.py` (create; F3 splits the hours, calculate and read rows out of it) | Monthly and biweekly creation; `pay_run_exists`; recreate after delete succeeds; `invalid_period_start`; `no_employees`; `employee_in_overlapping_run` after a schedule change (with IDs); inactive employees excluded; snapshot fields; two concurrent creates for the same period → one 201 and one 409; the unique-index race path returns the real `pay_run_id` (C63) | PAY-300 |
 | `test_hours_calculate.py` | Hours upsert returns `HoursOut` (C7); `not_hourly`; `employee_not_in_run`; bounds per schedule; a calculated run reverts to draft and its payslips reset (`calculated_by_name` cleared); `hours_missing`; calculate snapshots the rates and dual flag and stores `calculated_by_name` from the token's `name` (NULL without the claim); totals = Σ stored payslips; summary has exactly the six `counts` keys, `require_dual_approval`, `calculated_by_name`, `approved_by_name` and `funding_required_cents` (C9); the payslips list pages with `cursor`/`limit` until `next_cursor` is null (C8); `pay_run_locked` after approval; delete only in draft or calculated | PAY-301, PAY-302, PAY-303, PAY-304 |
 | `test_approve.py` | Approve creates payouts, attempt 1, snapshots and outbox rows in one transaction; `approved_by_name` stored from the token; a net = 0 payout → `paid` + `no_transfer` with no outbox row; an all-zero run → `paid` straight away; dual approval (calculator, bank editor after `created_at`, creator of the employee counts as a bank editor); setting off after calculate keeps the snapshot; missing or purged bank details → 409 `employee_bank_details_missing` (C40); rollback on failure leaves no payouts or outbox rows | PAY-400, PAY-401, PAY-402 |
 | `test_approve_concurrency.py` | Two parallel approves with different keys → exactly one 200 and one 409 `pay_run_not_approvable`, one set of payouts; two parallel with the **same** key → both 200 with the same body, one set of payouts | PAY-400 |
@@ -1785,9 +1802,9 @@ harness that mirrors the services layer. It runs with no I/O.
 | PAY-200 | `api/settings_router.py`, `services/settings.py` (`anchor_locked`), `services/create_run.py` (settings `FOR SHARE`), migration `0002` | `unit/test_validation.py`, `unit/test_errors.py`, `integration/test_settings_api.py`, `integration/test_migrations.py` |
 | PAY-201 | `api/employees_router.py`, `services/employees.py`, `domain/validation.py`, `crypto.py` | `unit/test_validation.py`, `integration/test_employees_api.py` |
 | PAY-202 | `api/employees_router.py`, `api/pagination.py`, `db/repositories.py` | `unit/test_cursor.py`, `integration/test_employees_api.py` |
-| PAY-203 | `services/employees.py` | `integration/test_employees_api.py` |
-| PAY-204 | `crypto.py`, `api/errors.py` | `unit/test_field_crypto.py`, `unit/test_errors.py` |
-| PAY-300 | `domain/periods.py`, `services/create_run.py` | `unit/test_periods.py`, `unit/test_overlap.py`, `integration/test_pay_run_create.py` |
+| PAY-203 | `api/employees_router.py`, `api/schemas.py` (`EmployeeUpdate`), `services/employees.py`, `domain/employees.py`, `db/repositories.py` (`EmployeeRepo.lock`) | `unit/test_employee_rules.py`, `unit/test_validation.py`, `integration/test_employees_api.py`, `integration/test_schedule_moves.py`, `integration/test_audit_events_api.py` |
+| PAY-204 | `crypto.py`, `api/errors.py`, `services/employees.py` (active-kid writes) | `unit/test_field_crypto.py`, `unit/test_errors.py`, `integration/test_key_rotation.py` |
+| PAY-300 | `domain/periods.py`, `services/create_run.py` | `unit/test_periods.py`, `unit/test_overlap.py`, `integration/test_pay_runs.py`, `integration/test_schedule_moves.py` |
 | PAY-301 | `domain/periods.py`, `domain/state.py`, `services/hours.py` | `unit/test_periods.py`, `integration/test_hours_calculate.py` |
 | PAY-302 | `domain/calc.py`, `services/calculate.py` | `unit/test_calc.py`, `unit/test_calc_properties.py`, `integration/test_hours_calculate.py` |
 | PAY-303 | `api/pay_runs_router.py`, `api/schemas.py` (`PayRunOut.counts`, `*_name`), `api/pagination.py`, `db/repositories.py` | `unit/test_cursor.py`, `integration/test_hours_calculate.py` |
@@ -1832,6 +1849,8 @@ PAY-403, PAY-404, PAY-408 and PAY-412 are owned by payout-worker and bank-stub. 
 - 2026-11-10: incorporated README R-table and C-table decisions (R1, R2, R3, R4, R7, R8, R9, R11, R13, R21, R22, R26, R27, R33, R34, R37; C1, C2, C5, C7, C8, C9, C10, C13, C14, C17, C18, C21, C22, C23, C24, C26, C28, C29, C30, C34, C40, C44).
 
 - 2026-11-11 (S5 review, C63): NUL characters rejected in free-text request fields (§4.1); `ResultIn.attempt` ≤ 32767 (§4.7; OpenAPI `maximum`); the relay re-validates envelopes (§5.2, C60); `pay_run_exists` returns the real ID on the race path (§3.7, §4.4); the overlap check (`employee_in_overlapping_run`, §4.4 step 5) is implemented at create from S5 on, ahead of schedule edits (F2); `check_jwt_issuers` also refuses issuers other than `web` and `payout-worker` (§6.2 item 3); §1 lists the actual modules; §2.8 states that the result audit row is written only when applied; §9 file names match the suites. Also folded in C57 and C60.
+
+- 2026-11-11 (F2): PATCH `/v1/employees/{id}` and `GET /v1/audit-events` implemented. Settled here: `EmployeeUpdate` refuses an empty body (`no_fields`) and explicit nulls (`null_not_allowed`); only changed values are written and audited, and a no-op PATCH writes no audit row; any supplied bank field counts as a bank edit without decrypting the stored value (§2.2, §2.8); bank fields are re-encrypted individually with the active kid; `required_on_reactivation` is reported per missing field and `bank_details_incomplete` covers a half pair on a purged employee (§4.3); new `domain/employees.py` and `InvalidFields` (§1, §3.7); audit-events query parameters and cursor scope (§4.5); rotation procedure and the no-re-key consequence (§3.6); schedule moves against the overlap check (§4.3). Tests: `unit/test_employee_rules.py`, `integration/test_schedule_moves.py`, `integration/test_key_rotation.py`, `integration/test_audit_events_api.py` (§9); §9.5 PAY-300 points at the real file `test_pay_runs.py`. PAY-200 and PAY-202 were verified complete from S5 (no change).
 
 **Open:**
 
