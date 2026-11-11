@@ -2,7 +2,7 @@
 // (the route template) and `kind` (simple | heavy); mutations send Origin: BASE_URL (C12).
 import http from "k6/http";
 
-import { BASE_URL, TARGET_URL } from "./session.js";
+import { BASE_URL, noJar, TARGET_URL } from "./session.js";
 
 export function params(cookie, name, kind = "simple", extra = {}) {
   return {
@@ -14,6 +14,7 @@ export function params(cookie, name, kind = "simple", extra = {}) {
       ...(extra.headers || {}),
     },
     tags: { name, kind, ...(extra.tags || {}) },
+    jar: noJar(), // the session is only the Cookie header (see session.js)
   };
 }
 

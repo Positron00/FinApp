@@ -6,7 +6,7 @@ import http from "k6/http";
 import { check, sleep } from "k6";
 
 import { seed } from "./lib/seed.js";
-import { TARGET_URL, login } from "./lib/session.js";
+import { TARGET_URL, login, noJar } from "./lib/session.js";
 
 export const options = {
   scenarios: { smoke: { executor: "constant-vus", vus: 5, duration: "30s" } },
@@ -29,6 +29,7 @@ function get(path, name, cookie) {
   const r = http.get(`${TARGET_URL}${path}`, {
     headers: { Cookie: cookie, Accept: "application/json" },
     tags: { name, kind: "simple" },
+    jar: noJar(),
   });
   check(r, { [`${name} 200`]: (x) => x.status === 200 });
   return r;
