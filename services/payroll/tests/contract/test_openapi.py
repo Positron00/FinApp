@@ -13,8 +13,8 @@ from payroll.settings import Settings
 from pycommon.app import build_openapi
 
 OPENAPI = Path(__file__).resolve().parents[2] / "openapi.json"
-# (method, path) → (request model or None, 2xx status, 2xx model)
-EXPECTED: dict[tuple[str, str], tuple[str | None, str, str]] = {
+# (method, path) → (request model or None, 2xx status, 2xx model or None for no content)
+EXPECTED: dict[tuple[str, str], tuple[str | None, str, str | None]] = {
     ("get", "/v1/company/settings"): (None, "200", "CompanySettingsOut"),
     ("put", "/v1/company/settings"): ("CompanySettingsIn", "200", "CompanySettingsOut"),
     ("get", "/v1/employees"): (None, "200", "Page_EmployeeOut_"),
@@ -25,6 +25,8 @@ EXPECTED: dict[tuple[str, str], tuple[str | None, str, str]] = {
     ("get", "/v1/pay-runs"): (None, "200", "Page_PayRunOut_"),
     ("post", "/v1/pay-runs"): ("PayRunCreate", "201", "PayRunOut"),
     ("get", "/v1/pay-runs/{run_id}"): (None, "200", "PayRunOut"),
+    ("delete", "/v1/pay-runs/{run_id}"): (None, "204", None),
+    ("put", "/v1/pay-runs/{run_id}/hours"): ("HoursIn", "200", "HoursOut"),
     ("post", "/v1/pay-runs/{run_id}/calculate"): (None, "200", "PayRunOut"),
     ("post", "/v1/pay-runs/{run_id}/approve"): (None, "200", "PayRunOut"),
     ("get", "/v1/pay-runs/{run_id}/payslips"): (None, "200", "Page_PayslipOut_"),
@@ -49,8 +51,9 @@ def test_committed_spec_is_current(spec: dict[str, Any]) -> None:
 
 
 def test_routes_models_and_error_responses(spec: dict[str, Any]) -> None:
-    """PAY-NFR-12, PAY-602, PAY-203: exactly the S5 and F2 routes, each with its models, and
-    every error status documented with the shared ErrorBody schema."""
+    """PAY-NFR-12, PAY-602, PAY-203, PAY-301, PAY-304: exactly the S5, F2 and F3 routes, each
+    with its models (DELETE is 204 with no body), and every error status documented with the
+    shared ErrorBody schema."""
     paths = {p: ops for p, ops in spec["paths"].items() if p not in HEALTH}
     assert {(m, p) for p, ops in paths.items() for m in ops} == set(EXPECTED)
     for (method, path), (body, ok, out) in EXPECTED.items():
@@ -58,8 +61,11 @@ def test_routes_models_and_error_responses(spec: dict[str, Any]) -> None:
         if body is not None:
             ref = op["requestBody"]["content"]["application/json"]["schema"]["$ref"]
             assert ref.endswith(f"/{body}"), (method, path)
-        ok_ref = op["responses"][ok]["content"]["application/json"]["schema"]["$ref"]
-        assert ok_ref.endswith(f"/{out}"), (method, path)
+        if out is None:
+            assert "content" not in op["responses"][ok], (method, path)
+        else:
+            ok_ref = op["responses"][ok]["content"]["application/json"]["schema"]["$ref"]
+            assert ok_ref.endswith(f"/{out}"), (method, path)
         errors = {s for s in op["responses"] if s.startswith(("4", "5"))}
         assert {"401", "403", "422", "429", "500", "503"} <= errors, (method, path)
         for status in errors:
@@ -85,3 +91,20 @@ def test_no_bank_numbers_in_public_responses(spec: dict[str, Any]) -> None:
         props = set(schema.get("properties", {}))
         if name.endswith("Out") and name != "InstructionOut":
             assert not props & {"routing", "account", "bank_routing", "bank_account"}, name
+
+
+def test_pay_run_mutation_error_codes_are_documented(spec: dict[str, Any]) -> None:
+    """PAY-301, PAY-304, C65: hours documents 400 (it takes a body), 404 and 409; delete
+    documents 404 and 409; the HoursIn and HoursOut shapes match design §4.4 (C7)."""
+    hours = spec["paths"]["/v1/pay-runs/{run_id}/hours"]["put"]["responses"]
+    assert {"400", "404", "409", "422"} <= set(hours)
+    delete = spec["paths"]["/v1/pay-runs/{run_id}"]["delete"]["responses"]
+    assert {"404", "409"} <= set(delete)
+    assert "400" not in delete
+    schemas = spec["components"]["schemas"]
+    entries = schemas["HoursIn"]["properties"]["entries"]
+    assert (entries["minItems"], entries["maxItems"]) == (1, 500)
+    assert schemas["HoursOut"]["required"] == ["pay_run_id", "status", "entries"]
+    assert schemas["HoursOut"]["properties"]["status"]["const"] == "draft"
+    bound = schemas["HoursEntry"]["properties"]["hours_hundredths"]
+    assert (bound["minimum"], bound["maximum"]) == (0, 74_400)

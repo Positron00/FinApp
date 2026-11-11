@@ -1,6 +1,5 @@
-"""``/v1/pay-runs*`` for S5 (design §4.4): create, list, get, calculate, approve, payslips, payouts.
-
-Delete, hours, retry and resolve arrive with F3 and F4a.
+"""``/v1/pay-runs*`` (design §4.4): create, list, get, delete, hours, calculate, approve,
+payslips and payouts. Retry and resolve arrive with F4a.
 """
 
 from __future__ import annotations
@@ -8,7 +7,7 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pycommon.auth import Principal
 
@@ -24,6 +23,8 @@ from payroll.api.deps import (
 )
 from payroll.api.responses import errors
 from payroll.api.schemas import (
+    HoursIn,
+    HoursOut,
     Limit,
     Page,
     PayoutOut,
@@ -36,6 +37,7 @@ from payroll.api.schemas import (
 from payroll.services import approve as approve_svc
 from payroll.services import calculate as calculate_svc
 from payroll.services import create_run as create_svc
+from payroll.services import hours as hours_svc
 from payroll.services import reads
 from payroll.services.runtime import Runtime
 
@@ -70,6 +72,17 @@ async def create_pay_run(body: PayRunCreate, rt: RT, principal: PayrollAdmin) ->
 @router.get("/{run_id}", response_model=PayRunOut, responses=errors(404))
 async def get_pay_run(run_id: UUID, rt: RT, principal: AnyRole) -> PayRunOut:
     return await reads.get_run(rt, principal.cid, run_id)
+
+
+@router.delete("/{run_id}", status_code=204, response_class=Response, responses=errors(404, 409))
+async def delete_pay_run(run_id: UUID, rt: RT, principal: PayrollAdmin) -> Response:
+    await create_svc.delete_run(rt, principal, run_id)
+    return Response(status_code=204)
+
+
+@router.put("/{run_id}/hours", response_model=HoursOut, responses=errors(400, 404, 409))
+async def put_hours(run_id: UUID, body: HoursIn, rt: RT, principal: PayrollAdmin) -> HoursOut:
+    return await hours_svc.put_hours(rt, principal, run_id, body)
 
 
 @router.post("/{run_id}/calculate", response_model=PayRunOut, responses=errors(404, 409))

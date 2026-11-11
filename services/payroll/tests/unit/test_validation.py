@@ -1,4 +1,4 @@
-"""Input validation (PAY-200, PAY-201, PAY-405, PAY-602; C14, C26)."""
+"""Input validation (PAY-200, PAY-201, PAY-301, PAY-405, PAY-602; C14, C26)."""
 
 # ruff: noqa: E501  (one case per line in the parameter tables)
 
@@ -6,9 +6,16 @@ from __future__ import annotations
 
 from datetime import date
 from typing import Any
+from uuid import uuid4
 
 import pytest
-from payroll.api.schemas import CompanySettingsIn, EmployeeCreate, EmployeeUpdate, ResultIn
+from payroll.api.schemas import (
+    CompanySettingsIn,
+    EmployeeCreate,
+    EmployeeUpdate,
+    HoursIn,
+    ResultIn,
+)
 from payroll.domain.validation import aba_checksum_ok, is_monday, is_valid_timezone
 from pydantic import ValidationError
 
@@ -213,3 +220,38 @@ def test_result_attempt_fits_smallint() -> None:
     with pytest.raises(ValidationError) as info:
         ResultIn.model_validate({"attempt": 32768, "outcome": "indeterminate"})
     assert _issues(info.value) == {"less_than_equal"}
+
+
+E1, E2 = str(uuid4()), str(uuid4())
+
+
+@pytest.mark.parametrize("hours", [0, 1, 33_600, 74_400])
+def test_hours_valid(hours: int) -> None:
+    """PAY-301: hundredths 0 to 74,400 (the outer bound; the schedule bound is the domain's)."""
+    body = HoursIn.model_validate({"entries": [{"employee_id": E1, "hours_hundredths": hours}]})
+    assert body.entries[0].hours_hundredths == hours
+
+
+@pytest.mark.parametrize(
+    ("body", "field", "issue"),
+    [
+        ({"entries": []}, "entries", "too_short"),
+        ({"entries": [{"employee_id": str(uuid4()), "hours_hundredths": 1} for _ in range(501)]}, "entries", "too_long"),
+        ({"entries": [{"employee_id": E1, "hours_hundredths": 1}, {"employee_id": E2, "hours_hundredths": 2}, {"employee_id": E1, "hours_hundredths": 3}]}, "entries", "duplicate_employee_id"),
+        ({"entries": [{"employee_id": E1, "hours_hundredths": -1}]}, "entries.0.hours_hundredths", "greater_than_equal"),
+        ({"entries": [{"employee_id": E1, "hours_hundredths": 74_401}]}, "entries.0.hours_hundredths", "less_than_equal"),
+        ({"entries": [{"employee_id": E1, "hours_hundredths": 1.5}]}, "entries.0.hours_hundredths", "int_from_float"),
+        ({"entries": [{"employee_id": "nope", "hours_hundredths": 1}]}, "entries.0.employee_id", "uuid_parsing"),
+        ({"entries": [{"employee_id": E1, "hours_hundredths": 1, "rate": 2}]}, "entries.0.rate", "extra_forbidden"),
+        ({"entries": [{"employee_id": E1, "hours_hundredths": 1}], "run": 1}, "run", "extra_forbidden"),
+    ],
+    ids=["empty", "501", "duplicate", "negative", "over-74400", "float", "bad-uuid", "extra-entry-key", "extra-key"],
+)  # fmt: skip
+def test_hours_invalid(body: dict[str, Any], field: str, issue: str) -> None:
+    """PAY-301, PAY-602, C14: 1 to 500 entries, unique employee IDs, integer hundredths in
+    0..74,400 and no unknown keys; each error carries the field's location."""
+    with pytest.raises(ValidationError) as err:
+        HoursIn.model_validate(body)
+    assert {(".".join(str(p) for p in e["loc"]), str(e["type"])) for e in err.value.errors()} == {
+        (field, issue)
+    }

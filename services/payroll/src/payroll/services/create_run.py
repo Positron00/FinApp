@@ -1,9 +1,13 @@
-"""Create a pay run (design §4.4 "Create"; PAY-300, R33).
+"""Create and delete pay runs (design §4.4 "Create" and "Delete"; PAY-300, PAY-304, R33).
 
 Lock order (§4.10): the per-company advisory lock, then the settings row ``FOR SHARE`` (so the
 biweekly anchor can't change underneath), then plain reads and the inserts. Every candidate
 employee is checked for coverage by another non-deleted run whose days overlap the new period
 (``employee_in_overlapping_run``), so no one is paid twice for the same days (C63).
+
+Delete is a soft delete of a ``draft`` or ``calculated`` run under the run lock: ``deleted_at``
+frees the period (the unique index and the overlap check ignore deleted runs); payslips and hours
+stay for the record.
 """
 
 from __future__ import annotations
@@ -11,24 +15,39 @@ from __future__ import annotations
 import logging
 from datetime import date
 from typing import Any, Final
+from uuid import UUID
 
 from pycommon.auth import Principal
 from pycommon.db import new_id
 from pycommon.logging import get_logger, log_event
 from pycommon.otel import tracer
-from sqlalchemy import insert, text
+from sqlalchemy import func, insert, text, update
 from sqlalchemy.exc import IntegrityError
 
 from payroll.api.schemas import PayRunCreate, PayRunOut
 from payroll.db.models import PayRun, Payslip
-from payroll.db.repositories import AuditRepo, EmployeeRepo, PayRunRepo, PayslipRepo, SettingsRepo
+from payroll.db.repositories import (
+    AuditRepo,
+    EmployeeRepo,
+    PayRunRepo,
+    PayslipRepo,
+    SettingsRepo,
+    rowcount,
+)
 from payroll.db.session import session_scope
-from payroll.domain import DomainError, EmployeeInOverlappingRun, NoEmployees, PayRunExists
+from payroll.domain import (
+    DomainError,
+    EmployeeInOverlappingRun,
+    NoEmployees,
+    PayRunExists,
+    PayRunLocked,
+)
 from payroll.domain.periods import Coverage, Schedule, derive_period, find_overlapping_employees
+from payroll.domain.state import MUTABLE_RUN, RunStatus, assert_run_mutable
 from payroll.services.common import pay_run_view
 from payroll.services.runtime import Runtime
 
-__all__ = ["create_run"]
+__all__ = ["create_run", "delete_run"]
 
 _log: Final = get_logger("payroll.pay_runs")
 RUN_INDEX: Final = "uq_pay_runs_company_schedule_period"
@@ -161,3 +180,42 @@ async def create_run(rt: Runtime, principal: Principal, body: PayRunCreate) -> P
         actor_id=principal.sub,
     )
     return out
+
+
+async def delete_run(rt: Runtime, principal: Principal, run_id: UUID) -> None:
+    """PAY-304: soft-delete a ``draft`` or ``calculated`` run; 409 ``pay_run_locked`` otherwise."""
+    cid = principal.cid
+    async with session_scope(rt.sessions, "pay_runs.delete") as session:
+        run = await PayRunRepo.get(session, cid, run_id, for_update=True)
+        status = RunStatus(run.status)
+        assert_run_mutable(status)
+        result = await session.execute(
+            update(PayRun)
+            .where(
+                PayRun.id == run_id,
+                PayRun.company_id == cid,
+                PayRun.status.in_([str(s) for s in MUTABLE_RUN]),
+                PayRun.deleted_at.is_(None),
+            )
+            .values(deleted_at=func.now(), deleted_by=principal.sub)
+            .execution_options(synchronize_session=False)
+        )
+        if rowcount(result) != 1:  # pragma: no cover  (the row lock makes this unreachable)
+            raise PayRunLocked(run.status)
+        await AuditRepo.add(
+            session,
+            cid,
+            actor_id=principal.sub,
+            event="payrun.deleted",
+            entity_type="pay_run",
+            entity_id=run_id,
+            details={"status_at_delete": str(status)},
+        )
+    log_event(
+        _log,
+        logging.INFO,
+        "payrun.deleted",
+        pay_run_id=str(run_id),
+        status_at_delete=str(status),
+        actor_id=principal.sub,
+    )

@@ -34,6 +34,9 @@ __all__ = [
     "EmployeeOut",
     "EmployeeUpdate",
     "EntityType",
+    "HoursEntry",
+    "HoursIn",
+    "HoursOut",
     "IdemKey",
     "InstructionOut",
     "Page",
@@ -256,7 +259,7 @@ class AuditEventOut(BaseModel):
         return {n: getattr(data, "created_at" if n == "at" else n) for n in cls.model_fields}
 
 
-# --- pay runs (PAY-300, PAY-302, PAY-303, PAY-400) ---------------------------------------------
+# --- pay runs (PAY-300 to PAY-304, PAY-400) ------------------------------------------------
 
 
 class PayRunCreate(BaseModel):
@@ -310,6 +313,36 @@ class PayRunOut(BaseModel):
     approved_at: datetime | None
     processing_since: datetime | None
     updated_at: datetime
+
+
+class HoursEntry(BaseModel):
+    model_config = _REQUEST
+
+    employee_id: UUID
+    hours_hundredths: HoursHundredths  # the schedule bound (33,600 biweekly) is the domain's
+
+
+class HoursIn(BaseModel):
+    """PUT …/hours body (PAY-301): 1 to 500 entries with unique ``employee_id`` values."""
+
+    model_config = _REQUEST
+
+    entries: Annotated[list[HoursEntry], Field(min_length=1, max_length=500)]
+
+    @field_validator("entries")
+    @classmethod
+    def _unique(cls, v: list[HoursEntry]) -> list[HoursEntry]:
+        if len({e.employee_id for e in v}) != len(v):
+            raise PydanticCustomError("duplicate_employee_id", "Each employee_id may appear once.")
+        return v
+
+
+class HoursOut(BaseModel):
+    """PUT …/hours response (C7): every hours row now stored for the run, by ``employee_id``."""
+
+    pay_run_id: UUID
+    status: Literal["draft"]
+    entries: list[HoursEntry]
 
 
 class PayslipOut(BaseModel):
