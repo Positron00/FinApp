@@ -431,7 +431,7 @@ When Redis is unavailable, login, reset and invite-accept fail closed (503 `serv
 - Check: integration `test_maintenance.py`.
 
 **PAY-609 Seed data (must).** `scripts/seed.py` (dev and CI only; it refuses to run when `ENV` isn't dev) works through the APIs and Mailpit:
-- it creates `approver@payrun.local` (approver) and `LOAD_USER_EMAIL` (payroll_admin) via invite and accept;
+- it creates `approver@payrun.example.com` (approver) and `LOAD_USER_EMAIL` (payroll_admin) via invite and accept;
 - it sets the company settings (tax 2000 bps, retirement 500 bps; the migration seeds 0/0);
 - it creates employees: by default 10 (salaried and hourly, one with an account ending `0000`), or 500 with `--employees 500`;
 - `--skeleton` (S8) creates only 5 salaried monthly employees, one calculated monthly run and one draft run, and makes no settings PUT;

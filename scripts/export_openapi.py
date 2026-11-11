@@ -14,7 +14,9 @@ change.
 from __future__ import annotations
 
 import argparse
+import functools
 import importlib
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -29,7 +31,11 @@ def render(package: str) -> str:
     settings_mod = importlib.import_module(f"{package}.settings")
     pycommon_app = importlib.import_module("pycommon.app")
     settings = settings_mod.Settings.model_construct()
-    spec: dict[str, Any] = pycommon_app.build_openapi(main.build_app, settings)
+    build = main.build_app
+    if "instrument" in inspect.signature(build).parameters:
+        # Contract export must not start telemetry (platform LLD §3.15: instrument=False).
+        build = functools.partial(main.build_app, instrument=False)
+    spec: dict[str, Any] = pycommon_app.build_openapi(build, settings)
     return json.dumps(spec, sort_keys=True, indent=2) + "\n"
 
 

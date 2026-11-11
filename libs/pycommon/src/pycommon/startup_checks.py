@@ -76,6 +76,13 @@ def check_secrets(s: BaseServiceSettings) -> Iterable[CheckFailure]:
         if value is None:
             if name == "redis_password" and not s.redis_host:
                 continue  # no Redis in this service (bank-stub)
+            if (
+                name not in BaseServiceSettings.model_fields
+                and not info.is_required()
+                and info.default is None
+            ):
+                continue  # optional secret left unset (e.g. SMTP_PASSWORD in uat); services
+                # enforce their own "required in prod" rules as extra checks
             yield CheckFailure(setting, "missing")
             continue
         if not isinstance(value, SecretStr):  # pragma: no cover  (pydantic guarantees the type)

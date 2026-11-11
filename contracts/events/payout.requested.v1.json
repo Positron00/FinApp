@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://payrun.local/contracts/events/payout.requested.v1.json",
+  "$id": "https://payrun.example.com/contracts/events/payout.requested.v1.json",
   "title": "payout.requested v1",
   "description": "Published by payroll through its outbox to stream:payout.requested; consumed by payout-worker (group payout-worker). Carries IDs and the amount only: no names, no bank details. The worker must use the amount from GET /v1/internal/payouts/{payout_id}/instruction, never this one; a mismatch is poison. The bank idempotency key is <payout_id>:<attempt>. Each re-publish of the same attempt has a fresh event_id and a higher republish_seq. Sources: plan §7, PAY-402, ADR 0003.",
   "type": "object",

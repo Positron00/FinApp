@@ -1,6 +1,6 @@
 # Tasks: PayRun 0.1.0
 
-Status (2026-11-10): S1–S3 done; S4 and S5 in progress; S6 next. Release 0.1.0. Skeleton tasks (S*) run on `main`; feature,
+Status (2026-11-10): S1–S4 done; S5 in progress; S6 next. Release 0.1.0. Skeleton tasks (S*) run on `main`; feature,
 hardening and release tasks (F*, H*, R1) run on `release/0.1.0`.
 
 **Rules for every task:**
@@ -43,7 +43,7 @@ The skeleton journey: sign in as the seeded owner → create a monthly run for s
 | S1 | Repo scaffold: uv and pnpm workspaces, `.gitignore`, `.editorconfig`, pre-commit (ruff, Prettier, ESLint, gitleaks), pinned versions, `scripts/dev-env.sh` (all secrets and keys from plan §8) | PAY-NFR-12 | — | — | `uv sync --locked`, `pnpm install --frozen-lockfile` pass; `dev-env.sh` makes a complete `.env` idempotently | 2 h | done (2026-11-10) |
 | S2 | `libs/pycommon`: settings, JSON logging with redaction, OTel, errors, issuer-bound JWT verify and sign, health, DB, Redis Streams (producer, `RelayLoop` over an owner repository; no consumer base, C22), resilient client, rate limiter, startup checks, maintenance runner, `create_app` | PAY-600, PAY-602, PAY-603, PAY-605, PAY-NFR-07 | S1 | — | Unit tests pass at ≥ 90% coverage | 6 h | done (2026-11-10) |
 | S3 | DB bootstrap SQL (4 schemas, migrator and runtime roles, exporter role) and the Redis ACL file generation | PAY-606, PAY-607 | S2 | — | Integration: grants test passes; web ACL user can't XADD | 2 h | done (2026-11-10; `tests/platform`, 17 tests) |
-| S4 | identity skeleton: users and credentials tables, `bootstrap_owner` CLI, `POST /v1/auth/login`, `GET /v1/users/me`, invite and accept (for the seed), email relay to Mailpit | PAY-100, PAY-101, PAY-103, PAY-104, PAY-110 | S3 | S5 | Unit and integration tests pass; `openapi.json` exported | 5 h | |
+| S4 | identity skeleton: users and credentials tables, `bootstrap_owner` CLI, `POST /v1/auth/login`, `GET /v1/users/me`, invite and accept (for the seed), email relay to Mailpit | PAY-100, PAY-101, PAY-103, PAY-104, PAY-110 | S3 | S5 | Unit and integration tests pass; `openapi.json` exported | 5 h | done (2026-11-10; 98% coverage) |
 | S5 | payroll skeleton: settings seed and `PUT /v1/company/settings`, employees (create, list), runs (create monthly, calculate, approve), payouts and attempts, outbox relay, internal instruction and result endpoints, run status rule | PAY-200, PAY-201, PAY-202, PAY-204, PAY-300, PAY-302, PAY-303, PAY-400, PAY-402, PAY-405, PAY-406, PAY-411 | S3 | S4 | Unit (calc properties) and integration (outbox, approve) tests pass; `openapi.json` and event schema committed | 8 h | |
 | S6 | payout-worker (consume, instruction, bank, result, idempotency) and bank-stub (persistent ledger) | PAY-403, PAY-404, PAY-412 | S3, S5 | S7 | Integration: outbox → stream → worker → bank → result path passes; duplicate delivery is a no-op | 6 h | |
 | S7 | web: Next.js app, session and requireSession, internal JWT, generated api-client, login page, a minimal run page (create, calculate, approve, status), proxy.ts with CSP, OTel and pino | PAY-104, PAY-106, PAY-600, PAY-601, PAY-604, PAY-413 | S4, S5 | S6 | Vitest passes; `next build` passes with no secrets; contract drift check passes | 6 h | |

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://payrun.local/contracts/events/payout.requested.dlq.v1.json",
+  "$id": "https://payrun.example.com/contracts/events/payout.requested.dlq.v1.json",
   "title": "payout.requested DLQ entry v1",
   "description": "One entry of stream:payout.requested.dlq. payout-worker writes it (XADD ... MAXLEN ~ 10000) when it dead-letters a stream:payout.requested message, then XACKs the original. Redis stream fields are strings on the wire; this schema describes the entry after decoding, with delivery_count as an integer. It never contains bank details, names or exception text beyond the redacted summary in error. Sources: README C21, PAY-408, PAY-409.",
   "type": "object",

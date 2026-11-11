@@ -72,12 +72,12 @@ def test_semconv_opt_in_is_set_before_instrumentation_import() -> None:
         "print(S._get_opentelemetry_stability_opt_in_mode(T.HTTP) == M.HTTP)\n"
     )
     env = {k: v for k, v in os.environ.items() if k != "OTEL_SEMCONV_STABILITY_OPT_IN"}
-    out = subprocess.run(  # noqa: S603  (fixed interpreter and code)
+    out = subprocess.run(
         [sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True
     )
     assert out.stdout.split() == ["http", "True"]
     env["OTEL_SEMCONV_STABILITY_OPT_IN"] = "http/dup"
-    out = subprocess.run(  # noqa: S603
+    out = subprocess.run(
         [sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True
     )
     assert out.stdout.split()[0] == "http/dup"

@@ -27,6 +27,20 @@ class KidSettings(SvcSettings):
     payroll_field_active_kid: str = "prod-2026-11"
 
 
+class OptionalSecretSettings(SvcSettings):
+    smtp_password: SecretStr | None = None
+
+
+def test_optional_service_secret_may_be_unset() -> None:
+    """PAY-605, C59: a service's optional secret left unset passes; base secrets never do."""
+    base = make_settings().model_dump()
+    assert list(check_secrets(OptionalSecretSettings.model_validate(base))) == []
+    weak = OptionalSecretSettings.model_validate(base | {"smtp_password": SecretStr("changeme")})
+    assert list(check_secrets(weak)) == [CheckFailure("SMTP_PASSWORD", "dev_default")]
+    no_redis = OptionalSecretSettings.model_validate(base | {"redis_password": None})
+    assert list(check_secrets(no_redis)) == [CheckFailure("REDIS_PASSWORD", "missing")]
+
+
 def test_secrets_pass_and_fail() -> None:
     """PAY-605: every SecretStr must be present, not a dev default and ≥ 16 characters."""
     assert list(check_secrets(make_settings())) == []

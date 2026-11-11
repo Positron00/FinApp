@@ -136,10 +136,10 @@ put_if_missing ALERT_PAGE_WEBHOOK_URL http://alert-sink:8080/page
 put_if_missing ALERT_TICKET_WEBHOOK_URL http://alert-sink:8080/ticket
 put_if_missing OTEL_TRACES_SAMPLER parentbased_always_on
 
-put_if_missing SEED_OWNER_EMAIL owner@payrun.local
+put_if_missing SEED_OWNER_EMAIL owner@payrun.example.com
 put_if_missing SEED_OWNER_PASSWORD "$(urlsafe20)"
 put_if_missing SEED_APPROVER_PASSWORD "$(urlsafe20)"
-put_if_missing LOAD_USER_EMAIL load@payrun.local
+put_if_missing LOAD_USER_EMAIL load@payrun.example.com
 put_if_missing LOAD_USER_PASSWORD "$(urlsafe20)"
 
 # --- derived keys -------------------------------------------------------------------------------

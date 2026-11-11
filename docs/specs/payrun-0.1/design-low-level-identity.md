@@ -490,7 +490,7 @@ The `.html.j2` versions carry the same text, with the link as an `<a href>` and 
 | `IDENTITY_ARGON2_TIME_COST` / `_MEMORY_KIB` / `_PARALLELISM` | int | 3 / 65536 / 4 | same | same | PAY-103, PAY-104 |
 | `IDENTITY_ARGON2_MAX_CONCURRENCY` | int | 4 | 4 | 4 | PAY-NFR-05 |
 | `IDENTITY_PUBLIC_BASE_URL` | URL (the web origin; R24) | `http://127.0.0.1:${WEB_PORT}` = `http://127.0.0.1:4100` (C12) | `https://<uat host>` | `https://<prod host>` | PAY-103, PAY-105 |
-| `IDENTITY_EMAIL_FROM` | str | `PayRun <no-reply@payrun.local>` | per env | per env | PAY-110 |
+| `IDENTITY_EMAIL_FROM` | str | `PayRun <no-reply@payrun.example.com>` | per env | per env | PAY-110 |
 | `SMTP_HOST` | str | `mailpit` | `mailpit` (in-cluster) | ES | PAY-110 |
 | `SMTP_PORT` | int | 1025 | 1025 | 587 | PAY-110 |
 | `SMTP_STARTTLS` | bool | false | false | true | PAY-110 |
@@ -547,7 +547,7 @@ Every line has pycommon's base fields (`ts`, `level`, `service`, `env`, `version
 | `auth.signin.succeeded` | info | `user_id`, `ip_hash`, `rehashed` (bool) | Login 200 | PAY-104 |
 | `auth.signin.failed` | info | `user_id` (or absent), `reason` (`bad_password`, `unknown_user`, `not_active`), `ip_hash` | Login 401 | PAY-104 |
 | `auth.signin.rate_limited` | warning | `scope` (`login_ip`, `login_account`, `login_locked`), `ip_hash`, `retry_after_s` | Login 429 | PAY-104 |
-| `auth.lockout` | warning | `user_id` (or absent), `level`, `lock_seconds`, `ip_hash` | An account lock starts | PAY-104 |
+| `auth.lockout` | warning | `user_id` (or absent), `lock_level` (`level` is a base log field, C59), `lock_seconds`, `ip_hash` | An account lock starts | PAY-104 |
 | `auth.password_reset.requested` | info | `matched` (bool), `user_id` (if matched), `reset_id` (if matched), `ip_hash` | Reset request 202 | PAY-105 |
 | `auth.password_reset.completed` | info | `user_id`, `reset_id`, `roles_version` | Confirm 200 | PAY-105 |
 | `auth.password_reset.invalid` | info | `reason` (as `invite.invalid`) | Confirm 400 | PAY-105 |
