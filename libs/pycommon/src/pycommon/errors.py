@@ -203,7 +203,9 @@ def _causes(exc: BaseException) -> list[BaseException]:
     return out
 
 
-_TIMEOUT_SQLSTATES: Final = frozenset({"57014"})  # query_canceled (statement_timeout)
+_TIMEOUT_SQLSTATES: Final = frozenset(
+    {"57014", "55P03"}  # query_canceled (statement_timeout), lock_not_available (lock_timeout)
+)
 _UNAVAILABLE_SQLSTATES_PREFIX: Final = ("08", "57P")  # connection exceptions, admin shutdown
 
 

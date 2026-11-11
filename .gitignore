@@ -56,3 +56,4 @@ ci-logs/
 deploy/k8s/overlays/dev/secrets.env
 .env.*
 !.env.example
+.hypothesis/

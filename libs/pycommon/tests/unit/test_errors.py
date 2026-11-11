@@ -273,6 +273,7 @@ def test_db_error_kind_classification() -> None:
 
     assert db_error_kind(TimeoutError()) == "timeout"
     assert db_error_kind(PgError("57014")) == "timeout"
+    assert db_error_kind(PgError("55P03")) == "timeout"  # lock_timeout (S5 finding)
     assert db_error_kind(PgError("08006")) == "unavailable"
     assert db_error_kind(PgError("23505")) is None
     wrapped = sqlalchemy.exc.DBAPIError(
