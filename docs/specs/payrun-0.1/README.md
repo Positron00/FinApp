@@ -1,6 +1,6 @@
 # Spec: PayRun 0.1.0
 
-Status: draft v1 (being aligned with plan v1.2, 2026-11-10) · Source plan: [`docs/plan/architecture-plan.md`](../../plan/architecture-plan.md) · Base: `main` at `0b082dc` (initial commit) · Release: 0.1.0
+Status: v1 aligned with plan v1.2 (2026-11-10; three independent reviews, decision tables R1–R37 and C1–C57; traceability clean) · Source plan: [`docs/plan/architecture-plan.md`](../../plan/architecture-plan.md) · Base: `main` at `0b082dc` (initial commit) · Release: 0.1.0
 
 ## What this work does
 
@@ -195,3 +195,5 @@ These come from two independent reviews: cross-service contracts (X#) and plan a
 | C53 | `compose.test.yaml` keeps production payout timing (claim idle, deadlines, re-publish), because payroll's re-publish check reads the same keys. Only in-process integration fixtures lower them. The stack-level bank-down resilience test is nightly-only (about 5 min) | platform patch |
 | C54 | Accepted: both seed modes create `LOAD_USER_EMAIL` (k6 smoke signs in as it) and make sure a current-month calculated run and a draft run exist (`runs.current`, `runs.draft` in the JSON summary). The identity Deployment memory limit is 512Mi (argon2 at 64 MiB × concurrency) | platform patch |
 | C55 | pycommon's labels are authoritative. The caller limiter uses scope and component `caller`. `external_requests_total{outcome}` takes `ok`, `client_error`, `rate_limited`, `server_error`, `timeout`, `connect_error` or `breaker_open`. The BFF's own `bff_upstream_requests_total` keeps its labels | platform patch |
+| C56 | The `validation_error` `details[].field` is the request location joined by dots, as FastAPI reports it: `body.<path>`, `query.<name>`, `header.<Name>` (e.g. `header.Idempotency-Key`, `body.entries.3.hours_hundredths`). The BFF uses the same form for its own Zod errors | final review M6 |
+| C57 | Event examples live in lead-owned files `contracts/events/examples/payout.requested.v1.*.json` and `payout.requested.dlq.v1.*.json`, created with S5. They're validated by `contract.sh` and read by producer and consumer contract tests | final review M10 |

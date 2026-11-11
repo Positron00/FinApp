@@ -1,6 +1,6 @@
 # Low-level design: payroll service
 
-Status: draft v2, 2026-11-10 · Sources: [architecture plan](../../plan/architecture-plan.md) v1.2 (accepted 2026-11-10), [requirements](requirements.md), [high-level design](design-high-level.md), the [spec README](README.md) "Spec resolutions" (R1–R37) and "Contract decisions" (C1–C45) tables, ADRs [0003](../../adr/0003-payout-flow.md), [0004](../../adr/0004-bank-details-at-rest.md), [0005](../../adr/0005-four-eyes-approval.md), [0006](../../adr/0006-money-and-rounding.md) · Event contracts: [`contracts/events/payout.requested.v1.json`](../../../contracts/events/payout.requested.v1.json), [`contracts/events/payout.requested.dlq.v1.json`](../../../contracts/events/payout.requested.dlq.v1.json) (written by payout-worker)
+Status: draft v2, 2026-11-10 · Sources: [architecture plan](../../plan/architecture-plan.md) v1.2 (accepted 2026-11-10), [requirements](requirements.md), [high-level design](design-high-level.md), the [spec README](README.md) "Spec resolutions" (R1–R37) and "Contract decisions" (C1–C55) tables, ADRs [0003](../../adr/0003-payout-flow.md), [0004](../../adr/0004-bank-details-at-rest.md), [0005](../../adr/0005-four-eyes-approval.md), [0006](../../adr/0006-money-and-rounding.md) · Event contracts: [`contracts/events/payout.requested.v1.json`](../../../contracts/events/payout.requested.v1.json), [`contracts/events/payout.requested.dlq.v1.json`](../../../contracts/events/payout.requested.dlq.v1.json) (written by payout-worker)
 
 This document is the contract between the payroll implementers, the payout-worker team (§4.6, §4.7, §5)
 and the web team (§4.2–§4.5). Precedence: the README C-table, then the R-table, then `requirements.md`,
@@ -295,6 +295,7 @@ CREATE TABLE payroll.payout_attempts (
   requested_at      timestamptz NOT NULL,
   last_published_at timestamptz NOT NULL,
   needs_operator_at timestamptz NULL,       -- set when the attempt enters needs_operator, cleared by redrive (C48)
+  CONSTRAINT ck_attempt_needs_operator_at CHECK ((status = 'needs_operator') = (needs_operator_at IS NOT NULL)),
   publish_count     integer     NOT NULL DEFAULT 1 CHECK (publish_count >= 1),
   final_at          timestamptz NULL,
   created_at        timestamptz NOT NULL DEFAULT now(),
@@ -747,7 +748,7 @@ def snapshot_aad(payout_id: UUID, attempt: int) -> str:
 | `PayRunLocked` | 409 | `pay_run_locked` | `{status}` |
 | `NotHourly` | 422 | `not_hourly` | `{employee_ids: [...]}` |
 | `EmployeeNotInRun` | 422 | `employee_not_in_run` | `{employee_ids: [...]}` |
-| `HoursOutOfBounds` | 422 | `validation_error` | `[{field: "entries.<i>.hours_hundredths", issue: "out_of_range"}]` (C14) |
+| `HoursOutOfBounds` | 422 | `validation_error` | `[{field: "body.entries.<i>.hours_hundredths", issue: "out_of_range"}]` (C14) |
 | `HoursMissing` | 422 | `hours_missing` | `{employee_ids: [...]}` |
 | `PayRunNotApprovable` | 409 | `pay_run_not_approvable` | `{status}` |
 | `ApproverMustDiffer` | 403 | `approver_must_differ` | `{rule, employee_ids}` |
@@ -756,6 +757,7 @@ def snapshot_aad(payout_id: UUID, attempt: int) -> str:
 | `RetryLimitReached` | 409 | `retry_limit_reached` | `{current_attempt, max_attempts}` |
 | `AttemptNotCurrent` | 409 | `attempt_not_current` | `{current_attempt}` |
 | `PayoutNotBlocked` | 409 | `payout_not_blocked` | `{attempt_status}` |
+| `ResolveTooEarly` | 409 | `resolve_too_early` | `{retry_after_s}`; the response also sets `Retry-After` (C48) |
 | `AnchorLocked` | 409 | `anchor_locked` | — |
 | `EmployeeEmailTaken` | 409 | `employee_email_taken` | — |
 | `NotFound(code)` | 404 | `employee_not_found`, `pay_run_not_found`, `payslip_not_found`, `payout_not_found`, `company_settings_not_found` | — |
@@ -784,7 +786,7 @@ def snapshot_aad(payout_id: UUID, attempt: int) -> str:
   | 500 | `internal_error` | Unhandled, or `FieldDecryptError` |
   | 503 | `db_timeout` / `db_unavailable` | Statement or pool timeout / connection failure |
 
-- **Full code list** (`api.errors.ErrorCode`): `invalid_token`, `forbidden_role`, `not_found`, `method_not_allowed`, `payload_too_large`, `validation_error`, `rate_limited`, `internal_error`, `db_timeout`, `db_unavailable`, `company_settings_not_found`, `anchor_locked`, `employee_not_found`, `employee_email_taken`, `pay_run_not_found`, `pay_run_exists`, `invalid_period_start`, `no_employees`, `employee_in_overlapping_run`, `pay_run_locked`, `not_hourly`, `employee_not_in_run`, `hours_missing`, `pay_run_not_approvable`, `approver_must_differ`, `idempotency_key_required`, `idempotency_key_reused`, `payslip_not_found`, `payout_not_found`, `payout_not_retryable`, `payout_not_blocked`, `retry_limit_reached`, `employee_bank_details_missing`, `attempt_not_current`. All are defined in PAY-602 or the requirement that raises them (R3).
+- **Full code list** (`api.errors.ErrorCode`): `invalid_token`, `forbidden_role`, `not_found`, `method_not_allowed`, `payload_too_large`, `validation_error`, `rate_limited`, `internal_error`, `db_timeout`, `db_unavailable`, `company_settings_not_found`, `anchor_locked`, `employee_not_found`, `employee_email_taken`, `pay_run_not_found`, `pay_run_exists`, `invalid_period_start`, `no_employees`, `employee_in_overlapping_run`, `pay_run_locked`, `not_hourly`, `employee_not_in_run`, `hours_missing`, `pay_run_not_approvable`, `approver_must_differ`, `idempotency_key_required`, `idempotency_key_reused`, `payslip_not_found`, `payout_not_found`, `payout_not_retryable`, `payout_not_blocked`, `retry_limit_reached`, `employee_bank_details_missing`, `attempt_not_current`. All are defined in PAY-602 or the requirement that raises them (R3), `resolve_too_early`.
 - **Request models** use `model_config = ConfigDict(extra="forbid")`. Response models use `ConfigDict(from_attributes=True)`.
 - **Shared Pydantic types** (`api/schemas.py`):
 
@@ -906,7 +908,7 @@ Rules:
 | `GET /v1/pay-runs/{run_id}/payslips/{payslip_id}` | any | — | 200 `PayslipOut` | 404 `pay_run_not_found`, 404 `payslip_not_found` |
 | `GET /v1/pay-runs/{run_id}/payouts?status=&cursor=&limit=` | any | query: `status: PayoutStatus \| None`, `cursor: str \| None`, `limit: Limit = 50` | 200 `Page[PayoutOut]`, ordered by the payslip's `employee_name`, then `id` (C8) | 404 `pay_run_not_found`, 422 |
 | `POST /v1/pay-runs/{run_id}/payouts/{payout_id}/retry` | approver | optional header `Idempotency-Key` **[decision]**, no body | 200 `PayoutOut` | 404 `pay_run_not_found`, 404 `payout_not_found`, 409 `payout_not_retryable`, 409 `retry_limit_reached`, 409 `employee_bank_details_missing`, 403 `approver_must_differ`, 422 `idempotency_key_reused`, 422 `validation_error` (malformed key) |
-| `POST /v1/pay-runs/{run_id}/payouts/{payout_id}/resolve` | approver | `ResolveIn`; no `Idempotency-Key` (a repeat finds the attempt no longer blocked) | 200 `PayoutOut` | 404 `pay_run_not_found`, 404 `payout_not_found`, 409 `payout_not_blocked`, 422 `validation_error` (unknown action, missing or too long note) |
+| `POST /v1/pay-runs/{run_id}/payouts/{payout_id}/resolve` | approver | `ResolveIn`; no `Idempotency-Key` (a repeat finds the attempt no longer blocked) | 200 `PayoutOut` | 404 `pay_run_not_found`, 404 `payout_not_found`, 409 `payout_not_blocked`, 409 `resolve_too_early` (with `Retry-After`; mark_rejected within `PAYOUT_MARK_REJECTED_MIN_WAIT_S`, C48), 422 `validation_error` (unknown action, missing or too long note) |
 
 ```python
 class PayRunCreate(BaseModel):
@@ -1068,8 +1070,8 @@ class ResolveIn(BaseModel):              # PAY-502, R8
   1. Lock the run (`FOR UPDATE`), then the payout (`FOR UPDATE`), then the current attempt (`FOR UPDATE`), the same order as retry and result (§4.10).
   2. `check_resolve(payout_status, attempt_status)` → 409 `payout_not_blocked` unless the current attempt is `needs_operator`.
   3. Apply `resolve_transition(action)` (§3.5a) with conditional updates:
-     - **redrive:** `UPDATE payout_attempts SET status='requested', failure_reason=NULL, publish_count=1, last_published_at=now() WHERE id=:aid AND status='needs_operator'`, then `OutboxWriter.add_payout_requested(..., amount_cents = payouts.amount_cents, republish_seq=0)` (fresh `event_id`; C13).
-     - **mark_rejected:** `UPDATE payout_attempts SET status='rejected', failure_reason='operator_rejected', final_at=now() WHERE id=:aid AND status='needs_operator'`, then `UPDATE payouts SET status='failed', final_at=now() WHERE id=:pid AND status='requested'`. Increment `payroll_payouts_total{outcome="operator_rejected"}`.
+     - **redrive:** `UPDATE payout_attempts SET status='requested', failure_reason=NULL, publish_count=1, last_published_at=now(), needs_operator_at=NULL WHERE id=:aid AND status='needs_operator'`, then `OutboxWriter.add_payout_requested(..., amount_cents = payouts.amount_cents, republish_seq=0)` (fresh `event_id`; C13).
+     - **mark_rejected:** `UPDATE payout_attempts SET status='rejected', failure_reason='operator_rejected', final_at=now(), needs_operator_at=NULL WHERE id=:aid AND status='needs_operator' AND now() - needs_operator_at >= make_interval(secs => :min_wait_s)` (rowcount 0 with the attempt still `needs_operator` → `ResolveTooEarly`), then `UPDATE payouts SET status='failed', final_at=now() WHERE id=:pid AND status='requested'`. Increment `payroll_payouts_total{outcome="operator_rejected"}`.
      - A rowcount of 0 raises `ConcurrentUpdate` (500).
   4. Recompute the run status as the result endpoint does (§4.7 step 5): a move into a final status sets `first_final_at` if NULL and observes `payroll_payout_settlement_seconds` once, increments `payroll_pay_runs_total{outcome}`, and logs `payrun.completed`.
   5. Write the `payout.operator_resolved` audit row `{attempt, action, note_len}`. The note's text is never stored, logged or traced (PAY-NFR-07); only its length is.
@@ -1167,7 +1169,7 @@ Whether the call changed anything is not in the response; it is in the log `payo
 5. Call `decide_result`.
    - **NOT_CURRENT:** roll back and return 409. Log `payout.attempt_not_current` (source `result`).
    - **STORED:** return 200 with `outcome` = the stored attempt status, and no change. Log `payout.result_recorded` with `applied=false`. Store the idempotency row.
-   - **APPLY:** first run `UPDATE payout_attempts SET status=:new, failure_reason=:reason, bank_reference=:ref, final_at=CASE WHEN :new IN ('settled','rejected') THEN now() END WHERE id=:aid AND status=:expected_status` (belt and braces; a rowcount of 0 raises `ConcurrentUpdate`, which becomes 500). Then:
+   - **APPLY:** first run `UPDATE payout_attempts SET status=:new, failure_reason=:reason, bank_reference=:ref, final_at=CASE WHEN :new IN ('settled','rejected') THEN now() END, needs_operator_at=CASE WHEN :new='needs_operator' THEN now() WHEN :new IN ('settled','rejected') THEN NULL ELSE needs_operator_at END WHERE id=:aid AND status=:expected_status` (belt and braces; a rowcount of 0 raises `ConcurrentUpdate`, which becomes 500). Then:
      - set the payout status to `payout_status_for_attempt(new)`, and set `final_at` when it is final;
      - recompute the run status with `run_status_from_payouts(SELECT status FROM payouts WHERE pay_run_id=:rid)`, using `UPDATE pay_runs SET status=:s … WHERE id=:rid AND status IN ('processing','paid','partially_failed')`. If the status enters `processing`, set `processing_since`. If it enters a final status and `first_final_at IS NULL`, set `first_final_at = now()` and observe `payroll_payout_settlement_seconds = first_final_at − approved_at`;
      - write the `payout.result_recorded` audit row (plus `payout.needs_operator` for poison);
@@ -1307,20 +1309,22 @@ They need no JWT, are excluded from tracing, and are never exposed through ingre
 `PayrollOutboxSource` (the repository the relay loop calls; every method runs in the loop's batch transaction):
 
 ```text
-claim_batch(limit = PAYROLL_OUTBOX_BATCH (100)):
+claim_unsent(session, *, limit = PAYROLL_OUTBOX_BATCH (100)) -> Sequence[StreamItem]:
     SELECT id, payload, payout_id, attempt FROM payroll.outbox
     WHERE sent_at IS NULL ORDER BY created_at, id
     LIMIT :limit FOR UPDATE SKIP LOCKED
-mark_sent(rows):
+    -> per row: open the PRODUCER span (below), build envelope_json, and return
+       StreamItem(event_id=row.id, type="payout.requested", envelope_json=…, ref=(row.payout_id, row.attempt, span))
+mark_sent(session, items):   # ends each item's span (OK)
     UPDATE payroll.outbox SET sent_at = now() WHERE id = ANY(:ids)
     UPDATE payroll.payout_attempts a SET last_published_at = now()
       FROM unnest(:payout_ids, :attempts) AS s(pid, att)
       WHERE a.payout_id = s.pid AND a.attempt = s.att AND a.status IN ('requested','indeterminate')
-mark_failed(rows, exc_class):
-    UPDATE payroll.outbox SET relay_attempts = relay_attempts + 1, last_error = :exc_class WHERE id = ANY(:ids)
+mark_failed(session, items, *, error_type):   # ends each item's span (ERROR)
+    UPDATE payroll.outbox SET relay_attempts = relay_attempts + 1, last_error = :error_type WHERE id = ANY(:ids)
 ```
 
-Per row, before publishing:
+Per row, inside `claim_unsent` (the span travels in `StreamItem.ref` and is closed by `mark_sent`/`mark_failed`):
 
 ```text
 ctx  = extract(row.payload.traceparent)
@@ -1331,7 +1335,7 @@ span = tracer.start_span("payroll.outbox.publish", context=ctx, kind=PRODUCER,
 envelope_json = json(row.payload with traceparent := inject(span context))   # worker becomes a child of the publish span
 ```
 
-- **Loop:** wait for the wake event or `PAYROLL_OUTBOX_POLL_MS` (200 ms), whichever is first; claim a batch; publish each row in order (each `publish` under `REDIS_SOCKET_TIMEOUT_MS`); `mark_sent` the published rows and `mark_failed` the rest; commit; end the spans (status ERROR for failed rows). On any failure log `outbox.relay.error` (`error_type`, `batch_size`, `failed`, `backoff_ms`) and back off `min(0.2 × 2^k, 5)` s with full jitter; a clean batch resets `k`. A full batch loops at once.
+- **Loop:** wait for the wake event or `PAYROLL_OUTBOX_POLL_MS` (200 ms), whichever is first; this is pycommon `RelayLoop` (platform §3.9, C22) over `PayrollOutboxSource`: it calls `claim_unsent`, publishes the batch in one `publish_many` pipeline (under `REDIS_SOCKET_TIMEOUT_MS`), then `mark_sent` or `mark_failed`, and commits. On any failure log `outbox.relay.error` (`error_type`, `batch_size`, `failed`, `backoff_ms`) and back off `min(0.2 × 2^k, 5)` s with full jitter; a clean batch resets `k`. A full batch loops at once.
 - **Stream fields** (the contract with payout-worker, R7):
   - `event_id`: string;
   - `type`: `"payout.requested"`;
@@ -1370,7 +1374,7 @@ for each attempt:
       WHERE id = :aid AND publish_count = :seen AND status IN ('requested','indeterminate')
     payroll_payouts_republished_total += 1; log payout.republished
   NEEDS_OPERATOR:
-    UPDATE payout_attempts SET status = 'needs_operator', failure_reason = 'republish_limit'
+    UPDATE payout_attempts SET status = 'needs_operator', failure_reason = 'republish_limit', needs_operator_at = now()
       WHERE id = :aid AND status IN ('requested','indeterminate')
     audit payout.needs_operator; payroll_payouts_total{outcome="needs_operator"} += 1
     log payout.needs_operator (level error)
@@ -1495,7 +1499,7 @@ return the number of employees purged
 | `OTEL_METRIC_EXPORT_INTERVAL` | int ms | 15000 (all) | §7.2, R26 |
 | `OTEL_SEMCONV_STABILITY_OPT_IN` | str (process env, set in the Dockerfile) | `http` (all) | observability §2 |
 
-The JWT audience is the constant `payroll` (the service name), not a setting. `PAYOUT_PAYROLL_CALL_DEADLINE_S` (R2) is a payout-worker key; payroll doesn't read it.
+The JWT audience is the constant `payroll` (the service name), not a setting. `PAYOUT_PAYROLL_CALL_DEADLINE_S` (R2) is a payout-worker key; payroll reads it only for its `check_mark_rejected_wait` startup check (C48).
 
 ### 6.2 Startup checks (PAY-605, C29)
 
@@ -1506,6 +1510,7 @@ Payroll calls `pycommon.startup_checks.run_startup_checks(settings, extra=STARTU
 3. **JWT keyset** (pycommon `check_jwt_kids`, plus a payroll extra): `INTERNAL_JWT_PUBLIC_KEYS` parses, every entry's `iss` is in `{"web", "payout-worker"}`, no kid starts with `dev-` or `test-`, and there is at least one kid each for `web` and `payout-worker` (PAY-600).
 4. **Debug and docs** (pycommon `check_debug_and_docs`): `DEBUG` and `DOCS_ENABLED` are false.
 5. **Timing** (pycommon `check_republish_after`, R11, plan §2.2): `PAYOUT_REPUBLISH_AFTER_S > PAYOUT_MAX_DELIVERIES × PAYOUT_CLAIM_MIN_IDLE_MS/1000 + BANK_TOTAL_DEADLINE_S`. With the defaults: 360 > 5 × 60 + 15 = 315 (R1). Payroll extras: `PAYOUT_REPUBLISH_MAX_BACKOFF_S ≥ PAYOUT_REPUBLISH_AFTER_S` and `PAYOUT_MAX_ATTEMPTS ≥ 1`.
+6. **mark_rejected wait** (pycommon `check_mark_rejected_wait`, C48): `PAYOUT_MARK_REJECTED_MIN_WAIT_S > (BANK_TOTAL_DEADLINE_S + 2 × PAYOUT_PAYROLL_CALL_DEADLINE_S + 10) + 30`. With the defaults: 120 > 35 + 30 = 65.
 
    The claim-idle invariant (`PAYOUT_CLAIM_MIN_IDLE_MS/1000 > BANK_TOTAL_DEADLINE_S + 2 × PAYOUT_PAYROLL_CALL_DEADLINE_S + 10`) belongs to payout-worker's checks, not payroll's (R11).
 
@@ -1542,7 +1547,7 @@ Payroll calls `pycommon.startup_checks.run_startup_checks(settings, extra=STARTU
 | `payout.retry_rejected` | info | `payout_id`, `code` | retry 409 | PAY-500 |
 | `payout.republished` | info | `payout_id`, `attempt`, `republish_seq`, `event_id`, `attempt_status` | re-publish row written | PAY-407 |
 | `payout.operator_resolved` | warning | `payout_id`, `pay_run_id`, `attempt`, `action` (`redrive` \| `mark_rejected`), `note_len`, `actor_id`, `event_id` (redrive only) | resolve committed | PAY-502, R8 |
-| `payout.resolve_rejected` | info | `payout_id`, `code` (`payout_not_blocked`), `attempt_status` | resolve 409 | PAY-502 |
+| `payout.resolve_rejected` | info | `payout_id`, `code` (`payout_not_blocked`, `resolve_too_early`), `attempt_status` | resolve 409 | PAY-502 |
 | `payout.needs_operator` | error | `payout_id`, `pay_run_id`, `attempt`, `reason` (`poison`, `republish_limit`, or the worker's reason such as `key_window_expired`, `amount_mismatch`) | attempt → `needs_operator` | PAY-407, PAY-409, PAY-410 |
 | `payout.instruction_served` | debug | `payout_id`, `attempt` | instruction 200 | PAY-411 |
 | `crypto.decrypt_failed` | error | `kid`, `entity` (`employee` \| `payout_attempt`), `entity_id` | `FieldDecryptError` | PAY-204 |
@@ -1575,7 +1580,7 @@ pycommon also emits `http.request`, `http.error`, `http.unhandled`, `auth.token.
 | `outbox_unsent` | observable gauge, collection-time | — | `SELECT count(*) FROM outbox WHERE sent_at IS NULL` | PAY-402, observability §5 |
 | `outbox_oldest_age_seconds` | observable gauge, collection-time | — | `SELECT COALESCE(EXTRACT(EPOCH FROM now() - min(created_at)), 0) FROM outbox WHERE sent_at IS NULL` | PAY-402 (`OutboxStuck`) |
 | `rate_limiter_errors_total` | counter (pycommon) | `component` | Redis error in the limiter (fail open) | PAY-603 |
-| `rate_limited_total` | counter (pycommon) | `scope` (`caller_user`, `caller_worker`) | 429 | PAY-603 |
+| `rate_limited_total` | counter (pycommon) | `scope` (`caller`; C55) | 429 | PAY-603 |
 | `maintenance_runs_total` / `maintenance_duration_seconds` | counter / histogram (pycommon) | `task`, `outcome` / `task` | each maintenance task per tick | PAY-608 |
 | `http_server_request_duration_seconds` | histogram (auto) | `http_route`, `http_request_method`, `http_response_status_code` | every request | PAY-NFR-04 |
 | DB pool in use / Redis connections | gauge (pycommon) | — | — | observability §5 |

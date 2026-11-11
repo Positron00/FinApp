@@ -347,7 +347,7 @@ It writes a new outbox row with a fresh `event_id`, increments `publish_count` a
   - Audit `payout.retry_requested`.
 - Check: unit, integration, e2e `recover.spec.ts`.
 
-**PAY-501 Payout list with history (must).** `GET /v1/pay-runs/{id}/payouts` returns each payout with its `payslip_id`, employee name, `amount_cents`, status, `no_transfer` and attempts `[{attempt, status, failure_reason, bank_reference, requested_at, final_at}]`.
+**PAY-501 Payout list with history (must).** `GET /v1/pay-runs/{id}/payouts` returns each payout with its `payslip_id`, employee name, `amount_cents`, status, `no_transfer` and attempts `[{attempt, status, failure_reason, bank_reference, account_last4, requested_at, final_at}]`.
 - Acceptance: never any account number other than `account_last4`.
 - Check: integration, e2e.
 
@@ -357,6 +357,7 @@ It writes a new outbox row with a fresh `event_id`, increments `publish_count` a
 - Either action recomputes the run status. Audit `payout.operator_resolved`, with the action and the note's length (not its text).
 - Acceptance:
   - 409 `payout_not_blocked` when the attempt isn't `needs_operator`;
+  - 409 `resolve_too_early` with `Retry-After` for `mark_rejected` within `PAYOUT_MARK_REJECTED_MIN_WAIT_S` of entering `needs_operator`; `redrive` succeeds at once;
   - 422 `validation_error` for an unknown action or a missing note.
 - Check: unit, integration, e2e (`recover.spec.ts` blocked case).
 
@@ -375,9 +376,9 @@ It writes a new outbox row with a fresh `event_id`, increments `publish_count` a
 - Check: unit per router (parametrised matrix), Vitest.
 
 **PAY-602 Error format (must).** Every service and the BFF return errors as `{error: {code, message, request_id, details?}}`.
-- Validation errors are 422 `validation_error`, with field `details` (field and issue, never the submitted value).
+- Validation errors are 422 `validation_error`, with `details` `[{field, issue}]` (never the submitted value). `field` is the request location joined by dots: `body.bank_routing`, `body.entries.3.hours_hundredths`, `query.limit`, `header.Idempotency-Key` (C56).
 - Not-found errors use `<entity>_not_found`: `pay_run_not_found`, `payslip_not_found`, `payout_not_found`, `employee_not_found`, `user_not_found`, `invite_not_found`, `company_settings_not_found`.
-- Other added codes: `employee_not_in_run`, `idempotency_key_required`, `anchor_locked`, `payout_not_blocked`; BFF only, `invalid_json` (400) and `request_failed` (fallback).
+- Other added codes: `employee_not_in_run`, `idempotency_key_required`, `anchor_locked`, `payout_not_blocked`, `resolve_too_early`; BFF only, `invalid_json` (400) and `request_failed` (fallback).
 - List responses are `{items, next_cursor}`, where `next_cursor` is an opaque base64url string or null.
 - Unhandled errors are 500 `internal_error`, with no traceback in the response.
 - The BFF maps service errors to user-safe messages and never forwards internals.

@@ -19,7 +19,7 @@ All paths are under `services/identity/` unless absolute.
 | Image | — | No service Dockerfile: built from the shared `deploy/docker/python-service.Dockerfile` with `PACKAGE=identity`, `SERVICE_DIR=identity`, served by `python -m pycommon.serve` with `PYCOMMON_APP=identity.main:app` on port 8000 (platform LLD §10.1). |
 | `alembic.ini`, `migrations/env.py`, `migrations/versions/0001_initial.py` | new | Alembic setup and the initial schema (§2.9). |
 | `openapi.json` | new (generated) | Committed contract, written by `scripts/export_openapi.py identity`. |
-| `src/identity/main.py` | new | `app = pycommon.create_app(settings, routers=[...], migrations_script_location=..., startup_checks=IDENTITY_CHECKS, background=[email_relay, gauge_refresher, maintenance], on_startup=...)`. `on_startup` creates the `PasswordHasher` (computes the dummy hash) and the identity limiters (§6.4). Background tasks: the email relay (§6.9), the gauge refresher (§5.2) and the maintenance runner (§6.10); on shutdown pycommon sets `stop` and waits, so the relay finishes its in-flight send (≤ `IDENTITY_SMTP_TIMEOUT_S`). |
+| `src/identity/main.py` | new | `app = pycommon.create_app(settings, routers=[...], migrations_script_location=..., startup_checks=IDENTITY_CHECKS, background=[email_relay, maintenance], on_startup=...)`. `on_startup` creates the `PasswordHasher` (computes the dummy hash) and the identity limiters (§6.4). Background tasks: the email relay (§6.9), the gauge refresher (§5.2) and the maintenance runner (§6.10); on shutdown pycommon sets `stop` and waits, so the relay finishes its in-flight send (≤ `IDENTITY_SMTP_TIMEOUT_S`). |
 | `src/identity/settings.py` | new | `IdentitySettings(pycommon.BaseServiceSettings)` with `service_name = "identity"` and `db_schema = "identity"`. The pycommon keys (`DB_*`, `REDIS_*`, `LOG_LEVEL`, `DOCS_ENABLED`, `SERVICE_RATE_LIMIT_USER`, `BREAKER_*`, `MAINTENANCE_INTERVAL_S`, `RETENTION_*`, …) are inherited unchanged (C1); identity adds the keys in §4.2, each field named exactly as its env var. |
 | `src/identity/startup_checks.py` | new | `IDENTITY_CHECKS: list[pycommon.StartupCheck]`, the identity-specific checks passed to `create_app` (§4.3). |
 | `src/identity/api/deps.py` | new | FastAPI dependencies: `public_caller` (requires `sub == "service:web"`), `user_caller` (requires a UUID `sub`), `admin_actor` (loads the actor row from the DB, requires `status = active` and `admin` in its DB roles), `client_ip` (parses `X-Client-IP`; `None` when absent). The per-caller limit is pycommon's `caller_rate_limit(exempt_subs=("service:web",))` (C17), attached to every `/v1` router. |
@@ -147,7 +147,7 @@ Indexes: `uq_password_resets_token_hash` UNIQUE on `(token_hash)` `WHERE token_h
 
 Indexes: `ix_audit_log_company_id_id` on `(company_id, id DESC)` (listing); `ix_audit_log_at` on `(at)` (purge).
 
-The migration runs `REVOKE UPDATE ON identity.audit_log FROM identity_app` (C2), so the runtime role can append and purge but not rewrite entries.
+The migration runs `REVOKE UPDATE, DELETE ON identity.audit_log FROM identity_app` (C2, C50), so the runtime role can append but never rewrite or delete entries. Retention purging goes through `identity.purge_audit_log(cutoff timestamptz) RETURNS integer`, a `SECURITY DEFINER` function owned by `identity_migrator` (with `SET search_path = identity, pg_temp`) that deletes only rows with `at < cutoff`. EXECUTE on it is granted to `identity_app` (bootstrap default privileges cover functions).
 
 **Audit events** (`domain/audit_events.py`):
 
@@ -202,7 +202,7 @@ Decision: login counters and lockout state live in Redis under `identity:rl:*` (
 - `alembic.ini` points at `migrations/`. `migrations/env.py` calls `pycommon.db.run_alembic_env(Base.metadata, schema="identity", runtime_role="identity_app")`, which connects with `DB_USER` / `DB_PASSWORD` (set to `identity_migrator` and its password in the migrate container; C1), keeps `alembic_version` in schema `identity`, and afterwards revokes `INSERT, UPDATE, DELETE` on `identity.alembic_version` from `identity_app`.
 - The schema itself is created by the bootstrap SQL (`deploy/compose/init/`), not by Alembic. The migration assumes it exists and is owned by the migrator.
 - Revisions:
-  - `0001_initial`: creates `users`, `credentials`, `invites`, `password_resets`, `audit_log`, `email_outbox`, with every constraint and index in §2.2–2.7, then `REVOKE UPDATE ON identity.audit_log FROM identity_app` (C2). Downgrade drops the tables in reverse FK order.
+  - `0001_initial`: creates `users`, `credentials`, `invites`, `password_resets`, `audit_log`, `email_outbox`, with every constraint and index in §2.2–2.7, then `REVOKE UPDATE, DELETE ON identity.audit_log FROM identity_app` (C2, C50), and creates the `SECURITY DEFINER` function `identity.purge_audit_log(cutoff)`. Downgrade drops the tables in reverse FK order.
 - Later revisions are expand-then-contract only (plan §2.3), each backward compatible with the running image.
 - Run by the Compose one-shot `migrate-identity` (`alembic upgrade head`) and the Kubernetes Job `migrate-identity-<version>`, before identity starts. `/readyz` fails until `identity.alembic_version` equals the script head (PAY-605).
 
@@ -242,7 +242,7 @@ Claims expected (verified by pycommon; EdDSA; leeway 5 s):
 | `public_caller` | `sub == "service:web"` | 403 `forbidden_role` |
 | `user_caller` | `sub` is a UUID | 403 `forbidden_role` |
 | `admin_actor` | `user_caller`, then the actor row `(cid, sub)` exists with `status = 'active'` and `'admin' = ANY(roles)` **in the DB** (JWT roles may be up to `SESSION_ROLE_RECHECK_S` stale) | 403 `forbidden_role` |
-| `caller_rate_limit` | pycommon `caller_rate_limit(exempt_subs=("service:web",))` (C17): user tokens get `SERVICE_RATE_LIMIT_USER` per minute per `(iss, sub)`, with pycommon's key format (`identity:rl:caller_user:<sha256(caller_key)[:32]>:<now // 60>`). `service:web` is exempt (R18), because every anonymous visitor shares that subject; the public routes are limited per IP and per account instead (§6.4). Fails open. | 429 `rate_limited` + `Retry-After` |
+| `caller_rate_limit` | pycommon `caller_rate_limit(exempt_subs=("service:web",))` (C17): user tokens get `SERVICE_RATE_LIMIT_USER` per minute per `(iss, sub)`, with pycommon's key format (`identity:rl:caller:<sha256(caller_key)[:32]>:<now // 60>`, scope `caller`; C55). `service:web` is exempt (R18), because every anonymous visitor shares that subject; the public routes are limited per IP and per account instead (§6.4). Fails open. | 429 `rate_limited` + `Retry-After` |
 
 ### 3.3 Pydantic models (`api/schemas.py`)
 
@@ -456,7 +456,7 @@ The `.html.j2` versions carry the same text, with the link as an `<a href>` and 
 ### 4.1 Naming
 
 - **pycommon keys** (C1): `IdentitySettings` inherits `BaseServiceSettings`, whose names are the contract for every Python service: `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_SCHEMA`, `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`, `REDIS_PASSWORD`, plus `ENV`, `COMPANY_ID`, `LOG_LEVEL`, `DOCS_ENABLED`, `DB_POOL_SIZE`, `SERVICE_RATE_LIMIT_USER`, `BREAKER_*`, `MAINTENANCE_INTERVAL_S` and `RETENTION_*`. There is no `DATABASE_URL` or `REDIS_URL`. The migrate and bootstrap-owner containers set the same `DB_*` keys with the migrator's credentials.
-- Identity keys the plan or requirements already name keep their exact names, without a prefix (`INVITE_TTL_H`, `RESET_TTL_H`, `AUTH_LOGIN_LIMIT_ACCOUNT`, `AUTH_LOGIN_LIMIT_IP`, `EMAIL_MAX_ATTEMPTS`, `AUDIT_IP_HASH_KEY`, `SMTP_HOST`, `SMTP_USERNAME`, `SMTP_PASSWORD`).
+- Identity keys the plan or requirements already name keep their exact names, without a prefix (`INVITE_TTL_H`, `RESET_TTL_H`, `AUTH_LOGIN_LIMIT_ACCOUNT`, `AUTH_LOGIN_LIMIT_IP`, `EMAIL_MAX_ATTEMPTS`, `AUDIT_IP_HASH_KEY`, and the unprefixed SMTP keys `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD` per C49).
 - Identity-only keys this design introduces use the `IDENTITY_` prefix (C1).
 - Each settings field is named exactly as its env var (pycommon settings are case-insensitive), so no aliases are needed.
 - "gen" means generated by `scripts/dev-env.sh` into `.env`; "ES" means External Secrets (ADR 0008).
@@ -506,7 +506,6 @@ The `.html.j2` versions carry the same text, with the link as an `<a href>` and 
 | `RETENTION_TOKENS_DAYS` | int | 7 | 7 | 7 | PAY-608 |
 | `RETENTION_OUTBOX_DAYS` | int (used for sent/failed/cancelled emails) | 7 | 7 | 7 | PAY-608 |
 | `IDENTITY_RETENTION_AUDIT_DAYS` | int | 400 | 400 | 400 | PAY-NFR-08 |
-| `IDENTITY_GAUGE_REFRESH_S` | int | 15 | 15 | 15 | PAY-NFR-10 |
 | `DOCS_ENABLED` | bool (pycommon) | true | false | false | PAY-605 |
 | `LOG_LEVEL` | str (case-insensitive, upper-cased by pycommon; C24) | `INFO` | `INFO` | `INFO` | PAY-NFR-07 |
 | `OTEL_SERVICE_NAME` | str | `identity` | same | same | PAY-NFR-09 |
@@ -574,7 +573,7 @@ Names as in plan §11 and `observability.md` §5; labels bounded.
 | Metric | Type | Labels | When | Requirement |
 |---|---|---|---|---|
 | `auth_signins_total` | counter | `outcome`: `success`, `failure`, `rate_limited` | Every login response (401 → `failure`, 429 → `rate_limited`) | PAY-104, PAY-NFR-10 |
-| `rate_limited_total` | counter (pycommon) | `scope`: the `Limit.scope` values `login_ip`, `login_account`, `reset_ip`, `reset_account`, `accept_ip`, `caller_user`, plus `login_locked` (incremented by identity for a request refused while the account is locked) | Every 429 from identity | PAY-603 |
+| `rate_limited_total` | counter (pycommon) | `scope`: the `Limit.scope` values `login_ip`, `login_account`, `reset_ip`, `reset_account`, `accept_ip`, `caller`, plus `login_locked` (incremented by identity for a request refused while the account is locked) | Every 429 from identity | PAY-603 |
 | `rate_limiter_errors_total` | counter (pycommon) | `component`: `login`, `reset`, `accept`, and pycommon's caller limiter | Every limiter or lock-command Redis error | PAY-603 |
 | `identity_emails_pending` | gauge | — | Count of `status = 'pending'` | PAY-110 |
 | `identity_emails_failed_total` | counter | — | +1 each time an email becomes `failed` (§6.9; R25). Pre-initialised with `add(0)` at start | PAY-110 |
@@ -585,7 +584,7 @@ Names as in plan §11 and `observability.md` §5; labels bounded.
 | `identity_password_hash_seconds` | histogram | `op`: `hash`, `verify` | Each argon2 call (sizing and the timing-class check) | PAY-104 |
 | `http_server_request_duration_seconds` | histogram | auto (route, status) | Every request | PAY-NFR-05 |
 
-The two email gauges are computed by **every replica** from one DB query every `IDENTITY_GAUGE_REFRESH_S` (a background task outside the advisory lock); the OTel observable-gauge callback reads the cached values at collection. Alert rules use `max()` across replicas.
+The two email gauges are computed by **every replica** at metric collection (R26): the OTel observable-gauge callback runs one DB query on a small sync engine (as payroll §7.2 does), and reports nothing for that cycle if the query fails (log `metrics.gauge_query_failed`). Alert rules use `max()` across replicas.
 
 **`EmailOutboxStuck`** (platform rules; R25) fires on `max(identity_email_oldest_pending_age_seconds) > 900 or increase(identity_emails_failed_total[1h]) > 0`, so it clears an hour after the last failure. Alerts, promtool tests and dashboards use `auth_signins_total{outcome="failure"}` (C19). The Step 6 email drill reads the alert from alert-sink on host port 4135 (`ALERT_SINK_PORT`, test override; R31).
 
@@ -655,7 +654,7 @@ Keys:
 | `identity:rl:<scope>:<hash>:<window>` | counter (pycommon) | `window_s + 1` | One per limit above |
 | `identity:rl:login:lock:<ek>` | string: the lock's level | the lock duration | Account locked while present |
 | `identity:rl:login:level:<ek>` | string: the last lock level | `IDENTITY_LOCKOUT_LEVEL_TTL_S`, rewritten on each lock | Lock level; gone after 24 h without a new lock |
-| `identity:rl:caller_user:<hash>:<window>` | counter (pycommon `caller_rate_limit`) | 61 s | Per-user service limit (`SERVICE_RATE_LIMIT_USER`; §3.2) |
+| `identity:rl:caller:<hash>:<window>` | counter (pycommon `caller_rate_limit`) | 61 s | Per-user service limit (`SERVICE_RATE_LIMIT_USER`; §3.2) |
 
 **Login algorithm:**
 1. `login.hit(login_ip, ih)`. Denied → 429, `Retry-After = retry_after_s`, scope `login_ip`.
@@ -777,7 +776,7 @@ pycommon's `MaintenanceRunner(lock_name="identity:maintenance")` ticks every `MA
 | `purge_invites` | `DELETE FROM invites WHERE status IN ('accepted','revoked') AND coalesce(expires_at, updated_at) < now() − RETENTION_TOKENS_DAYS` (a never-sent invite has `expires_at` `NULL`, so its revoke or accept time counts) | 7 days |
 | `purge_password_resets` | `DELETE FROM password_resets WHERE coalesce(expires_at, updated_at) < now() − RETENTION_TOKENS_DAYS` | 7 days after expiry |
 | `purge_emails` | `DELETE FROM email_outbox WHERE status IN ('sent','failed','cancelled') AND finished_at < now() − RETENTION_OUTBOX_DAYS` | 7 days after sent or failed |
-| `purge_audit` | `DELETE FROM audit_log WHERE at < now() − IDENTITY_RETENTION_AUDIT_DAYS` | 400 days |
+| `purge_audit` | `SELECT identity.purge_audit_log(now() − IDENTITY_RETENTION_AUDIT_DAYS)` (the runtime role has no DELETE on `audit_log`, C50) | 400 days |
 
 A pending user's latest invite stays `pending` (hash nulled once expired), so an admin can still resend it.
 
@@ -810,7 +809,7 @@ Every test names its requirement IDs in its docstring. Unit tests run with `--di
 | Test file | Covers | Requirement |
 |---|---|---|
 | `test_migrations.py` | Upgrade to head, downgrade one step, upgrade again; `alembic_version` lives in schema `identity`; all §2 constraints exist | PAY-606 |
-| `test_grants.py` | `identity_app`: `permission denied` on `payroll.*`, `payouts.*`, `bank_stub.*` and on `CREATE TABLE identity.x`; `UPDATE identity.audit_log` denied (C2); `INSERT`/`UPDATE` on `identity.alembic_version` denied; DML on the other identity tables allowed. `identity_migrator`: no rights in other schemas | PAY-606 |
+| `test_grants.py` | `identity_app`: `permission denied` on `payroll.*`, `payouts.*`, `bank_stub.*` and on `CREATE TABLE identity.x`; `UPDATE` and `DELETE` on `identity.audit_log` denied (C2, C50), including after re-running the bootstrap SQL; `identity.purge_audit_log(cutoff)` deletes only rows older than the cutoff; `INSERT`/`UPDATE` on `identity.alembic_version` denied; DML on the other identity tables allowed. `identity_migrator`: no rights in other schemas | PAY-606 |
 | `test_redis_acl.py` | The `identity` Redis user can use `identity:*` (`MULTI`/`INCR`/`EXPIRE NX`, `SET NX EX`, `PTTL`) but gets `NOPERM` on `web:sess:x`, on `XADD stream:payout.requested` and on `EVAL` (C3) | PAY-607 |
 | `test_bootstrap_owner.py` | Runs as `identity_migrator`. Empty DB → exit 0, pending owner with all three roles, invite (`expires_at` `NULL`) and outbox row, audit `user.bootstrapped`; second run → exit 3 and `identity.bootstrap.refused`; second run with `--if-empty` → exit 0, `identity.bootstrap.skipped`, no new rows (R16); two concurrent runs → one 0, one 3; `--if-empty --password-env SEED_OWNER_PASSWORD` in dev → active owner who can log in, no invite and no email; `--password-env` with `ENV=uat` → exit 2; DB down → exit 4 | PAY-100, PAY-609 |
 | `test_invites.py` | Invite 201 with a pending user, `pending_invite_id` set (C11) and a pending outbox row; `GET /v1/users` shows `pending_invite_id` only for pending users; 409 `user_email_taken` (case-insensitive, concurrent duplicates); 422 for empty/unknown roles; 403 for non-admin; resend 200 revokes the old token (`invite_invalid` afterwards) and 409 `invite_not_pending` for an active user; the invite's `expires_at` is `NULL` until sent, then send time + `INVITE_TTL_H`, and moves forward on a re-send (time-machine; C31); accept: 200 `SessionUser` with `user_id`, `company_id`, `email`, `name`, `roles`, `roles_version` and `status` (C6), used / expired / unknown / revoked token → 400, 11-char password → 422, two concurrent accepts → one 200; the token travels only in the body | PAY-101, PAY-102, PAY-103, PAY-106 |
@@ -867,5 +866,4 @@ The Schemathesis run against identity (no 5xx, no schema violations) is in the C
 ## 9. Change log
 
 - 2026-11-10: incorporated README R-table and C-table decisions (R3, R4, R9, R15, R16, R17, R18, R19, R21, R24, R25, R27, R30, R31, R37; C1, C2, C3, C6, C10, C11, C12, C14, C16, C17, C19, C23, C24, C25, C28, C29, C30, C31, C35, C44, C45).
-- Open: the SMTP port key. This design uses `SMTP_PORT`; the platform LLD (`.env` table and §7.3 Compose env) sets `SMTP_PORT`. Needs a lead decision on one name.
-- Open: the platform bootstrap SQL re-grants `SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA identity TO identity_app` on every re-run (password rotation), which undoes this design's `REVOKE UPDATE ON identity.audit_log FROM identity_app` (C2) until the next migration. Needs a lead decision on where the revoke lives.
+- Resolved: SMTP keys (C49); the audit-log revoke and purge function (C50; this design §2.6, §6.10).

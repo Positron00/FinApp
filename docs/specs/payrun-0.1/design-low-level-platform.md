@@ -929,7 +929,10 @@ class StreamItem:
     event_id: UUID
     type: str
     envelope_json: str                 # already carries the traceparent the consumer should continue
+    ref: Any = None                    # owner's opaque handle (e.g. payroll: (payout_id, attempt, span)); the loop passes it back untouched
 
+# The owner opens any per-item PRODUCER span inside claim_unsent (when it builds envelope_json) and
+# closes it in mark_sent / mark_failed; RelayLoop publishes the whole batch with one publish_many pipeline.
 class OutboxRepository(Protocol):      # implemented by the owning service over its own table
     async def claim_unsent(self, session: AsyncSession, *, limit: int) -> Sequence[StreamItem]: ...
         # SELECT … WHERE sent_at IS NULL ORDER BY created_at, id LIMIT :limit FOR UPDATE SKIP LOCKED
@@ -996,6 +999,8 @@ class CircuitBreaker:
     def allow(self) -> bool: ...        # False while open; in half-open, True for exactly one trial
     def record_success(self) -> None: ...
     def record_failure(self) -> None: ...
+    # Construction registers the `circuit_breaker_state{target}` observable gauge, which reports the
+    # current state (0 closed at start), so the series exists on a healthy stack (check_metrics.sh).
 
 class ProviderError(Exception):
     provider: str; operation: str
@@ -1057,6 +1062,7 @@ class Decision:
 class RateLimiter:
     def __init__(self, redis: Redis, *, prefix: str, component: str, clock: Clock = SystemClock()) -> None: ...
         # prefix "identity:rl" / "payroll:rl"; component is the rate_limiter_errors_total label
+        # __init__ calls rate_limiter_errors_total.add(0, {component}) so the series exists before any error
     async def hit(self, limit: Limit, subject: str) -> Decision: ...
     async def check(self, limit: Limit, subject: str) -> None: ...   # raises RateLimited / ServiceUnavailable
 
@@ -1096,12 +1102,16 @@ def check_republish_after(republish_after_s: float, max_deliveries: int, claim_m
                           bank_total_deadline_s: float) -> Iterable[CheckFailure]
     # republish_after_s > max_deliveries * claim_min_idle_ms/1000 + bank_total_deadline_s
 
+def check_mark_rejected_wait(mark_rejected_min_wait_s: float, bank_total_deadline_s: float,
+                             payroll_call_deadline_s: float) -> Iterable[CheckFailure]
+    # mark_rejected_min_wait_s > (bank_total_deadline_s + 2*payroll_call_deadline_s + 10) + 30   (C48)
+
 def run_startup_checks(settings: BaseServiceSettings, extra: Sequence[StartupCheck] = ()) -> None
 ```
 
 - `run_startup_checks` runs the common checks plus `extra`. In **uat and prod** any failure logs `startup.check_failed` {setting, reason} at error for **each** failure (never the value), then exits with code 2. In **dev** the same failures are logged at warning and start-up continues, so a developer sees them.
-- The two timing checks are extras: payroll registers `check_republish_after`, the worker registers `check_claim_idle` and `check_republish_after`. Both services therefore read the shared timing keys (`PAYOUT_MAX_DELIVERIES`, `PAYOUT_CLAIM_MIN_IDLE_MS`, `BANK_TOTAL_DEADLINE_S`, `PAYOUT_PAYROLL_CALL_DEADLINE_S`, `PAYOUT_REPUBLISH_AFTER_S`) from one shared source: `x-payout-timing` in Compose, the `payout-timing` ConfigMap in Kubernetes.
-- **The defaults pass both checks:** republish 360 > 5 × 60 + 15 = 315 (R1; the old plan value 300 failed), and claim idle 60 > 15 + 2 × 5 + 10 = 35.
+- The timing checks are extras: payroll registers `check_republish_after` and `check_mark_rejected_wait`; the worker registers `check_claim_idle` and `check_republish_after`. Both services therefore read the shared timing keys (`PAYOUT_MAX_DELIVERIES`, `PAYOUT_CLAIM_MIN_IDLE_MS`, `BANK_TOTAL_DEADLINE_S`, `PAYOUT_PAYROLL_CALL_DEADLINE_S`, `PAYOUT_REPUBLISH_AFTER_S`, `PAYOUT_MARK_REJECTED_MIN_WAIT_S`) from one shared source: `x-payout-timing` in Compose, the `payout-timing` ConfigMap in Kubernetes.
+- **The defaults pass all three checks:** republish 360 > 5 × 60 + 15 = 315 (R1; the old plan value 300 failed); claim idle 60 > 15 + 2 × 5 + 10 = 35; mark_rejected wait 120 > 35 + 30 = 65 (C48).
 - **Every Python service uses this module (C29):** a failed check logs `startup.check_failed` {setting, reason} and exits **2**; services add their checks as `extra` and log no other start-up refusal event (no `worker.startup.refused`, `bank_stub.startup.refused` or exit 1). The web does the same in TypeScript: `config.invalid`, exit 2.
 
 ### 3.13 `maintenance.py` (PAY-608)
@@ -1111,6 +1121,8 @@ def run_startup_checks(settings: BaseServiceSettings, extra: Sequence[StartupChe
 class MaintenanceTask:
     name: str                                                 # "purge_outbox", "republish", …
     fn: Callable[[AsyncSession], Awaitable[int]]              # returns rows affected; owns no commit
+    # Tasks that need more than the session (settings, clock, Redis) bind it with a closure or
+    # functools.partial when the service builds its task list (e.g. payroll republish, worker prune_consumers).
 
 class MaintenanceRunner:
     def __init__(self, engine: AsyncEngine, sf: async_sessionmaker[AsyncSession], *, lock_name: str,
@@ -1358,7 +1370,7 @@ names (`REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME=web`, `REDIS_PASSWORD`; C12).
 | `DB_HOST`, `DB_PORT`, `DB_NAME` | str, int, str | postgres, 5432, payrun / managed endpoint | PAY-606 |
 | `DB_USER`, `DB_PASSWORD`, `DB_SCHEMA` | str, secret, str | `<schema>_app` (runtime) or `<schema>_migrator` (migrate, bootstrap-owner) per C2; password from `<SVC>_DB_PASSWORD` / `<SVC>_DB_MIGRATOR_PASSWORD` | PAY-606 |
 | `DB_STATEMENT_TIMEOUT_MS` / `DB_POOL_TIMEOUT_S` | int / float | 2000 / 2 everywhere | PAY-605, plan §2.2 |
-| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | int | 10 / 5 everywhere (tuned after load tests) | NFR-05 |
+| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | int | 10 / 5 by default; payout-worker and bank-stub 20 / 5 (their designs); tuned after load tests | NFR-05 |
 | `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`, `REDIS_PASSWORD` | str, int, str, secret | redis, 6379, the service's ACL user (§2.2), password from `REDIS_<USER>_PASSWORD` / managed endpoint | PAY-607 |
 | `REDIS_SOCKET_TIMEOUT_MS` / `PAYOUT_XREAD_BLOCK_MS` | int | 500 / 5000 everywhere | plan §2.2 |
 | `INTERNAL_JWT_PUBLIC_KEYS` | JSON keyset | from `<SVC>_INTERNAL_JWT_PUBLIC_KEYS` / ConfigMap / ConfigMap | PAY-600 |
@@ -1371,6 +1383,7 @@ names (`REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME=web`, `REDIS_PASSWORD`; C12).
 | `STREAM_MAXLEN` | int | 100000 | PAY-402 |
 | `PAYOUT_MAX_DELIVERIES` | int | 5 (shared, `payout-timing`) | PAY-404, 408 |
 | `PAYOUT_CLAIM_MIN_IDLE_MS` | int | 60000 (shared) | PAY-408, 605 |
+| `PAYOUT_MARK_REJECTED_MIN_WAIT_S` | int | 120 (shared; C48) | PAY-502, 605 |
 | `PAYOUT_REPUBLISH_AFTER_S` / `PAYOUT_REPUBLISH_MAX_BACKOFF_S` / `PAYOUT_REPUBLISH_MAX` | int | 360 / 900 / 10 (shared; README resolution R1) | PAY-407, 605 |
 | `BANK_TOTAL_DEADLINE_S` / `PAYOUT_PAYROLL_CALL_DEADLINE_S` | float | 15 / 5 (shared) | PAY-404, 605 |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | URL | `http://otel-collector:4317` (Python), `:4318` (web) | NFR-09, 10 |
@@ -1554,6 +1567,7 @@ x-payout-timing: &payout-timing
   PAYOUT_REPUBLISH_MAX: "10"
   BANK_TOTAL_DEADLINE_S: "15"
   PAYOUT_PAYROLL_CALL_DEADLINE_S: "5"
+  PAYOUT_MARK_REJECTED_MIN_WAIT_S: "120"     # C48
 
 x-app: &app
   restart: unless-stopped

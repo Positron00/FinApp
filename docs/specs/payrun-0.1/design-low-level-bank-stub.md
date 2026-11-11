@@ -106,7 +106,7 @@ Request headers: `X-Api-Key` (required), `Idempotency-Key` (required), `Content-
 
 Steps, in this order:
 1. `require_api_key` (§3.3). Failure → 401 `invalid_api_key`.
-2. `Idempotency-Key` missing → **400 `idempotency_key_required`** (C34). Not matching `IDEMPOTENCY_KEY_PATTERN` → **422 `validation_error`** with `details=[{"field": "Idempotency-Key", "issue": "pattern"}]` (C34, C14).
+2. `Idempotency-Key` missing → **400 `idempotency_key_required`** (C34). Not matching `IDEMPOTENCY_KEY_PATTERN` → **422 `validation_error`** with `details=[{"field": "header.Idempotency-Key", "issue": "pattern"}]` (C34, C14).
 3. `await asyncio.sleep(BANK_STUB_LATENCY_MS / 1000)` (§3.6).
 4. **Replay lookup (before the body is validated; R6):** `row = await repo.get_by_key(key)`. If found → **200** with that row as `TransferResponse`, **whatever the body** (the body isn't validated or compared). Log `bank_stub.transfer.replayed`; metric outcome `replayed`.
 5. Validate the body with `TransferRequest.model_validate_json(raw)`. Failure → 422 `validation_error` with `details=[{field, issue}]` (field names and error types only; values never echoed).
@@ -341,6 +341,4 @@ is owned by the worker's resilience suite: `tests/resilience/test_bank_restart.p
 
 - 2026-11-10: incorporated README R-table and C-table decisions (R3, R6, R13, R27; C1, C2, C14, C23, C24, C28, C29, C34, C44).
 
-Still open (for the lead; not decided here):
-1. **`COMPANY_ID` is required but unused.** pycommon `BaseServiceSettings.company_id` has no default, so bank-stub must be given `COMPANY_ID` (it gets it from `x-py-env`) even though it has no tenant.
-2. **Startup-check reason `not_deployable` is new.** pycommon's `CheckFailure.reason` list (platform §3.12) doesn't include it; `check_not_prod` adds it.
+Resolved after the change log entry: C46 (`PAYOUT_PAYROLL_*` keys), C47 (`COMPANY_ID` for every service, `PAYOUT_CONSUMER_GC_IDLE_S`, startup reason `not_deployable`). Nothing is open.

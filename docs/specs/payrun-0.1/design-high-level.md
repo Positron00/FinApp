@@ -63,6 +63,23 @@ stateDiagram-v2
   }
 ```
 
+```mermaid
+stateDiagram-v2
+  direction LR
+  state "Run" as RUN {
+    [*] --> draft
+    draft --> calculated: calculate
+    calculated --> draft: hours edited
+    draft --> deleted: delete
+    calculated --> deleted: delete
+    calculated --> processing: approve
+    calculated --> paid: approve (all no_transfer)
+    processing --> paid: all payouts paid
+    processing --> partially_failed: no payout requested, some failed
+    partially_failed --> processing: retry / redrive
+  }
+```
+
 - **Payout:** `requested` (current attempt requested, indeterminate or needs_operator) → `paid` (settled, or `no_transfer`) | `failed` (rejected) → retry → `requested`.
 - **Run:** `draft` ⇄ `calculated` → (approve) `processing` | `paid` → `paid` | `partially_failed`. Retry or redrive: `partially_failed` → `processing`. `draft` and `calculated` can be soft-deleted (`deleted_at`, PAY-304), which frees the period. The rule is PAY-406.
 
