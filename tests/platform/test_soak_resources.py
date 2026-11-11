@@ -8,6 +8,7 @@ evaluates differently from what the check assumes fails here rather than at nigh
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -164,7 +165,10 @@ def test_queries_in_promtool(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     cmd = [
-        "docker", "run", "--rm", "-v", f"{tmp_path}:/t:ro", "-w", "/t",
+        # As the caller: on Linux tmp_path is 0700, and the image's default user (nobody) can't
+        # read it; Docker Desktop on macOS hides this (first PR CI run, 2026-11-11).
+        "docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
+        "-v", f"{tmp_path}:/t:ro", "-w", "/t",
         "--entrypoint", "promtool", PROMETHEUS_IMAGE, "test", "rules", "test.yml",
     ]  # fmt: skip
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
