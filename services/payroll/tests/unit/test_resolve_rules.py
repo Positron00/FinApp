@@ -1,16 +1,18 @@
-"""Operator resolution rules (design §3.5a; PAY-502, R8, C13, C48)."""
+"""Operator resolution rules (design §3.5a; PAY-502, R8, C13, C48, C73)."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from payroll.domain import PayoutNotBlocked, ResolveTooEarly
+from payroll.domain import InvalidFields, PayoutNotBlocked, ResolveTooEarly
 from payroll.domain.resolve import (
+    KEY_WINDOW_EXPIRED,
     OPERATOR_REJECTED,
     ResolveAction,
     check_mark_rejected_wait,
     check_resolve,
+    check_resolve_action,
     resolve_transition,
 )
 from payroll.domain.state import AttemptStatus, PayoutStatus
@@ -74,3 +76,22 @@ def test_mark_rejected_wait() -> None:
     assert (info.value.retry_after_s, info.value.headers) == (1, {"Retry-After": "1"})
     check_mark_rejected_wait(needs_operator_at=AT, now=AT + timedelta(seconds=120), min_wait_s=120)
     check_mark_rejected_wait(needs_operator_at=AT, now=AT + timedelta(hours=1), min_wait_s=120)
+
+
+def test_redrive_refused_after_key_window_expired() -> None:
+    """PAY-410, PAY-502, C73: redrive keeps requested_at, so a key_window_expired attempt would
+    only GET the same key, 404 and come back to needs_operator: refused (422 validation_error at
+    body.action); mark_rejected stays open."""
+    with pytest.raises(InvalidFields) as err:
+        check_resolve_action(action=ResolveAction.REDRIVE, failure_reason=KEY_WINDOW_EXPIRED)
+    assert err.value.status == 422
+    assert err.value.details == [{"field": "body.action", "issue": "redrive_not_allowed"}]
+    check_resolve_action(action=ResolveAction.MARK_REJECTED, failure_reason=KEY_WINDOW_EXPIRED)
+
+
+@pytest.mark.parametrize(
+    "reason", ["poison", "schema_invalid", "amount_mismatch", "republish_limit", "envelope_invalid"]
+)
+def test_redrive_allowed_for_other_reasons(reason: str) -> None:
+    """PAY-502, C73: only key_window_expired refuses a redrive."""
+    check_resolve_action(action=ResolveAction.REDRIVE, failure_reason=reason)

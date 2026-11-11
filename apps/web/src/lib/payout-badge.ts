@@ -15,6 +15,7 @@ const REASONS: Record<string, string> = {
   account_closed: "Account closed",
   insufficient_funds_at_bank: "Insufficient funds at the bank",
   operator_rejected: "Rejected by an operator",
+  key_window_expired: "Bank key expired",
 };
 
 export function failureReasonLabel(code: string | null): string | undefined {

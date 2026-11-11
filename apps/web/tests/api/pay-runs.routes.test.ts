@@ -426,7 +426,7 @@ describe("POST /api/pay-runs/[id]/approve", () => {
     [
       "approver_must_differ",
       403,
-      "Dual approval is on: you can't approve this run because you calculated it, or you changed bank details for an employee in it. Ask another approver.",
+      "Dual approval is on: someone else must approve. You created, calculated or entered hours for this run, or changed bank details that a second person hasn't released yet.",
     ],
     [
       "employee_bank_details_missing",

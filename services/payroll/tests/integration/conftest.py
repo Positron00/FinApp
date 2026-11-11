@@ -29,6 +29,7 @@ from tests.helpers import COMPANY_ID, OTHER_COMPANY_ID, employee_body, make_sett
 PAYROLL_ADMIN = str(UUID("0193a000-0000-7000-8000-0000000000a1"))
 APPROVER = str(UUID("0193a000-0000-7000-8000-0000000000a2"))
 ADMIN = str(UUID("0193a000-0000-7000-8000-0000000000a3"))
+APPROVER_2 = str(UUID("0193a000-0000-7000-8000-0000000000a4"))  # a second approver (C73)
 WORKER = "service:payout-worker"
 TABLES = (
     "idempotency_keys",
@@ -157,6 +158,9 @@ class Api:
 
     def approver(self, **kw: Any) -> dict[str, str]:
         return self.headers(APPROVER, ("approver",), **kw)
+
+    def approver2(self, **kw: Any) -> dict[str, str]:
+        return self.headers(APPROVER_2, ("approver",), **kw)
 
     def admin(self, **kw: Any) -> dict[str, str]:
         return self.headers(ADMIN, ("admin",), **kw)

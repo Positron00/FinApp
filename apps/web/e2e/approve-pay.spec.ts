@@ -23,7 +23,7 @@ import { alertWith, rowWith, runBadge } from "./helpers/ui";
  * PAY-400, PAY-401, PAY-413, PAY-501, ADR 0005.
  */
 const DUAL_APPROVAL =
-  "Dual approval is on: you can't approve this run because you calculated it, or you changed bank details for an employee in it. Ask another approver.";
+  "Dual approval is on: someone else must approve. You created, calculated or entered hours for this run, or changed bank details that a second person hasn't released yet.";
 
 test.describe("@journeys J4 approve and pay", () => {
   test("dual approval, approve, poll to partially_failed with the 0000 account (PAY-400, 401, 413, 501)", async ({
@@ -46,7 +46,7 @@ test.describe("@journeys J4 approve and pay", () => {
     await test.step("the owner's approve is refused with the dual-approval message (PAY-401)", async () => {
       await expect(
         asOwner.getByText(
-          "You calculated this run. With dual approval on, another approver must approve it.",
+          "You created or calculated this run. With dual approval on, another approver must approve it.",
         ),
       ).toBeVisible();
       await asOwner.getByRole("button", { name: "Approve", exact: true }).click();

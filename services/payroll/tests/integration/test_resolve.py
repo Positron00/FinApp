@@ -128,7 +128,9 @@ async def test_mark_rejected_waits_then_retry_pays(
     assert points.get("operator_rejected") == 1
     [hist] = [v for _, v in otel_memory.metric_points("payroll_payout_settlement_seconds")]
     assert hist.count == 1
-    assert (await api.retry(run["id"], p["id"])).status_code == 200
+    assert a["resolved_by"] == APPROVER
+    # C73: the operator who marked it rejected can't retry it; a second approver can.
+    assert (await api.retry(run["id"], p["id"], headers=api.approver2())).status_code == 200
     settled = {"attempt": 2, "outcome": "settled", "bank_reference": "BR-2"}
     assert (await api.result(p["id"], settled)).json()["outcome"] == "settled"
     assert await db.fetchval("SELECT status FROM payroll.pay_runs WHERE id = $1", run["id"]) == (
@@ -294,7 +296,7 @@ async def test_late_settled_for_a_superseded_attempt_is_recorded(
     later_attempt_settled (attempt 2: paid twice), logged at error and counted."""
     api = await api_factory(instrument=True)
     run, p = await _mark_rejected(api, db)
-    assert (await api.retry(run["id"], p["id"])).status_code == 200
+    assert (await api.retry(run["id"], p["id"], headers=api.approver2())).status_code == 200
     settled = {"attempt": 2, "outcome": "settled", "bank_reference": "BR-2"}
     assert (await api.result(p["id"], settled)).json()["outcome"] == "settled"
     late = {"attempt": 1, "outcome": "settled", "bank_reference": "BR-LATE-1"}
@@ -334,8 +336,62 @@ async def test_ordinary_answers_are_not_late_settlements(api: Api, db: Any) -> N
     assert (await api.result(p["id"], rejected)).json()["outcome"] == "rejected"
     unknown = {"attempt": 7, "outcome": "settled", "bank_reference": "BR-7"}
     assert _code(await api.result(p["id"], unknown)) == (409, "attempt_not_current")
-    assert (await api.retry(run["id"], p["id"])).status_code == 200
+    assert (await api.retry(run["id"], p["id"], headers=api.approver2())).status_code == 200
     settled = {"attempt": 2, "outcome": "settled", "bank_reference": "BR-2"}
     for _ in range(2):
         assert (await api.result(p["id"], settled)).json()["outcome"] == "settled"
     assert await _late_audits(db, p["id"]) == []
+
+
+async def test_resolver_cannot_retry_what_they_marked_rejected(api: Api, db: Any) -> None:
+    """PAY-500, PAY-502, ADR 0005, C73: with dual approval on, the operator who marked the attempt
+    rejected (resolved_by) gets 403 approver_must_differ (rule resolver) on retry, nothing is
+    written but a payout.retry_denied audit row; a second approver's retry then succeeds."""
+    run, p = await _mark_rejected(api, db)
+    assert (await _attempt(db, p["id"]))["resolved_by"] == APPROVER
+    r = await api.retry(run["id"], p["id"])
+    assert _code(r) == (403, "approver_must_differ")
+    assert r.json()["error"]["details"] == {"rule": "resolver", "employee_ids": []}
+    assert await db.fetchval(
+        "SELECT current_attempt FROM payroll.payouts WHERE id = $1", p["id"]
+    ) == 1  # fmt: skip
+    [denied] = await db.fetch(
+        "SELECT actor_id, entity_type, entity_id, details::text AS d FROM payroll.audit_events "
+        "WHERE event = 'payout.retry_denied'"
+    )
+    assert (denied["actor_id"], denied["entity_type"], str(denied["entity_id"])) == (
+        APPROVER, "payout", p["id"],
+    )  # fmt: skip
+    assert json.loads(denied["d"]) == {
+        "rule": "resolver", "employee_count": 0, "pay_run_id": run["id"],
+    }  # fmt: skip
+    assert (await api.retry(run["id"], p["id"], headers=api.approver2())).status_code == 200
+
+
+async def test_redrive_refused_after_key_window_expired(api: Api, db: Any) -> None:
+    """PAY-410, PAY-502, C73: a redrive keeps requested_at, so the worker would GET the same key
+    again, 404 and report key_window_expired again. Resolve refuses redrive for such an attempt
+    (422 validation_error at body.action, nothing changed, no outbox row); mark_rejected after
+    the C48 wait is allowed."""
+    run = await api.approved_run(1)
+    p = (await api.payouts(run["id"]))[0]
+    expired = {"attempt": 1, "outcome": "poison", "reason": "key_window_expired"}
+    assert (await api.result(p["id"], expired)).json()["outcome"] == "needs_operator"
+    before = await _attempt(db, p["id"])
+    assert before["failure_reason"] == "key_window_expired"
+    clock = FakeClock(start=before["needs_operator_at"])
+    api.rt.clock = clock
+    await api.mark_outbox_sent(db)
+    r = await api.resolve(run["id"], p["id"], "redrive", NOTE)
+    assert _code(r) == (422, "validation_error")
+    assert r.json()["error"]["details"] == [
+        {"field": "body.action", "issue": "redrive_not_allowed"}
+    ]
+    assert await _attempt(db, p["id"]) == before
+    assert await db.fetchval("SELECT count(*) FROM payroll.outbox WHERE sent_at IS NULL") == 0
+    clock.advance(120)
+    r = await api.resolve(run["id"], p["id"], "mark_rejected", NOTE)
+    assert r.status_code == 200, r.text
+    assert (r.json()["status"], r.json()["attempts"][0]["failure_reason"]) == (
+        "failed", "operator_rejected",
+    )  # fmt: skip

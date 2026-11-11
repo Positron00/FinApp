@@ -204,7 +204,7 @@ describe("RetryButton (through PayoutsTab)", () => {
   // PAY-500, PAY-401: the retry approver_must_differ message renders in role="alert".
   it("shows the retry dual-approval message", async () => {
     const msg =
-      "Dual approval is on: you can't retry this payout because you last changed this employee's bank details. Ask another approver.";
+      "Dual approval is on: someone else must retry. You marked this payment rejected, or changed this employee's bank details and a second person hasn't released them yet.";
     stubApi((c) =>
       c.method === "POST"
         ? apiError(403, "approver_must_differ", msg)

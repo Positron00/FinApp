@@ -1,16 +1,19 @@
 """Password reset request and confirm (identity LLD §6.6; PAY-105, PAY-107, R17, R19, C31).
 
-The request always answers 202 after one user lookup, whether or not the email matched. The
+The request always answers 202 after one user lookup, whether or not the email matched, and
+pads its database work to ``REQUEST_FLOOR_S`` so a match isn't slower than a miss (C74). The
 relay issues the token at send time, so the request stores no token. Confirm checks the token
 before the password policy, then marks the reset used, replaces the credential and bumps
-``roles_version`` in one transaction, so the BFF's re-check ends any session it missed.
+``roles_version`` in one transaction, so the BFF's re-check ends any session it missed; it then
+clears the account's login lockout (C74).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Final
 from uuid import UUID
 
 from pycommon.db import transaction
@@ -27,9 +30,14 @@ from identity.domain.tokens import digest_of
 from identity.limits import UNKNOWN_IP
 from identity.runtime import IdentityRuntime
 
-__all__ = ["ConfirmCommand", "RequestCommand", "confirm_reset", "request_reset"]
+__all__ = ["REQUEST_FLOOR_S", "ConfirmCommand", "RequestCommand", "confirm_reset", "request_reset"]
 
 _log = get_logger("identity.resets")
+
+# The least time a reset request's lookup and writes take (C74). An active match runs a write
+# transaction (about 3 ms more than a miss on the dev box); padding every request past the
+# lookup to this floor puts both in one timing class, well clear of the match's own cost.
+REQUEST_FLOOR_S: Final = 0.05
 
 
 @dataclass(frozen=True)
@@ -54,7 +62,9 @@ async def request_reset(rt: IdentityRuntime, cmd: RequestCommand) -> None:
     retry = await rt.limits.check_reset(ih or UNKNOWN_IP, rt.email_key(cmd.email))
     if retry is not None:
         raise RateLimited(retry_after_s=retry)
+    loop = asyncio.get_running_loop()
     with tracer("identity").start_as_current_span("identity.reset.request") as span:
+        started = loop.time()
         async with rt.sessions() as session:
             found = await UserRepo(session).find_by_email(cid, cmd.email)
         reset_id: UUID | None = None
@@ -85,6 +95,8 @@ async def request_reset(rt: IdentityRuntime, cmd: RequestCommand) -> None:
                     )
         if reset_id is not None and found is not None:
             span.set_attribute("identity.user_id", str(found.id))
+        # Same latency for a match and a miss (C74): sleep out the rest of the floor.
+        await asyncio.sleep(max(0.0, REQUEST_FLOOR_S - (loop.time() - started)))
     fields: dict[str, Any] = {"matched": reset_id is not None, "ip_hash": ih}
     if reset_id is not None and found is not None:
         fields["user_id"] = str(found.id)
@@ -136,12 +148,12 @@ async def confirm_reset(rt: IdentityRuntime, cmd: ConfirmCommand) -> ResetConfir
         async with transaction(rt.sessions) as session:
             users = UserRepo(session)
             # Users before resets (§6.5): a concurrent deactivation is serialised here.
-            await users.lock(cid, found.user_id)
+            user = await users.lock(cid, found.user_id)
             if await ResetRepo(session).mark_used(cid, found.reset_id) is None:
                 # A concurrent confirm won, a deactivation revoked it, or it expired meanwhile.
                 raise _invalid("not_pending")
             roles_version = await users.bump_roles_version_if_active(cid, found.user_id)
-            if roles_version is None:  # pragma: no cover  (deactivation revokes the reset)
+            if user is None or roles_version is None:  # pragma: no cover  (deactivation revokes)
                 raise _invalid("user_not_active")  # rolls the transaction back
             await CredentialRepo(session).set_password(
                 user_id=found.user_id, cid=cid, password_hash=password_hash
@@ -154,6 +166,8 @@ async def confirm_reset(rt: IdentityRuntime, cmd: ConfirmCommand) -> ResetConfir
                 ip_hash=ih,
                 details={"reset_id": str(found.reset_id)},
             )
+    # After the commit, so a rolled-back confirm never unlocks the account (C74, §6.4).
+    await rt.limits.clear_lockout(rt.email_key(user.email))
     log_event(
         _log,
         logging.INFO,

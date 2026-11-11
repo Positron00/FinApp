@@ -104,8 +104,8 @@ export const CATALOG: Record<string, readonly [number, Msg]> = {
     403,
     (v) =>
       v.route?.endsWith("/retry")
-        ? "Dual approval is on: you can't retry this payout because you last changed this employee's bank details. Ask another approver."
-        : "Dual approval is on: you can't approve this run because you calculated it, or you changed bank details for an employee in it. Ask another approver.",
+        ? "Dual approval is on: someone else must retry. You marked this payment rejected, or changed this employee's bank details and a second person hasn't released them yet."
+        : "Dual approval is on: someone else must approve. You created, calculated or entered hours for this run, or changed bank details that a second person hasn't released yet.",
   ],
   payout_not_retryable: [
     409,
@@ -131,7 +131,11 @@ export const CATALOG: Record<string, readonly [number, Msg]> = {
   request_failed: [0, "The request couldn't be completed."],
 };
 
-/** Codes whose `details.employee_ids` is forwarded (C15). */
+/**
+ * Codes whose `details.employee_ids` is forwarded (C15). `approver_must_differ` isn't one: its
+ * `details.rule` (calculator, creator, hours_editor, bank_editor, resolver) is payroll-internal
+ * and is dropped here; the one message per route covers every rule (C73).
+ */
 const EMPLOYEE_ID_CODES = new Set([
   "not_hourly",
   "employee_not_in_run",

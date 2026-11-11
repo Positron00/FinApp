@@ -14,6 +14,8 @@ import type { PayRun } from "@/lib/schemas/responses";
  * click, kept in the mutation's variables; disabled while pending; never retried. On a network
  * error the run is refetched: `processing` or `paid` means the first request landed. The confirm
  * is a `Dialog` (PAY-NFR-14, web LLD §6.3): focus moves in, Escape closes, focus returns to Approve.
+ * The dual-approval hint covers the rules the UI can see (creator, calculator); payroll also
+ * refuses an hours editor or an unvetted bank editor (C73), so the button stays enabled.
  */
 export function ApproveButton({
   run,
@@ -60,9 +62,10 @@ export function ApproveButton({
 
   return (
     <div className="flex flex-col gap-2">
-      {run.require_dual_approval && run.calculated_by === meId ? (
+      {run.require_dual_approval && (run.calculated_by === meId || run.created_by === meId) ? (
         <p className="text-sm text-muted">
-          You calculated this run. With dual approval on, another approver must approve it.
+          You created or calculated this run. With dual approval on, another approver must approve
+          it.
         </p>
       ) : null}
       <button

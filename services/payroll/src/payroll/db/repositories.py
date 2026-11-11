@@ -24,13 +24,16 @@ from payroll.db.models import (
     Payout,
     PayoutAttempt,
     PayRun,
+    PayRunHours,
     Payslip,
 )
 from payroll.domain import InvalidCursor, NotFound
+from payroll.domain.dual_approval import BankEdit, HoursEdit
 
 __all__ = [
     "AttemptRepo",
     "AuditRepo",
+    "DualApprovalRepo",
     "EmployeeRepo",
     "PayRunRepo",
     "PayoutRepo",
@@ -157,6 +160,62 @@ class EmployeeRepo:
             .execution_options(populate_existing=True)
         )
         return {e.id: e for e in (await session.scalars(stmt)).all()}
+
+
+class DualApprovalRepo:
+    """The facts dual approval needs beyond the run row (design §3.4; PAY-401, PAY-500, C73)."""
+
+    @staticmethod
+    async def bank_edits(
+        session: AsyncSession, company_id: UUID, employee_ids: Sequence[UUID], actor_id: str
+    ) -> list[BankEdit]:
+        """One query: the employees among ``employee_ids`` whose last bank editor is
+        ``actor_id``, each with ``vetted_at``, the latest ``requested_at`` of an attempt of
+        theirs in a dual-approval run requested by someone other than that editor (the last
+        time a second person released a snapshot of these bank details). Call it with the
+        employee rows already locked, so the edit can't change underneath."""
+        vetted = (
+            select(func.max(PayoutAttempt.requested_at))
+            .select_from(Payout)
+            .join(PayoutAttempt, PayoutAttempt.payout_id == Payout.id)
+            .join(PayRun, PayRun.id == Payout.pay_run_id)
+            .where(
+                Payout.company_id == Employee.company_id,
+                Payout.employee_id == Employee.id,
+                PayRun.require_dual_approval.is_(True),
+                PayoutAttempt.requested_by != Employee.bank_updated_by,
+            )
+            .correlate(Employee)
+            .scalar_subquery()
+        )
+        stmt = (
+            select(
+                Employee.id,
+                Employee.bank_updated_by,
+                Employee.bank_updated_at,
+                vetted.label("vetted_at"),
+            )
+            .where(
+                Employee.company_id == company_id,
+                Employee.id.in_(list(employee_ids)),
+                Employee.bank_updated_by == actor_id,
+            )
+            .order_by(Employee.id)
+        )
+        return [
+            BankEdit(r.id, r.bank_updated_by, r.bank_updated_at, r.vetted_at)
+            for r in (await session.execute(stmt)).all()
+        ]
+
+    @staticmethod
+    async def hours_edits(session: AsyncSession, company_id: UUID, run_id: UUID) -> list[HoursEdit]:
+        """Who last entered each hours row of the run (``pay_run_hours.entered_by``)."""
+        stmt = (
+            select(PayRunHours.employee_id, PayRunHours.entered_by)
+            .where(PayRunHours.company_id == company_id, PayRunHours.pay_run_id == run_id)
+            .order_by(PayRunHours.employee_id)
+        )
+        return [HoursEdit(r.employee_id, r.entered_by) for r in (await session.execute(stmt)).all()]
 
 
 class PayRunRepo:

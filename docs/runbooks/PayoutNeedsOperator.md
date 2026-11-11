@@ -49,6 +49,8 @@ The payout is blocked: the employee is not paid, and the run cannot finish. The 
    ```
 
    The API key is a secret: never paste it into tickets. Write down the transfer's status and reference, or "not found".
+
+   **"Not found" is not proof after `key_window_expired` (C73).** Once the attempt is older than `BANK_KEY_SAFE_WINDOW_S` (24 h), the bank may have dropped its idempotency record, so a key lookup can say "not found" for a transfer that settled. For these attempts, reconcile against the **bank statement** (amount, account last 4, date) and record the statement reference in the resolve note.
 4. **Related alerts:** PayoutDLQ (poison messages are dead-lettered too).
 
 ## Likely causes
@@ -66,7 +68,9 @@ Resolve each attempt in the web app (run page → payout → **Resolve**, approv
 3. **The bank shows no transfer, and the cause is fixed** (for example the poison came from a bug now fixed): choose **Send again**.
 4. **The bank shows no transfer and the attempt must not be sent:** choose **Mark rejected** (`mark_rejected`). Payroll refuses it with 409 `resolve_too_early` until `PAYOUT_MARK_REJECTED_MIN_WAIT_S` (120 s) after the attempt entered `needs_operator` (C48). The payout becomes `failed` and the approver can retry it later.
 
-Mark rejected without the bank check risks a double payment: if the bank later settles the attempt, PayoutLateSettlement pages.
+Mark rejected without the bank check risks a double payment: if the bank later settles the attempt, PayoutLateSettlement pages. After `key_window_expired` nothing asks the bank about the old key again, so a missed settled transfer would **not** page: only the statement check above protects against it. For the same reason, **Send again** cannot help an expired-key attempt (the worker may only look it up, and the lookup keeps saying "not found"); payroll refuses it, and the only resolution is **Mark rejected** after the statement check.
+
+With dual approval on, the person who marks an attempt rejected cannot also retry that payout (C73): a second approver checks the statement reference in the note before retrying.
 
 ## Confirm recovery
 

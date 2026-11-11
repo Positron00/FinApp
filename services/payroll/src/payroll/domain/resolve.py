@@ -1,4 +1,5 @@
-"""Operator resolution of a ``needs_operator`` attempt (design §3.5a; PAY-502, R8, C13, C48)."""
+"""Operator resolution of a ``needs_operator`` attempt (design §3.5a; PAY-502, R8, C13, C48,
+C73)."""
 
 from __future__ import annotations
 
@@ -7,19 +8,22 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Final
 
-from payroll.domain import PayoutNotBlocked, ResolveTooEarly
+from payroll.domain import InvalidFields, PayoutNotBlocked, ResolveTooEarly
 from payroll.domain.state import AttemptStatus, PayoutStatus
 
 __all__ = [
+    "KEY_WINDOW_EXPIRED",
     "OPERATOR_REJECTED",
     "ResolveAction",
     "ResolveTransition",
     "check_mark_rejected_wait",
     "check_resolve",
+    "check_resolve_action",
     "resolve_transition",
 ]
 
 OPERATOR_REJECTED: Final = "operator_rejected"
+KEY_WINDOW_EXPIRED: Final = "key_window_expired"
 _SECOND: Final = timedelta(seconds=1)
 
 
@@ -35,6 +39,16 @@ def check_resolve(*, payout_status: PayoutStatus, attempt_status: AttemptStatus 
         or attempt_status is not AttemptStatus.NEEDS_OPERATOR
     ):
         raise PayoutNotBlocked(str(attempt_status) if attempt_status is not None else None)
+
+
+def check_resolve_action(*, action: ResolveAction, failure_reason: str | None) -> None:
+    """C73: ``redrive`` is refused for a ``key_window_expired`` attempt (422 ``validation_error``,
+    ``body.action`` / ``redrive_not_allowed``). A redrive keeps ``requested_at`` (it dates the
+    bank key), so the worker would take the GET-only path again (PAY-410), get the same 404 and
+    report the same poison: the attempt would only come back to ``needs_operator``. The operator
+    reconciles with the bank statement and uses ``mark_rejected``."""
+    if action is ResolveAction.REDRIVE and failure_reason == KEY_WINDOW_EXPIRED:
+        raise InvalidFields([("body.action", "redrive_not_allowed")])
 
 
 def check_mark_rejected_wait(

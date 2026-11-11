@@ -15,3 +15,5 @@ Scope of the rule when on:
 
 Decision: option 2 (a company setting `require_dual_approval`, default on), chosen by the user on 2026-11-10.
 Consequences: `pay_runs.calculated_by` is recorded. e2e signs in as two users. The k6 approve scenario uses the second user.
+
+Amendment 2026-11-11 (C73, H3 security review): the "since the run was created" window let one person prepare and release a payment alone (edit a bank account or add an employee before the run exists, or enter the hours, then approve someone else's calculation). With the setting on, the approver now also differs from the run's creator and from anyone who entered hours on it, and a bank-detail change blocks its editor until a payout for that employee has been released under dual approval by someone else. Retry uses the same window, and the operator who marks an attempt rejected cannot retry that payout. Option 2 itself is unchanged.

@@ -14,6 +14,24 @@ import type { Payout } from "@/lib/schemas/responses";
 export const NOTE_MAX = 500;
 type Action = ResolveBody["action"];
 
+/** The worker's poison reason when the bank key's safe window passed (C73). */
+export const KEY_WINDOW_EXPIRED = "key_window_expired";
+
+/** Payroll refused a redrive because the attempt's bank key expired (422, C73). */
+function isRedriveRefused(err: unknown): boolean {
+  return (
+    err instanceof ApiError &&
+    err.code === "validation_error" &&
+    Array.isArray(err.details) &&
+    (err.details as { field?: unknown; issue?: unknown }[]).some(
+      (d) => d.field === "body.action" && d.issue === "redrive_not_allowed",
+    )
+  );
+}
+
+export const REDRIVE_REFUSED_MESSAGE =
+  "Send again isn't possible for this payment: its bank key has expired. Check the bank statement, then mark it rejected.";
+
 /**
  * The resolve dialog (web LLD §6.3; PAY-502, R8, C48): for a Blocked payout (current attempt
  * `needs_operator`), approver only. The bank-check warning comes first and gets the focus; the
@@ -23,6 +41,11 @@ type Action = ResolveBody["action"];
  * 409 `payout_not_blocked` shows its message and refetches the payouts. 409 `resolve_too_early`
  * keeps the dialog open with a countdown from `Retry-After`, during which "Mark rejected" is
  * disabled; "Send again" has no wait. Focus returns to the Resolve button on close.
+ *
+ * C73: when the current attempt's `failure_reason` is `key_window_expired`, "Send again" is
+ * disabled (payroll refuses it) and the warning asks for the bank statement instead of a key
+ * lookup, since the bank may have forgotten the key. A stale dialog that still sends a redrive
+ * gets 422 `redrive_not_allowed`: it shows a readable alert and disables "Send again" from then.
  */
 export function ResolveDialog({
   payout,
@@ -39,7 +62,9 @@ export function ResolveDialog({
   const [action, setAction] = useState<Action | null>(null);
   const [note, setNote] = useState("");
   const [wait, setWait] = useState(0);
+  const [redriveRefused, setRedriveRefused] = useState(false);
   const current = payout.attempts.find((a) => a.attempt === payout.current_attempt);
+  const keyExpired = current?.failure_reason === KEY_WINDOW_EXPIRED || redriveRefused;
 
   useEffect(() => {
     if (wait <= 0) return;
@@ -64,6 +89,10 @@ export function ResolveDialog({
         setWait(err.retryAfter ?? 0);
         if (action === "mark_rejected") setAction(null);
       }
+      if (isRedriveRefused(err)) {
+        setRedriveRefused(true);
+        setAction((a) => (a === "redrive" ? null : a));
+      }
       if (err.code === "payout_not_blocked") {
         void qc.invalidateQueries({ queryKey: ["pay-run", payout.pay_run_id, "payouts"] });
       }
@@ -72,10 +101,12 @@ export function ResolveDialog({
 
   const err = resolve.error;
   const fields = apiFieldErrors(err);
+  const refusedNow = isRedriveRefused(err);
   const tooEarly = err instanceof ApiError && err.code === "resolve_too_early";
   const trimmed = note.trim();
   const canSubmit =
     action !== null &&
+    !(action === "redrive" && keyExpired) &&
     trimmed.length >= 1 &&
     note.length <= NOTE_MAX &&
     !resolve.isPending &&
@@ -85,9 +116,11 @@ export function ResolveDialog({
       ? wait > 0
         ? `This payout was blocked moments ago. Wait ${wait} seconds, check the bank again, then mark it rejected.`
         : "You can now check the bank again and mark it rejected."
-      : err instanceof ApiError && err.code === "validation_error"
-        ? null
-        : errorText(err)
+      : refusedNow
+        ? REDRIVE_REFUSED_MESSAGE
+        : err instanceof ApiError && err.code === "validation_error"
+          ? null
+          : errorText(err)
     : null;
 
   return (
@@ -96,11 +129,21 @@ export function ResolveDialog({
         <h3 id={`${id}-warn`} ref={warningRef} tabIndex={-1} className="font-semibold">
           Check the bank first
         </h3>
-        <p>
-          Look up this transfer with the bank (runbook <code>PayoutNeedsOperator.md</code>:{" "}
-          <code>GET /v1/transfers/{"{key}"}</code>) before you choose. Don&apos;t mark it rejected
-          if the bank shows it settled.
-        </p>
+        {keyExpired ? (
+          <p>
+            This payment&apos;s bank key has expired, so a lookup by key can say &quot;not
+            found&quot; even if the money moved. Check the bank statement (amount, account, date;
+            runbook <code>PayoutNeedsOperator.md</code>) before you mark it rejected, and put the
+            statement reference in the note. Don&apos;t mark it rejected if the statement shows it
+            paid.
+          </p>
+        ) : (
+          <p>
+            Look up this transfer with the bank (runbook <code>PayoutNeedsOperator.md</code>:{" "}
+            <code>GET /v1/transfers/{"{key}"}</code>) before you choose. Don&apos;t mark it rejected
+            if the bank shows it settled.
+          </p>
+        )}
       </section>
       <dl className="mt-3 grid grid-cols-2 gap-x-4">
         <dt className="text-muted">Employee</dt>
@@ -122,8 +165,8 @@ export function ResolveDialog({
       >
         <fieldset
           className="flex flex-col gap-2"
-          aria-invalid={fields.action ? true : undefined}
-          aria-describedby={fields.action ? `${id}-action-err` : undefined}
+          aria-invalid={fields.action && !refusedNow ? true : undefined}
+          aria-describedby={fields.action && !refusedNow ? `${id}-action-err` : undefined}
         >
           <legend className="font-semibold">What should happen?</legend>
           <label className="flex gap-2">
@@ -132,14 +175,16 @@ export function ResolveDialog({
               name="action"
               value="redrive"
               checked={action === "redrive"}
+              disabled={keyExpired}
               onChange={() => setAction("redrive")}
               aria-describedby={`${id}-redrive`}
             />
             <span>
               Send again (redrive)
               <span id={`${id}-redrive`} className="block text-sm text-muted">
-                Use when the bank has no record of the transfer, or it is pending, and the cause is
-                fixed. The same attempt is sent again.
+                {keyExpired
+                  ? "Not available: the bank key for this payment has expired, so sending it again can't reach the bank."
+                  : "Use when the bank has no record of the transfer, or it is pending, and the cause is fixed. The same attempt is sent again."}
               </span>
             </span>
           </label>
@@ -162,7 +207,7 @@ export function ResolveDialog({
               </span>
             </span>
           </label>
-          {fields.action ? (
+          {fields.action && !refusedNow ? (
             <span id={`${id}-action-err`} className="text-danger">
               Choose what should happen.
             </span>

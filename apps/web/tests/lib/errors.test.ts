@@ -89,11 +89,11 @@ describe("mapUpstreamError", () => {
   // PAY-401, PAY-500: route-specific approver_must_differ and employee_bank_details_missing.
   it("uses route-specific messages", () => {
     expect(messageFor("approver_must_differ", { route: "/api/pay-runs/[id]/approve" })).toMatch(
-      /approve this run/,
+      /must approve\. You created, calculated or entered hours/,
     );
     expect(
       messageFor("approver_must_differ", { route: "/api/pay-runs/[id]/payouts/[payoutId]/retry" }),
-    ).toMatch(/retry this payout/);
+    ).toMatch(/must retry\. You marked this payment rejected/);
     expect(
       messageFor("employee_bank_details_missing", { route: "/api/pay-runs/[id]/approve" }),
     ).toMatch(/then approve/);
@@ -206,6 +206,36 @@ describe("mapUpstreamError", () => {
       "Some employees in this run have no bank details. Add their bank details, then approve.",
     );
     expect(map(403, "approver_must_differ", retryRoute)).toMatchObject({ status: 403 });
+  });
+
+  // C73: payroll's internal `details.rule` (and `employee_ids`) never reach the browser, for
+  // every rule; the message names all of them in plain words.
+  it.each(["calculator", "creator", "hours_editor", "bank_editor", "resolver"])(
+    "drops approver_must_differ details (rule %s)",
+    (rule) => {
+      const approveRoute = "/api/pay-runs/[id]/approve";
+      const retryRoute = "/api/pay-runs/[id]/payouts/[payoutId]/retry";
+      const details = { rule, employee_ids: ["00000000-0000-4000-8000-000000000001"] };
+      const a = errorBody(map(403, "approver_must_differ", approveRoute, details), "r");
+      expect(a.error).not.toHaveProperty("details");
+      expect(JSON.stringify(a)).not.toContain(rule);
+      expect(a.error.message).toBe(
+        "Dual approval is on: someone else must approve. You created, calculated or entered hours for this run, or changed bank details that a second person hasn't released yet.",
+      );
+      const r = errorBody(map(403, "approver_must_differ", retryRoute, details), "r");
+      expect(r.error).not.toHaveProperty("details");
+      expect(r.error.message).toBe(
+        "Dual approval is on: someone else must retry. You marked this payment rejected, or changed this employee's bank details and a second person hasn't released them yet.",
+      );
+    },
+  );
+
+  // C73: resolve's 422 `redrive_not_allowed` keeps its `[{field, issue}]` details for the dialog.
+  it("forwards the redrive_not_allowed validation detail", () => {
+    const e = map(422, "validation_error", "/api/pay-runs/[id]/payouts/[payoutId]/resolve", [
+      { field: "body.action", issue: "redrive_not_allowed" },
+    ]);
+    expect(e.details).toEqual([{ field: "body.action", issue: "redrive_not_allowed" }]);
   });
 
   // PAY-602: a body that isn't an error envelope.

@@ -8,9 +8,14 @@ current attempt is ``needs_operator``.
   ``last_published_at = now``, ``needs_operator_at`` cleared; ``requested_at`` is kept (it dates
   the bank key); a new outbox row with a fresh ``event_id`` and ``republish_seq = 0``. No wait:
   the bank key is the same, so a redrive can't pay twice.
+  Refused for a ``key_window_expired`` attempt (422 ``validation_error``, C73): the worker would
+  only GET the same key, get the same 404 and report the same poison.
 - **mark_rejected:** only ``PAYOUT_MARK_REJECTED_MIN_WAIT_S`` after ``needs_operator_at`` (else
   409 ``resolve_too_early`` with ``Retry-After``); attempt → ``rejected`` / ``operator_rejected``,
   payout → ``failed``, so the normal retry opens.
+
+Either way the attempt records ``resolved_by`` (the operator's ``sub``). With dual approval on,
+that operator can't retry a payout they marked rejected (C73, ``check_retry_dual``).
 
 Either way the run status is recomputed, and ``payout.operator_resolved`` is audited with the
 note's **length** only (PAY-NFR-07). "now" is ``Runtime.clock`` (the re-publish task's clock too),
@@ -34,11 +39,12 @@ from payroll.api.schemas import PayoutOut, ResolveIn
 from payroll.db.models import Payout, PayoutAttempt
 from payroll.db.repositories import AttemptRepo, AuditRepo, PayoutRepo, PayRunRepo, rowcount
 from payroll.db.session import session_scope
-from payroll.domain import PayoutNotBlocked, ResolveTooEarly
+from payroll.domain import InvalidFields, PayoutNotBlocked, ResolveTooEarly
 from payroll.domain.resolve import (
     ResolveAction,
     check_mark_rejected_wait,
     check_resolve,
+    check_resolve_action,
     resolve_transition,
 )
 from payroll.domain.state import AttemptStatus, PayoutStatus
@@ -72,7 +78,7 @@ async def resolve(
                 done = await _resolve_in_tx(
                     rt, session, principal, run_id, payout_id, action=action, body=body
                 )
-        except (PayoutNotBlocked, ResolveTooEarly) as exc:
+        except (PayoutNotBlocked, ResolveTooEarly, InvalidFields) as exc:
             log_event(
                 _log, logging.INFO, "payout.resolve_rejected", payout_id=str(payout_id),
                 code=exc.code, attempt_status=getattr(exc, "attempt_status", "needs_operator"),
@@ -117,6 +123,7 @@ async def _resolve_in_tx(
     check_resolve(payout_status=PayoutStatus(payout.status), attempt_status=current)
     if attempt is None or attempt.needs_operator_at is None:  # pragma: no cover  (CHECK)
         raise PayoutNotBlocked(str(current) if current is not None else None)
+    check_resolve_action(action=action, failure_reason=attempt.failure_reason)
     t = resolve_transition(action)
     event_id: UUID | None = None
     blocked = (PayoutAttempt.id == attempt.id) & (PayoutAttempt.status == "needs_operator")
@@ -134,6 +141,7 @@ async def _resolve_in_tx(
                 failure_reason=t.failure_reason,
                 final_at=func.now(),
                 needs_operator_at=None,
+                resolved_by=principal.sub,
             )
             .execution_options(synchronize_session=False)
         )
@@ -155,6 +163,7 @@ async def _resolve_in_tx(
                 publish_count=t.publish_count,
                 last_published_at=now,
                 needs_operator_at=None,
+                resolved_by=principal.sub,
             )
             .execution_options(synchronize_session=False)
         )

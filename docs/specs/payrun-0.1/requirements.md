@@ -226,7 +226,7 @@ The run snapshots `tax_bps`, `retirement_bps` and `require_dual_approval`, sets 
   - Audit `payrun.approved`.
 - Check: unit, integration `test_approve_concurrency.py`.
 
-**PAY-401 Dual approval (must).** When the run's `require_dual_approval` snapshot is true, the approver must differ from `calculated_by`, and from `bank_updated_by` of every employee in the run whose bank details changed after the run's `created_at`. When the company setting is turned off, runs already calculated keep their snapshot.
+**PAY-401 Dual approval (must).** When the run's `require_dual_approval` snapshot is true, the approver must differ from `calculated_by`, from the run's creator, from anyone who entered or edited hours on the run, and from `bank_updated_by` of every employee in the run whose bank details haven't been *vetted* since they changed. A change is vetted once a payout for that employee is released under dual approval by someone other than the editor; an employee never paid that way has every change unvetted (C73). When the company setting is turned off, runs already calculated keep their snapshot.
 - Acceptance: 403 `approver_must_differ`.
 - Check: unit, integration, e2e (two users).
 
@@ -337,7 +337,7 @@ It writes a new outbox row with a fresh `event_id`, increments `publish_count` a
 - it requires the payout to be `failed` (current attempt `rejected`);
 - it requires `current_attempt` < `PAYOUT_MAX_ATTEMPTS` (5, including the first);
 - it requires the employee to be active with bank details;
-- under dual approval, it requires the retrier ≠ the employee's `bank_updated_by`;
+- under dual approval, it requires the retrier ≠ the employee's `bank_updated_by` while that change is unvetted (PAY-401), and ≠ the operator who marked the payout's last attempt rejected (C73);
 - it creates attempt n+1 with a new bank snapshot, sets the payout to `requested`, writes the outbox row, and recomputes the run status (back to `processing`).
 - Acceptance:
   - 409 `payout_not_retryable` (including indeterminate and needs_operator attempts).

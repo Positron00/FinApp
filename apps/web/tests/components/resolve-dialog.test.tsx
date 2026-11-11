@@ -20,7 +20,13 @@ const blocked = payout({
 });
 
 /** The dialog opened from a trigger button, as on the Payouts tab. */
-function Harness({ onResolved }: { onResolved: (m: string) => void }) {
+function Harness({
+  onResolved,
+  target = blocked,
+}: {
+  onResolved: (m: string) => void;
+  target?: typeof blocked;
+}) {
   const [open, setOpen] = useState(false);
   return (
     <>
@@ -29,7 +35,7 @@ function Harness({ onResolved }: { onResolved: (m: string) => void }) {
       </button>
       {open ? (
         <ResolveDialog
-          payout={blocked as never}
+          payout={target as never}
           onClose={() => setOpen(false)}
           onResolved={(m) => {
             setOpen(false);
@@ -41,9 +47,9 @@ function Harness({ onResolved }: { onResolved: (m: string) => void }) {
   );
 }
 
-async function open() {
+async function open(target = blocked) {
   const onResolved = vi.fn();
-  const r = renderWithClient(<Harness onResolved={onResolved} />);
+  const r = renderWithClient(<Harness onResolved={onResolved} target={target} />);
   await userEvent.click(screen.getByRole("button", { name: "Resolve" }));
   return { ...r, onResolved };
 }
@@ -203,6 +209,97 @@ describe("ResolveDialog", () => {
     expect(screen.getByLabelText(/Note for the audit log/).getAttribute("aria-invalid")).toBe(
       "true",
     );
+  });
+
+  // C73: an expired bank key → "Send again" disabled with the reason; the warning asks for the
+  // bank statement (runbook) instead of a key lookup; "Mark rejected" still works.
+  it("disables Send again for a key_window_expired attempt", async () => {
+    const calls = stubApi((c) => (c.method === "POST" ? { body: blocked } : undefined));
+    const expired = payout({
+      status: "requested",
+      attempts: [
+        attempt({
+          status: "needs_operator",
+          failure_reason: "key_window_expired",
+          final_at: null,
+          bank_reference: null,
+        }),
+      ],
+    });
+    const { onResolved } = await open(expired as typeof blocked);
+    const dialog = screen.getByRole("alertdialog", { name: "Resolve blocked payout" });
+    const redrive = screen.getByRole("radio", { name: /Send again/ }) as HTMLInputElement;
+    expect(redrive.disabled).toBe(true);
+    expect(redrive.getAttribute("aria-describedby")).toBeTruthy();
+    expect(document.getElementById(redrive.getAttribute("aria-describedby")!)!.textContent).toMatch(
+      /^Not available: the bank key for this payment has expired/,
+    );
+    expect(dialog.textContent).toMatch(/Check the bank statement/);
+    expect(dialog.textContent).toContain("PayoutNeedsOperator.md");
+    expect(dialog.textContent).not.toContain("GET /v1/transfers/{key}");
+    // focus still starts on the warning
+    expect(document.activeElement).toBe(
+      screen.getByRole("heading", { name: "Check the bank first" }),
+    );
+    await userEvent.click(redrive);
+    expect(redrive.checked).toBe(false);
+    await userEvent.click(screen.getByRole("radio", { name: /Mark rejected/ }));
+    await userEvent.type(screen.getByLabelText(/Note for the audit log/), "statement ref ST-9");
+    await userEvent.click(submit());
+    await waitFor(() => expect(onResolved).toHaveBeenCalledWith("Payout marked rejected"));
+    expect(calls[0]).toMatchObject({ body: { action: "mark_rejected" } });
+  });
+
+  // C73: other blocked reasons keep Send again and the key-lookup advice.
+  it("keeps Send again for other needs_operator reasons", async () => {
+    stubApi(() => undefined);
+    const poison = payout({
+      status: "requested",
+      attempts: [
+        attempt({ status: "needs_operator", failure_reason: "schema_invalid", final_at: null }),
+      ],
+    });
+    await open(poison as typeof blocked);
+    expect((screen.getByRole("radio", { name: /Send again/ }) as HTMLInputElement).disabled).toBe(
+      false,
+    );
+    expect(screen.getByRole("alertdialog").textContent).toContain("GET /v1/transfers/{key}");
+  });
+
+  // C73: a stale dialog (the attempt's key expired after it loaded) → 422 redrive_not_allowed
+  // shows a readable alert, not the generic field error, and Send again is disabled from then.
+  it("maps 422 redrive_not_allowed to a readable message", async () => {
+    stubApi((c) =>
+      c.method === "POST"
+        ? {
+            status: 422,
+            body: {
+              error: {
+                code: "validation_error",
+                message: "Some fields need attention.",
+                request_id: "req-422",
+                details: [{ field: "body.action", issue: "redrive_not_allowed" }],
+              },
+            },
+          }
+        : undefined,
+    );
+    const { onResolved } = await open();
+    await userEvent.click(screen.getByRole("radio", { name: /Send again/ }));
+    await userEvent.type(screen.getByLabelText(/Note for the audit log/), "bank: not found");
+    await userEvent.click(submit());
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain(
+      "Send again isn't possible for this payment: its bank key has expired. Check the bank statement, then mark it rejected.",
+    );
+    expect(alert.textContent).toContain("Reference: req-422");
+    expect(screen.queryByText("Choose what should happen.")).toBeNull();
+    const redrive = screen.getByRole("radio", { name: /Send again/ }) as HTMLInputElement;
+    expect(redrive.disabled).toBe(true);
+    expect(redrive.checked).toBe(false);
+    expect(submit().disabled).toBe(true); // no choice left
+    expect(screen.getByRole("alertdialog").textContent).toMatch(/Check the bank statement/);
+    expect(onResolved).not.toHaveBeenCalled();
   });
 
   // PAY-NFR-14: Escape closes and focus returns to the trigger.

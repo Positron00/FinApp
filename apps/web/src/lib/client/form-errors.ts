@@ -16,6 +16,7 @@ const ISSUE_MESSAGES: Record<string, string> = {
   required_on_reactivation: "Enter new bank details to reactivate this employee.",
   bank_details_incomplete: "Enter both the routing and the account number.",
   duplicate_role: "Each role can be chosen once.",
+  redrive_not_allowed: "Send again isn't possible: the bank key for this payment has expired.",
   too_small: "This is too short or too small.",
   too_big: "This is too long or too large.",
 };

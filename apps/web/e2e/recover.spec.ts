@@ -32,12 +32,14 @@ import { alertWith, rowWith, runBadge, statusWith } from "./helpers/ui";
  *   a fresh run are made `needs_operator` with a worker token; both show "Blocked" and no Retry;
  *   A is resolved with "Send again" (and a second resolve is 409 `payout_not_blocked`); B's
  *   "Mark rejected" is first refused with the `resolve_too_early` countdown, then accepted once
- *   `PAYOUT_MARK_REJECTED_MIN_WAIT_S` (120 s, production timing) has passed; B is retried and
- *   the run ends `paid`.
- * PAY-401, PAY-500, PAY-501, PAY-502.
+ *   `PAYOUT_MARK_REJECTED_MIN_WAIT_S` (120 s, production timing) has passed. With dual approval
+ *   on, the approver who marked B rejected can't retry it (C73, rule `resolver`: the retry
+ *   message); the owner, who also holds approver and didn't resolve B, retries it and the run
+ *   ends `paid`.
+ * PAY-401, PAY-500, PAY-501, PAY-502, C73.
  */
 const RETRY_DUAL =
-  "Dual approval is on: you can't retry this payout because you last changed this employee's bank details. Ask another approver.";
+  "Dual approval is on: someone else must retry. You marked this payment rejected, or changed this employee's bank details and a second person hasn't released them yet.";
 
 const payoutsPanel = (p: Page) => p.getByRole("tabpanel", { name: "Payouts" });
 
@@ -240,11 +242,30 @@ test.describe("@journeys J5 recover", () => {
       await expect(
         row.getByRole("cell", { name: "Failed Rejected by an operator", exact: true }),
       ).toBeVisible();
+    });
+
+    await test.step("B: the approver who marked it rejected can't retry it (C73, PAY-500)", async () => {
+      const row = rowWith(payoutsPanel(asApprover), b.employee_name);
+      const refused = asApprover.waitForResponse(
+        (r) => r.url().endsWith(`/payouts/${b.id}/retry`) && r.request().method() === "POST",
+      );
       await row.getByRole("button", { name: `Retry payout to ${b.employee_name}` }).click();
+      expect((await refused).status()).toBe(403);
+      await expect(alertWith(row, RETRY_DUAL)).toBeVisible();
+    });
+
+    await test.step("B: the owner (also an approver) retries it (PAY-500, C73)", async () => {
+      await asOwner.goto(`/pay-runs/${run.id}`);
+      const row = rowWith(payoutsPanel(asOwner), b.employee_name);
+      const retried = asOwner.waitForResponse(
+        (r) => r.url().endsWith(`/payouts/${b.id}/retry`) && r.request().method() === "POST",
+      );
+      await row.getByRole("button", { name: `Retry payout to ${b.employee_name}` }).click();
+      expect((await retried).status()).toBe(200);
     });
 
     await test.step("the run ends paid; A kept attempt 1, B settled on attempt 2 (PAY-500, 502)", async () => {
-      await expect(runBadge(asApprover, "Paid")).toBeVisible({ timeout: 120_000 });
+      await expect(runBadge(asOwner, "Paid")).toBeVisible({ timeout: 120_000 });
       const final = await getRun(asApprover, run.id);
       expect(final.status).toBe("paid");
       const after = await payouts(asApprover, run.id);

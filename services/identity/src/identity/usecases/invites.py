@@ -249,6 +249,9 @@ async def accept_invite(rt: IdentityRuntime, cmd: AcceptCommand) -> SessionUser:
                 ip_hash=ih,
                 details={"invite_id": str(found.invite_id)},
             )
+    # Failed logins against the pending account may have locked its email; only the invitee
+    # holds the token, so accepting clears it (C74, §6.4). After the commit, best effort.
+    await rt.limits.clear_lockout(rt.email_key(user.email))
     log_event(
         _log,
         logging.INFO,

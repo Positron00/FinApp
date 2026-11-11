@@ -141,6 +141,27 @@ describe("POST /api/pay-runs/[id]/payouts/[payoutId]/resolve", () => {
     expect(t.logs.text()).not.toContain("XYZ-77");
   });
 
+  // C73: payroll's 422 for a redrive of a key_window_expired attempt keeps its detail, so the
+  // dialog can show the readable message.
+  it("forwards 422 redrive_not_allowed with its detail", async () => {
+    const cookie = await signIn({ roles: ["approver"] });
+    server.use(
+      http.post(UPSTREAM, () =>
+        HttpResponse.json(
+          errorBody("validation_error", [{ field: "body.action", issue: "redrive_not_allowed" }]),
+          { status: 422 },
+        ),
+      ),
+    );
+    const res = await call(cookie, { action: "redrive", note: NOTE });
+    expect(res.status).toBe(422);
+    expect(await errorOf(res)).toMatchObject({
+      code: "validation_error",
+      message: "Some fields need attention.",
+      details: [{ field: "body.action", issue: "redrive_not_allowed" }],
+    });
+  });
+
   // PAY-502: the other route-specific codes.
   it.each([
     ["payout_not_blocked", 409, "This payout isn't blocked any more. Refresh the page."],

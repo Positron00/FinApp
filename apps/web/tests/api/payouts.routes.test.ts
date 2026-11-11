@@ -210,7 +210,7 @@ describe("POST /api/pay-runs/[id]/payouts/[payoutId]/retry", () => {
     [
       "approver_must_differ",
       403,
-      "Dual approval is on: you can't retry this payout because you last changed this employee's bank details. Ask another approver.",
+      "Dual approval is on: someone else must retry. You marked this payment rejected, or changed this employee's bank details and a second person hasn't released them yet.",
     ],
     ["payout_not_found", 404, "That payout wasn't found."],
     ["pay_run_not_found", 404, "That pay run wasn't found."],

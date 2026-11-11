@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import statistics
+import time
 from datetime import timedelta
 from typing import Any
 
@@ -15,6 +18,8 @@ from tests.integration.conftest import CLIENT_IP, Harness, HarnessFactory, token
 
 PW = passphrase()
 NEW_PW = passphrase()
+RAISED = {"auth_login_limit_account": 1000, "auth_login_limit_ip": 1000}
+_log = logging.getLogger(__name__)
 
 
 async def send_and_get_token(h: Harness) -> str:
@@ -273,3 +278,25 @@ async def test_deactivation_revokes_a_pending_reset(harness: HarnessFactory, adm
         for r in await admin_db.fetch("SELECT status FROM identity.email_outbox ORDER BY id")
     ]
     assert outbox == ["sent", "cancelled"]
+
+
+async def test_reset_request_timing(harness: HarnessFactory, admin_db: Any) -> None:
+    """PAY-105, C74 (test_reset_request_timing): with raised limits, the median latency of 30
+    reset requests for unknown emails and 30 for an active user differs by <= 20%, the same
+    timing class as login (PAY-104, C45), so the 202 doesn't reveal whether an account exists."""
+    async with harness(**RAISED) as h:
+        await h.create_user("ann@example.com", password=PW)
+        for email in ("ann@example.com", "warm@example.com"):  # warm the pool and caches
+            assert (await h.reset_request(email)).status_code == 202
+        unknown: list[float] = []
+        active: list[float] = []
+        for i in range(30):
+            for email, sink in (("ann@example.com", active), (f"x{i}@example.com", unknown)):
+                t0 = time.perf_counter()
+                r = await h.reset_request(email)
+                sink.append(time.perf_counter() - t0)
+                assert r.status_code == 202
+    m_unknown, m_active = statistics.median(unknown), statistics.median(active)
+    _log.info("reset request medians (s): unknown %.4f, active %.4f", m_unknown, m_active)
+    assert abs(m_unknown - m_active) / max(m_unknown, m_active) <= 0.20, (m_unknown, m_active)
+    assert await admin_db.fetchval("SELECT count(*) FROM identity.password_resets") == 31

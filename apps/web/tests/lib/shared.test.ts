@@ -71,6 +71,7 @@ describe("payoutBadge (§6.3)", () => {
   it("labels failure reasons", () => {
     expect(failureReasonLabel("insufficient_funds_at_bank")).toBe("Insufficient funds at the bank");
     expect(failureReasonLabel("operator_rejected")).toBe("Rejected by an operator");
+    expect(failureReasonLabel("key_window_expired")).toBe("Bank key expired"); // C73
     expect(failureReasonLabel("weird_code")).toBe("weird_code");
     expect(failureReasonLabel(null)).toBeUndefined();
   });

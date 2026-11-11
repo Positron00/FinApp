@@ -45,9 +45,9 @@ All paths are under `services/payroll/`. The package is `payroll`.
 | `src/payroll/domain/periods.py` | new | Period derivation, `period_index`, the overlap test and the hours bounds (§3.1). |
 | `src/payroll/domain/calc.py` | new | Gross, tax, retirement, net and totals in integer arithmetic (§3.2). |
 | `src/payroll/domain/state.py` | new | Status enums, `run_status_from_payouts` (PAY-406), the mutability and approvability guards, `decide_result`, `is_late_settlement` and `instruction_allowed` (§3.3). |
-| `src/payroll/domain/dual_approval.py` | new | `check_approve_dual` and `check_retry_dual` (PAY-401, PAY-500) (§3.4). |
+| `src/payroll/domain/dual_approval.py` | new | `check_approve_dual` and `check_retry_dual` (PAY-401, PAY-500, C73) (§3.4). `db/repositories.py` `DualApprovalRepo` reads hours editors and unvetted bank edits; `services/dual_denied.py` audits a denial after the rollback (C73). |
 | `src/payroll/domain/retry.py` | new | `check_retry`, `republish_backoff_s` and `republish_decision` (PAY-500, PAY-407) (§3.5). |
-| `src/payroll/domain/resolve.py` | new | `ResolveAction`, `check_resolve` and `resolve_transition` (PAY-502) (§3.5a). |
+| `src/payroll/domain/resolve.py` | new | `ResolveAction`, `check_resolve`, `check_resolve_action` (C73) and `resolve_transition` (PAY-502) (§3.5a). |
 | `src/payroll/domain/validation.py` | new | `aba_checksum_ok`, `is_monday` and the IANA timezone check. |
 | `src/payroll/domain/employees.py` | new (F2) | The PATCH rules that need the stored row (§4.3): `merge_pay_basis` (merged pay basis, the other type's amount cleared) and `check_bank_completeness` (all-or-none bank columns, `required_on_reactivation`). Raise `InvalidFields`. |
 | `src/payroll/db/models.py` | new | SQLAlchemy 2.0 declarative models for the 10 tables in §2 (`__table_args__ = {"schema": "payroll"}`). |
@@ -297,6 +297,7 @@ CREATE TABLE payroll.payout_attempts (
   requested_at      timestamptz NOT NULL,
   last_published_at timestamptz NOT NULL,
   needs_operator_at timestamptz NULL,       -- set when the attempt enters needs_operator, cleared by redrive (C48)
+  resolved_by       text        NULL,       -- the operator (sub) who last resolved this attempt (C73; migration 0003)
   CONSTRAINT ck_attempt_needs_operator_at CHECK ((status = 'needs_operator') = (needs_operator_at IS NOT NULL)),
   publish_count     integer     NOT NULL DEFAULT 1 CHECK (publish_count >= 1),
   final_at          timestamptz NULL,
@@ -318,6 +319,7 @@ CREATE INDEX ix_attempts_nonfinal ON payroll.payout_attempts (requested_at)
 - `account_last4` is a display copy, so the attempt history can show which account each attempt paid (J5) **[decision]**.
 - `bank_reference` is at most 64 characters, the same bound as the worker and bank-stub (C26).
 - **Meaning of `publish_count`:** how many times this attempt has been published since it was created or last redriven, counting that publication. So the number of re-publishes so far is `publish_count − 1` (§3.5). An operator redrive (PAY-502) sets it back to 1 (C13).
+- `resolved_by` is set by both resolve actions. With dual approval on, the operator who marked an attempt rejected can't retry the payout (C73, §3.4).
 - `failure_reason` holds the bank's reason for `rejected`, `operator_rejected` for an operator's mark_rejected (PAY-502), and the cause for `needs_operator` (`republish_limit`, `envelope_invalid`, or the worker's poison reason such as `schema_invalid`, `amount_mismatch`, `key_window_expired`). A redrive clears it.
 
 ### 2.8 `audit_events`
@@ -358,8 +360,12 @@ Audit events and the shape of `details`:
 | `payout.needs_operator` | `{attempt, reason}` (`poison`, `republish_limit`, `envelope_invalid` or the worker's reason) | PAY-407, PAY-409, PAY-NFR-03 |
 | `payout.late_settlement` | `{attempt, current_attempt, attempt_status, failure_reason?, bank_reference, later_attempt_settled, later_settled_attempt?}`; actor `service:payout-worker`; once per payout and attempt (§4.7 "Late settlement") | PAY-NFR-02 |
 | `payout.operator_resolved` | `{attempt, action, note_len}` (`action` is `redrive` or `mark_rejected`; the note's length, never its text) | PAY-502 |
+| `payrun.approve_denied` | `{rule, employee_count}`; actor = the refused approver; entity the run. Written in its own transaction after the 403 rolled the approve back (C73) | PAY-401 |
+| `payout.retry_denied` | `{rule, employee_count, pay_run_id}`; actor = the refused retrier; entity the payout. Written in its own transaction after the 403 rolled the retry back (C73) | PAY-500 |
 
 No money amounts, names, emails or bank numbers other than `account_last4` appear in `details` (plan §6).
+
+**Append-only (C73, as C50 for identity):** `payroll_app` has `SELECT` and `INSERT` on `audit_events` but no `UPDATE`, `DELETE` or `TRUNCATE` (migration `0003`; `20-payroll.sql` re-revokes after its blanket grant, so a bootstrap re-run can't restore them). No payroll code updates or deletes audit rows, and no maintenance task purges them (§5.4 purges only `outbox`, `idempotency_keys` and bank details). There is no audit retention purge in 0.1.0; one would need a definer-rights function like identity's `purge_audit_log`.
 
 ### 2.9 `outbox`
 
@@ -425,6 +431,7 @@ CREATE INDEX ix_idempotency_expires ON payroll.idempotency_keys (expires_at);
   - The migration seeds `tax_rate_bps` = 0 and `retirement_bps` = 0 and the name from `PAYROLL_SEED_COMPANY_NAME` (R22). `scripts/seed.py` then sets tax 2000 bps and retirement 500 bps through `PUT /v1/company/settings` (PAY-609).
   - In dev and CI `COMPANY_ID` is `0193a000-0000-7000-8000-000000000001` (C28).
   - The migration is idempotent: re-running it keeps the existing row.
+- **`0003_c73_four_eyes`** (C73): adds `payout_attempts.resolved_by text NULL`, and runs `REVOKE UPDATE, DELETE, TRUNCATE ON payroll.audit_events FROM payroll_app`. The role name is fixed, as in `migrations/env.py`. Its downgrade re-grants `UPDATE, DELETE` and drops the column.
 - Migrations run as `payroll_migrator` in the `migrate-payroll` one-shot or Job, before the service starts. That container sets the same pycommon keys as the service with migrator credentials: `DB_USER=payroll_migrator`, `DB_PASSWORD=${PAYROLL_DB_MIGRATOR_PASSWORD}`, `DB_SCHEMA=payroll` (C1). After `upgrade`, `run_alembic_env` revokes write access on `payroll.alembic_version` from `payroll_app`. `/readyz` checks that `alembic_version` (in schema `payroll`) is at head.
 
 ### 2.12 Run and payout state at a glance
@@ -618,7 +625,7 @@ unpaid.
 a `rejected` attempt (usually `operator_rejected`) and NOT_CURRENT on an earlier, non-settled
 attempt. The response stays as the table says; the caller records the event (§4.7).
 
-### 3.4 `domain/dual_approval.py` (PAY-401, PAY-500, ADR 0005)
+### 3.4 `domain/dual_approval.py` (PAY-401, PAY-500, PAY-502, ADR 0005, C73)
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -626,31 +633,47 @@ class BankEdit:
     employee_id: UUID
     bank_updated_by: str | None
     bank_updated_at: datetime | None
+    vetted_at: datetime | None = None    # last four-eyes snapshot of these details (below)
 
-class DualApprovalRule(StrEnum):
-    CALCULATOR = "calculator"
-    BANK_EDITOR = "bank_editor"
+    def unvetted_by(self, actor_id: str) -> bool:
+        return (self.bank_updated_by == actor_id and self.bank_updated_at is not None
+                and (self.vetted_at is None or self.bank_updated_at > self.vetted_at))
+
+@dataclass(frozen=True, slots=True)
+class HoursEdit:
+    employee_id: UUID
+    entered_by: str
+
+class DualApprovalRule(StrEnum):         # details.rule; internal (details is free-form in the OpenAPI)
+    CALCULATOR = "calculator"; CREATOR = "creator"; HOURS_EDITOR = "hours_editor"
+    BANK_EDITOR = "bank_editor"; RESOLVER = "resolver"
 
 def check_approve_dual(*, require_dual_approval: bool, approver_id: str, calculated_by: str,
-                       run_created_at: datetime, bank_edits: Iterable[BankEdit]) -> None:
+                       created_by: str, hours_edits: Iterable[HoursEdit],
+                       bank_edits: Iterable[BankEdit]) -> None:
     if not require_dual_approval:
         return
-    if approver_id == calculated_by:
-        raise ApproverMustDiffer(rule=DualApprovalRule.CALCULATOR, employee_ids=[])
-    hits = sorted(e.employee_id for e in bank_edits
-                  if e.bank_updated_by == approver_id
-                  and e.bank_updated_at is not None and e.bank_updated_at > run_created_at)
-    if hits:
-        raise ApproverMustDiffer(rule=DualApprovalRule.BANK_EDITOR, employee_ids=hits)
+    if approver_id == calculated_by: raise ApproverMustDiffer(CALCULATOR, [])
+    if approver_id == created_by:    raise ApproverMustDiffer(CREATOR, [])
+    hours = [h.employee_id for h in hours_edits if h.entered_by == approver_id]
+    if hours: raise ApproverMustDiffer(HOURS_EDITOR, hours)
+    banks = [e.employee_id for e in bank_edits if e.unvetted_by(approver_id)]
+    if banks: raise ApproverMustDiffer(BANK_EDITOR, banks)
 
-def check_retry_dual(*, require_dual_approval: bool, retrier_id: str, bank_updated_by: str | None,
-                     employee_id: UUID) -> None:
-    if require_dual_approval and bank_updated_by == retrier_id:
-        raise ApproverMustDiffer(rule=DualApprovalRule.BANK_EDITOR, employee_ids=[employee_id])
+def check_retry_dual(*, require_dual_approval: bool, retrier_id: str, bank_edit: BankEdit,
+                     resolved_by: str | None) -> None:
+    if not require_dual_approval:
+        return
+    if bank_edit.unvetted_by(retrier_id): raise ApproverMustDiffer(BANK_EDITOR, [bank_edit.employee_id])
+    if resolved_by is not None and resolved_by == retrier_id: raise ApproverMustDiffer(RESOLVER, [])
 ```
 
-- `require_dual_approval` for approve is the run's snapshot (`pay_runs.require_dual_approval`, taken at calculate).
-- For retry it is also the run's snapshot (R34).
+- `require_dual_approval` for approve and for retry is the run's snapshot (`pay_runs.require_dual_approval`, taken at calculate; R34).
+- **The approve rule (C73; supersedes "since the run was created" in PAY-401 and ADR 0005).** The approver must not be (a) the run's calculator, (b) its creator, (c) the last editor (`pay_run_hours.entered_by`) of **any** hours row of the run (stricter than "the last hours editor of the run": every row records its own last editor), nor (d) the last bank-detail editor of any employee in the run whose bank details changed after they were last **vetted**. Checked in that order; the first hit wins and lists the employees for (c) and (d).
+- **Vetted.** `vetted_at` is the latest `payout_attempts.requested_at` (the moment the bank snapshot was taken) of an attempt for that employee in a run with `require_dual_approval = true` **and** `requested_by <> employees.bank_updated_by`, i.e. the last time a second person released these exact details. An employee never paid that way has every edit unvetted, however old (the Monday-edit / Tuesday-run bypass, ghost employees). A payout released by the editor alone (dual approval off, or before C73) never vets.
+- **Query.** `DualApprovalRepo.bank_edits(cid, employee_ids, actor)` is one statement over the run's employees whose `bank_updated_by = actor`, each with a correlated `max(requested_at)` over `payouts ⋈ payout_attempts ⋈ pay_runs` (indexes `ix_payouts_employee`, `uq_payout_attempts_payout_attempt`). It runs after the employees are locked `FOR SHARE`, so the edit can't change underneath. `DualApprovalRepo.hours_edits(cid, run_id)` reads `pay_run_hours`.
+- **The retry rule (C73).** The same bank-editor window applies (an edit a second person already released doesn't block its editor; an edit after the payout's own snapshot does). Then the operator who marked the current attempt rejected (`payout_attempts.resolved_by` when `failure_reason = 'operator_rejected'`) can't retry it: the resolve that opens the retry and the retry that pays again need two people (PAY-502).
+- Errors: 403 `approver_must_differ` with `{rule, employee_ids}`; no new code. A denial is logged (`dual_approval.denied`) and audited (`payrun.approve_denied` / `payout.retry_denied`, §2.8).
 
 ### 3.5 `domain/retry.py` (PAY-500, PAY-407)
 
@@ -693,7 +716,7 @@ def republish_decision(*, status: AttemptStatus, is_current: bool, publish_count
   - `republish_seq` is `publish_count` **before** the increment (R34): the first publication carries 0 and the first re-publish 1.
   - The attempt becomes `needs_operator` when the 12th publication would be due, that is after 10 re-publishes. That is 360 + 720 + 9 × 900 = 9180 s (about 2.55 h, plus up to one maintenance interval per step) after the first publication at the defaults.
 
-### 3.5a `domain/resolve.py` (PAY-502, R8, C13)
+### 3.5a `domain/resolve.py` (PAY-502, R8, C13, C73)
 
 ```python
 class ResolveAction(StrEnum):
@@ -704,6 +727,9 @@ OPERATOR_REJECTED: Final = "operator_rejected"
 def check_resolve(*, payout_status: PayoutStatus, attempt_status: AttemptStatus | None) -> None:
     if payout_status is not PayoutStatus.REQUESTED or attempt_status is not AttemptStatus.NEEDS_OPERATOR:
         raise PayoutNotBlocked(attempt_status=attempt_status)    # None for a no_transfer payout
+
+def check_resolve_action(*, action: ResolveAction, failure_reason: str | None) -> None:
+    # C73: redrive of a key_window_expired attempt → InvalidFields([("body.action", "redrive_not_allowed")])
 
 def check_mark_rejected_wait(*, needs_operator_at: datetime, now: datetime, min_wait_s: int) -> None:
     # ResolveTooEarly(retry_after_s = the whole seconds left, rounded up, at least 1) while
@@ -723,8 +749,10 @@ def resolve_transition(action: ResolveAction) -> ResolveTransition: ...
 
 - **redrive:** attempt → `requested`, `failure_reason = NULL`, `publish_count = 1`, `last_published_at = now()` (C13); `requested_at` is **not** changed, because it dates the bank key for the key safe window (PAY-410). A new outbox row with a fresh `event_id` and `republish_seq = 0`. The payout stays `requested`. The same bank key `<payout_id>:<attempt>` is used, so a redrive can't pay twice.
 - **mark_rejected:** allowed only when `now − needs_operator_at ≥ PAYOUT_MARK_REJECTED_MIN_WAIT_S` (120 s, C48), checked by `check_mark_rejected_wait` under the attempt row lock; earlier gives `ResolveTooEarly` → 409 `resolve_too_early` with `Retry-After` (and `details.retry_after_s`). "now" is `Runtime.clock` **[decision, F4a]** (see §5.3). Then attempt → `rejected`, `failure_reason = "operator_rejected"`, `final_at = now()`; payout → `failed`, `final_at = now()`. The normal retry (PAY-500) is then open, subject to `check_retry`.
+- **No redrive after `key_window_expired` (C73).** The worker takes the GET-only path when `now − requested_at > BANK_KEY_SAFE_WINDOW_S` (PAY-410; `payout_worker/handler.py`, reading `requested_at` from the instruction, §4.6). A redrive keeps `requested_at`, so the worker GETs the same key, gets the same 404 and reports `poison` / `key_window_expired` again: the attempt is back in `needs_operator` after every redrive. `check_resolve_action` refuses it with 422 `validation_error` (`details: [{field: "body.action", issue: "redrive_not_allowed"}]`; no new code). The only way out is `mark_rejected`, after reconciling with the bank statement (runbook), then a retry with a new key.
+- Both actions set `resolved_by = sub` on the attempt (C73).
 - Either action is followed by `run_status_from_payouts` (PAY-406).
-- `check_resolve` runs after the locks are taken (§4.10). Any other state → `PayoutNotBlocked` (409 `payout_not_blocked`).
+- `check_resolve` runs after the locks are taken (§4.10), then `check_resolve_action`. Any other state → `PayoutNotBlocked` (409 `payout_not_blocked`).
 
 ### 3.6 `crypto.py` (PAY-204, ADR 0004)
 
@@ -939,7 +967,7 @@ Rules (settled in F2):
 | `GET /v1/pay-runs/{run_id}/payslips/{payslip_id}` | any | — | 200 `PayslipOut` | 404 `pay_run_not_found`, 404 `payslip_not_found` |
 | `GET /v1/pay-runs/{run_id}/payouts?status=&cursor=&limit=` | any | query: `status: PayoutStatus \| None`, `cursor: str \| None`, `limit: Limit = 50` | 200 `Page[PayoutOut]`, ordered by the payslip's `employee_name`, then `id` (C8) | 404 `pay_run_not_found`, 422 |
 | `POST /v1/pay-runs/{run_id}/payouts/{payout_id}/retry` | approver | optional header `Idempotency-Key` **[decision]**, no body (so no 400) | 200 `PayoutOut` (with the attempt history; a replay carries `Idempotent-Replayed: true`) | 404 `pay_run_not_found`, 404 `payout_not_found`, 409 `payout_not_retryable`, 409 `retry_limit_reached`, 409 `employee_bank_details_missing`, 403 `approver_must_differ`, 422 `idempotency_key_reused`, 422 `validation_error` (malformed key) |
-| `POST /v1/pay-runs/{run_id}/payouts/{payout_id}/resolve` | approver | `ResolveIn`; no `Idempotency-Key` (a repeat finds the attempt no longer blocked) | 200 `PayoutOut` | 400 `bad_request` (body not JSON), 404 `pay_run_not_found`, 404 `payout_not_found`, 409 `payout_not_blocked`, 409 `resolve_too_early` (with `Retry-After`, documented on the 409 response in `openapi.json`; mark_rejected within `PAYOUT_MARK_REJECTED_MIN_WAIT_S`, C48), 422 `validation_error` (unknown action, missing or too long note) |
+| `POST /v1/pay-runs/{run_id}/payouts/{payout_id}/resolve` | approver | `ResolveIn`; no `Idempotency-Key` (a repeat finds the attempt no longer blocked) | 200 `PayoutOut` | 400 `bad_request` (body not JSON), 404 `pay_run_not_found`, 404 `payout_not_found`, 409 `payout_not_blocked`, 409 `resolve_too_early` (with `Retry-After`, documented on the 409 response in `openapi.json`; mark_rejected within `PAYOUT_MARK_REJECTED_MIN_WAIT_S`, C48), 422 `validation_error` (unknown action, missing or too long note; `body.action` / `redrive_not_allowed` for a redrive of a `key_window_expired` attempt, C73) |
 
 ```python
 class PayRunCreate(BaseModel):
@@ -1077,7 +1105,7 @@ class ResolveIn(BaseModel):              # PAY-502, R8
 - **Approve (PAY-400, PAY-401).** Wrapped by the idempotency handling (§4.8).
   1. Lock the run (`FOR UPDATE`). `assert_run_approvable` → 409 `pay_run_not_approvable`.
   2. Read the run's employees with `SELECT … FROM employees WHERE id = ANY(:ids) AND company_id=:cid ORDER BY id FOR SHARE`.
-  3. Call `check_approve_dual` with the run's `require_dual_approval` snapshot → 403.
+  3. With the run's `require_dual_approval` snapshot on, read `DualApprovalRepo.hours_edits` and `DualApprovalRepo.bank_edits` (§3.4) and call `check_approve_dual` → 403. After the rollback, `payrun.approve_denied` is written in its own transaction (C73); if that write fails, `audit.write_failed` is logged and the 403 stands.
   4. Every employee with a payslip net > 0 must have bank details, else 409 `employee_bank_details_missing` with `employee_ids` (PAY-400, C40, R34). This covers employees purged (§5.4.1) or reactivated without details.
   5. For each payslip, ordered by id:
      - **net = 0:** insert a payout with `paid`, `no_transfer = true`, `current_attempt = 0` and `final_at = now()`.
@@ -1092,7 +1120,7 @@ class ResolveIn(BaseModel):              # PAY-502, R8
   8. Commit, then wake the relay.
 - **Retry (PAY-500).** `run_id` and `payout_id` must match (`payout.pay_run_id = run_id`), else 404 `payout_not_found`.
   1. Lock the run, then the payout (`FOR UPDATE`), then the current attempt (`FOR UPDATE`), then the employee (`FOR SHARE`).
-  2. Run `check_retry`, then `check_retry_dual`.
+  2. Run `check_retry`, then (snapshot on) `check_retry_dual` with `DualApprovalRepo.bank_edits` for the employee and the current attempt's `resolved_by` when it was `operator_rejected` (C73). A denial writes `payout.retry_denied` after the rollback, as approve does.
   3. Decrypt the employee's current bank details. Insert attempt `n+1` (`requested`, new snapshot, `publish_count = 1`, `requested_at = last_published_at = now`).
   4. Set the payout to `status = requested`, `current_attempt = n+1` and `final_at = NULL`.
   5. Write the outbox row (`republish_seq = 0`).
@@ -1101,10 +1129,10 @@ class ResolveIn(BaseModel):              # PAY-502, R8
   8. Commit, then log `payout.retry_requested` and wake the relay (logs and metrics go out after commit, so a rolled-back retry logs nothing).
 - **Resolve (PAY-502, R8).** `run_id` and `payout_id` must match, else 404 `payout_not_found`.
   1. Lock the run (`FOR UPDATE`), then the payout (`FOR UPDATE`), then the current attempt (`FOR UPDATE`), the same order as retry and result (§4.10).
-  2. `check_resolve(payout_status, attempt_status)` → 409 `payout_not_blocked` unless the current attempt is `needs_operator`.
+  2. `check_resolve(payout_status, attempt_status)` → 409 `payout_not_blocked` unless the current attempt is `needs_operator`; then `check_resolve_action(action, failure_reason)` → 422 `validation_error` for a redrive of a `key_window_expired` attempt (C73).
   3. Apply `resolve_transition(action)` (§3.5a) with conditional updates:
-     - **redrive:** `UPDATE payout_attempts SET status='requested', failure_reason=NULL, publish_count=1, last_published_at=:now, needs_operator_at=NULL WHERE id=:aid AND status='needs_operator'`, then `OutboxWriter.add_payout_requested(..., amount_cents = payouts.amount_cents, republish_seq=0)` (fresh `event_id`; C13).
-     - **mark_rejected:** `check_mark_rejected_wait(needs_operator_at, now=clock.now(), min_wait_s)` (→ `ResolveTooEarly`), then `UPDATE payout_attempts SET status='rejected', failure_reason='operator_rejected', final_at=now(), needs_operator_at=NULL WHERE id=:aid AND status='needs_operator'`, then `UPDATE payouts SET status='failed', final_at=now() WHERE id=:pid AND status='requested'`. Increment `payroll_payouts_total{outcome="operator_rejected"}`.
+     - **redrive:** `UPDATE payout_attempts SET status='requested', failure_reason=NULL, publish_count=1, last_published_at=:now, needs_operator_at=NULL, resolved_by=:sub WHERE id=:aid AND status='needs_operator'`, then `OutboxWriter.add_payout_requested(..., amount_cents = payouts.amount_cents, republish_seq=0)` (fresh `event_id`; C13).
+     - **mark_rejected:** `check_mark_rejected_wait(needs_operator_at, now=clock.now(), min_wait_s)` (→ `ResolveTooEarly`), then `UPDATE payout_attempts SET status='rejected', failure_reason='operator_rejected', final_at=now(), needs_operator_at=NULL, resolved_by=:sub WHERE id=:aid AND status='needs_operator'`, then `UPDATE payouts SET status='failed', final_at=now() WHERE id=:pid AND status='requested'`. Increment `payroll_payouts_total{outcome="operator_rejected"}`.
      - A rowcount of 0 raises `ConcurrentUpdate` (500).
   4. Recompute the run status as the result endpoint does (§4.7 step 5): a move into a final status sets `first_final_at` if NULL and observes `payroll_payout_settlement_seconds` once, increments `payroll_pay_runs_total{outcome}`, and logs `payrun.completed`.
   5. Write the `payout.operator_resolved` audit row `{attempt, action, note_len}`. The note's text is never stored, logged or traced (PAY-NFR-07); only its length is.
@@ -1604,7 +1632,8 @@ Payroll calls `pycommon.startup_checks.run_startup_checks(settings, extra=STARTU
 | `payrun.calculated` | info | `pay_run_id`, `payslips`, `tax_bps`, `retirement_bps`, `require_dual_approval`, `duration_ms`, `actor_id` | calculate | PAY-302 |
 | `payrun.approved` | info | `pay_run_id`, `payouts`, `transfers`, `no_transfer`, `status`, `actor_id`, `duration_ms` | approve committed | PAY-400 |
 | `payrun.approve_rejected` | info | `pay_run_id`, `code`, `status` | 409 `pay_run_not_approvable` | PAY-400 |
-| `dual_approval.denied` | warning | `pay_run_id`, `payout_id?`, `action` (`approve` \| `retry`), `rule`, `employee_count`, `actor_id` | 403 `approver_must_differ` | PAY-401, PAY-500 |
+| `dual_approval.denied` | warning | `pay_run_id`, `payout_id?`, `action` (`approve` \| `retry`), `rule` (`calculator`, `creator`, `hours_editor`, `bank_editor`, `resolver`; C73), `employee_count`, `actor_id` | 403 `approver_must_differ` | PAY-401, PAY-500 |
+| `audit.write_failed` | error | `audit_event`, `entity_id`, `error` (class name) | the denial audit row (C73) couldn't be written; the 403 stands | PAY-401, PAY-500 |
 | `payrun.completed` | info | `pay_run_id`, `status` (`paid` \| `partially_failed`), `paid`, `failed`, `first_completion: bool`, `settlement_s` (first only) | the run enters a final status (result, resolve or approve) | PAY-406 |
 | `payrun.deleted` | info | `pay_run_id`, `status_at_delete`, `actor_id` | delete | PAY-304 |
 | `payout.result_recorded` | info | `payout_id`, `pay_run_id`, `attempt`, `outcome`, `applied`, `attempt_status`, `payout_status`, `run_status`, `failure_reason?` | result 200 | PAY-405 |
@@ -1614,7 +1643,7 @@ Payroll calls `pycommon.startup_checks.run_startup_checks(settings, extra=STARTU
 | `payout.retry_rejected` | info | `payout_id`, `code` (`payout_not_retryable`, `retry_limit_reached`, `employee_bank_details_missing`) | retry 409 | PAY-500 |
 | `payout.republished` | info | `payout_id`, `attempt`, `republish_seq`, `event_id`, `attempt_status` | re-publish row written | PAY-407 |
 | `payout.operator_resolved` | warning | `payout_id`, `pay_run_id`, `attempt`, `action` (`redrive` \| `mark_rejected`), `note_len`, `actor_id`, `event_id` (redrive only) | resolve committed | PAY-502, R8 |
-| `payout.resolve_rejected` | info | `payout_id`, `code` (`payout_not_blocked`, `resolve_too_early`), `attempt_status` (`needs_operator` for `resolve_too_early`) | resolve 409 | PAY-502 |
+| `payout.resolve_rejected` | info | `payout_id`, `code` (`payout_not_blocked`, `resolve_too_early`, `validation_error` for a refused redrive, C73), `attempt_status` (`needs_operator` for `resolve_too_early`) | resolve 409 | PAY-502 |
 | `payout.needs_operator` | error | `payout_id`, `pay_run_id`, `attempt`, `reason` (`poison`, `republish_limit`, `envelope_invalid`, or the worker's reason such as `key_window_expired`, `amount_mismatch`) | attempt → `needs_operator` | PAY-407, PAY-409, PAY-410, PAY-NFR-03 |
 | `payout.late_settlement` | error | `payout_id`, `pay_run_id`, `attempt`, `current_attempt`, `attempt_status`, `failure_reason` (when set), `bank_reference`, `later_attempt_settled`, `later_settled_attempt` (when set), `recorded` | a `settled` result for a rejected or superseded attempt (§4.7 "Late settlement") | PAY-NFR-02 |
 | `payout.instruction_served` | debug | `payout_id`, `attempt` | instruction 200 | PAY-411 |
@@ -1755,7 +1784,8 @@ issuer/kid mismatch → 401 `invalid_token` (C30). The route guards then apply:
 | `test_state_transitions.py` | Every row and column of the `decide_result` table (§3.3), including `needs_operator`; the `is_late_settlement` table (PAY-NFR-02); `instruction_allowed` for every status × current/stale; `assert_run_mutable` and `assert_run_approvable` per status | PAY-405, PAY-411, PAY-301, PAY-304, PAY-400 |
 | `test_retry_rules.py` | `check_retry` order and each error (indeterminate, needs_operator, requested, paid → not retryable; `current_attempt` = 5 → limit; inactive or purged → bank missing); `republish_backoff_s` sequence 360, 720, 900, 900 at the defaults (R1); `republish_decision` (not due, due, unsent outbox, non-current, the boundary at 10 re-publishes → NEEDS_OPERATOR; `envelope_invalid` → NEEDS_OPERATOR once due) | PAY-500, PAY-407, PAY-NFR-03 |
 | `test_resolve_rules.py` | `check_resolve`: only a `requested` payout whose current attempt is `needs_operator` passes; every other attempt status (`requested`, `indeterminate`, `settled`, `rejected`) → `PayoutNotBlocked`; `resolve_transition` for both actions (redrive: `requested`, reason cleared, `publish_count = 1`, publish with `republish_seq = 0`; mark_rejected: `rejected`, `operator_rejected`, final, payout `failed`; mark_rejected before the 120 s wait → `ResolveTooEarly`, and redrive has no wait) | PAY-502 |
-| `test_dual_approval.py` | Off → always passes; calculator == approver; a bank editor after `created_at` is blocked and one before it is allowed; several employees list all IDs; retry dual rule | PAY-401, PAY-500 |
+| `test_dual_approval.py` | Off → always passes; the rule values; calculator, creator and hours editor are refused; a never-vetted bank edit blocks however old; an edit after `vetted_at` blocks and one covered by it doesn't; the order calculator → creator → hours editor → bank editor; retry: the bank-editor window, the resolver, bank editor checked first (C73) | PAY-401, PAY-500, PAY-502 |
+| `test_dual_denied.py` | A failed denial audit write logs `audit.write_failed` and doesn't raise (C73) | PAY-401, PAY-500 |
 | `test_payout_model.py` | **Hypothesis `RuleBasedStateMachine`** (§9.4). Owned by payroll only (C44) | PAY-NFR-02, PAY-406, PAY-405, PAY-411, PAY-500, PAY-502 |
 | `test_field_crypto.py` | Round trip; token format `kid:nonce:ct`; a fresh nonce per call; a tampered ciphertext, nonce, kid or AAD (swapping between employees) raises `FieldDecryptError`; an unknown kid raises; decrypt with an old kid after rotation; bad key length refused; the error message holds no plaintext | PAY-204, ADR 0004 |
 | `test_employee_rules.py` (F2) | `merge_pay_basis`: keep or replace the amount, switch type with its amount and clear the other; `rate_required`, `salary_required`, `pay_basis`; `check_bank_completeness`: details on file, `required_on_reactivation` per missing field, `bank_details_incomplete` | PAY-203 |
@@ -1773,8 +1803,9 @@ issuer/kid mismatch → 401 `invalid_token` (C30). The route guards then apply:
 | File | Covers | Requirement |
 |---|---|---|
 | `conftest.py` | Containers, bootstrap SQL, migrate as the migrator, runtime-role sessions, truncate and flush between tests, token factory (web roles, worker, wrong issuer), frozen clock | — |
-| `test_migrations.py` | Upgrade to head, downgrade one step, upgrade again; `0002` seeds `company_settings` for `COMPANY_ID` with the defaults (timezone, anchor 2026-01-05, dual approval true); re-running is a no-op; a missing `COMPANY_ID` fails | PAY-200, PAY-606 |
-| `test_grants.py` | `payroll_app` can't `SELECT` from `identity.users`, `payouts.disbursements` or `bank_stub.transfers` (`permission denied`), can't run DDL in `payroll`, and can read but not write `payroll.alembic_version` | PAY-606 |
+| `test_migrations.py` | Upgrade to head, downgrade one step (`0003` re-grants audit DML and drops `resolved_by`), then to `0001` and base, upgrade again (C73); `0002` seeds `company_settings` for `COMPANY_ID` with the defaults (timezone, anchor 2026-01-05, dual approval true); re-running is a no-op; a missing `COMPANY_ID` fails | PAY-200, PAY-606 |
+| `test_grants.py` | `payroll_app` can't `SELECT` from `identity.users`, `payouts.disbursements` or `bank_stub.transfers` (`permission denied`), can't run DDL in `payroll`, and can read but not write `payroll.alembic_version`; `payroll.audit_events` is append-only (INSERT works; UPDATE, DELETE, TRUNCATE → `permission denied`), also after re-running `20-payroll.sql` (C73) | PAY-606 |
+| `test_dual_approval.py` (C73) | Alice (owner) / Bob (preparer) / Grace (approver): Monday bank edit, Tuesday run → Alice refused (`bank_editor`) and `payrun.approve_denied` audited, Grace approves; ghost employee; an edit after the last four-eyes payout still blocks; an edit released by Grace no longer blocks; a payout Alice released with dual approval off doesn't vet; creator and hours editor refused; Bob edits a bank account and a second admin approves (no denial); retry after a vetted edit allowed, after a new edit refused with `payout.retry_denied` | PAY-401, PAY-500 |
 | `test_settings_api.py` | GET and PUT; out-of-range 422 with `[{field, issue}]` details; `settings.updated` audit with the changed fields; admin-only PUT; changing `biweekly_anchor` with a non-deleted biweekly run → 409 `anchor_locked` and no change, allowed again once that run is deleted, and allowed with only monthly runs; a PUT racing a biweekly create never leaves a run on the old anchor (R33) | PAY-200 |
 | `test_employees_api.py` | Create, list (cursor, status filter, order), get; `employee_email_taken` (case-insensitive); another company → 404; responses never contain the routing or account digits (scanned). PATCH (F2): plain fields audited by name only, no-op PATCH writes no audit row; bank change sets `bank_updated_by` and `bank_updated_at`, re-encrypts with the active kid and audits old/new `account_last4` only; routing-only change; deactivate and reactivate (`deactivated_at` set and cleared, status diff); reactivation after purge needs both bank fields and clears `bank_purged_at`; pay-type switch; email taken on PATCH, 404, roles, empty and null bodies; a bank edit after run creation blocks that approver (PAY-401) | PAY-201, PAY-202, PAY-203, PAY-401, PAY-NFR-08 |
 | `test_schedule_moves.py` (F2) | A PATCH schedule move monthly → biweekly → monthly and biweekly → monthly: overlapping periods refused with only the moved ID, cleared by deactivation (R34); a PATCH racing a monthly and a biweekly create (parallel tasks) never leaves two live payslips with shared days for one employee | PAY-203, PAY-300 |
@@ -1788,7 +1819,7 @@ issuer/kid mismatch → 401 `invalid_token` (C30). The route guards then apply:
 | `test_internal_instruction.py` | 200 shape and decrypted values for a current requested or indeterminate attempt; 409 for stale, final and `needs_operator`; 404 for another `cid`; 401 for a web token, 403 for a worker-issued token with the wrong `sub` (C30); `Cache-Control: no-store` | PAY-411 |
 | `test_internal_result.py` | The response is exactly `{payout_id, attempt, outcome}` with `outcome` = the stored attempt status (R7, C26); each outcome → attempt, payout and run state; already final → 200 with the stored status and no change; stale → 409; `indeterminate` after `settled` → unchanged; `settled` after `indeterminate` → applied; poison → `needs_operator` and re-publishing stops; on a `needs_operator` attempt `settled` and `rejected` apply while `indeterminate` and `poison` return 200 unchanged; a 65-character `bank_reference` → 422; run status equals the function after every call; `processing_since` and `first_final_at` behaviour; the settlement histogram is observed once | PAY-405, PAY-406, PAY-409 |
 | `test_retry.py` | Retry after rejected → attempt 2 with the new bank snapshot, outbox row, run back to `processing`; `payout_not_retryable` (requested, indeterminate, needs_operator, paid); `retry_limit_reached` at attempt 5; `employee_bank_details_missing` (inactive, purged); dual approval vs `bank_updated_by` using the run's snapshot; a late result for attempt 1 after the retry → 409 `attempt_not_current`; retry racing a late result (parallel tasks) → consistent final state; the payout list (paginated, C8) shows `payslip_id`, `amount_cents` and every attempt with `account_last4` only | PAY-500, PAY-501, PAY-NFR-02 |
-| `test_resolve.py` | A `needs_operator` attempt (poison or republish limit): **redrive** → attempt `requested`, `failure_reason` NULL, `publish_count = 1`, `last_published_at` = now, `requested_at` unchanged, a new outbox row with a fresh `event_id` and `republish_seq = 0` (C13), then a `settled` result → payout `paid`; **mark_rejected** → attempt `rejected` / `operator_rejected`, payout `failed`, run final when it was the last open payout (`first_final_at`, histogram once), then a retry → attempt 2 → `paid` (with `needs_operator_at` set more than 120 s back via time-machine); mark_rejected inside the wait → 409 `resolve_too_early` with `Retry-After`; 409 `payout_not_blocked` for `requested`, `indeterminate`, `settled`, `rejected` and `no_transfer` payouts; 404 for a payout of another run or company; 422 for an unknown action or a missing note; audit `payout.operator_resolved` holds `note_len` and never the note; a resolve racing a late result (parallel tasks) → one consistent outcome (lock order §4.10); approver only; **late settlement** after mark_rejected (200 `rejected`, audit `payout.late_settlement`, error log, counter once, a repeat not counted again) and after mark_rejected + retry + attempt 2 settled (409 `attempt_not_current`, audit in its own transaction with `later_attempt_settled`); duplicate or non-settled answers and unknown attempts are not late | PAY-502, PAY-NFR-02 |
+| `test_resolve.py` | A `needs_operator` attempt (poison or republish limit): **redrive** → attempt `requested`, `failure_reason` NULL, `publish_count = 1`, `last_published_at` = now, `requested_at` unchanged, a new outbox row with a fresh `event_id` and `republish_seq = 0` (C13), then a `settled` result → payout `paid`; **mark_rejected** → attempt `rejected` / `operator_rejected`, payout `failed`, run final when it was the last open payout (`first_final_at`, histogram once), then a retry → attempt 2 → `paid` (with `needs_operator_at` set more than 120 s back via time-machine); mark_rejected inside the wait → 409 `resolve_too_early` with `Retry-After`; 409 `payout_not_blocked` for `requested`, `indeterminate`, `settled`, `rejected` and `no_transfer` payouts; 404 for a payout of another run or company; 422 for an unknown action or a missing note; audit `payout.operator_resolved` holds `note_len` and never the note; a resolve racing a late result (parallel tasks) → one consistent outcome (lock order §4.10); approver only; `resolved_by` stored, and the operator who marked rejected can't retry (403 `resolver`, `payout.retry_denied` audited) while a second approver can; redrive of a `key_window_expired` attempt → 422 with nothing changed, then mark_rejected after the wait (C73); **late settlement** after mark_rejected (200 `rejected`, audit `payout.late_settlement`, error log, counter once, a repeat not counted again) and after mark_rejected + retry + attempt 2 settled (409 `attempt_not_current`, audit in its own transaction with `later_attempt_settled`); duplicate or non-settled answers and unknown attempts are not late | PAY-502, PAY-NFR-02 |
 | `test_outbox.py` | The state change and the outbox row commit together, and a forced rollback leaves neither; the relay publishes through `StreamProducer.publish` with exactly the fields `event_id`, `type` and `envelope` (R7, C22), `MAXLEN ~`, marks the row sent and updates `last_published_at`; two relays in parallel never send a row twice (SKIP LOCKED); Redis down → rows stay unsent, `outbox.relay.error`, catch-up after Redis is back; the published envelope validates against the schema; `traceparent` continues the approve trace (in-memory span exporter) | PAY-402, PAY-NFR-09 |
 | `test_republish.py` | Not due → nothing; due (frozen clock) → a new outbox row with a fresh `event_id`, `republish_seq = publish_count` before the increment (R34), the count incremented; backoff 360, 720, 900, 900 (R1); after a redrive the backoff restarts at 360; an unsent outbox row blocks re-publish; after 10 re-publishes → `needs_operator` and the audit row; stream FLUSHALL, then a tick re-publishes every non-final attempt; indeterminate attempts are re-published with the same `(payout_id, attempt)`; a relay-refused envelope no longer blocks: the due attempt → `needs_operator` / `envelope_invalid` and can be redriven, while a sendable unsent row beside it still blocks; `needs_operator_at` comes from the clock read after the locks (C48); two unsent rows of one attempt are relayed in one batch (ordered attempt locks) | PAY-407, PAY-NFR-03, C48 |
 | `test_maintenance.py` | Advisory lock `payroll:maintenance`: two runners → only one ticks; each task logs `maintenance.task.completed` (or `maintenance.task.failed` without stopping the others; C44); sent outbox rows older than 7 days purged and unsent kept; idempotency keys past `expires_at` purged; bank purge after 30 days of deactivation nulls the employee fields and the final attempts' snapshots, **skips** an employee with a non-final attempt, and writes the audit row; a draft run with a purged employee → approve 409 | PAY-608, PAY-407 |
@@ -1866,7 +1897,7 @@ harness that mirrors the services layer. It runs with no I/O.
 | PAY-303 | `api/pay_runs_router.py`, `api/schemas.py` (`PayRunOut.counts`, `*_name`), `api/pagination.py`, `db/repositories.py` | `unit/test_cursor.py`, `integration/test_hours_calculate.py` |
 | PAY-304 | `domain/state.py`, `services/create_run.py` (delete) | `unit/test_state_transitions.py`, `integration/test_hours_calculate.py`, `integration/test_pay_runs.py` |
 | PAY-400 | `services/approve.py`, `api/deps.py` (idempotency), `domain/state.py` | `unit/test_idempotency_hash.py`, `integration/test_approve.py`, `integration/test_approve_concurrency.py`, `integration/test_idempotency.py` |
-| PAY-401 | `domain/dual_approval.py`, `services/approve.py` | `unit/test_dual_approval.py`, `integration/test_approve.py` |
+| PAY-401 | `domain/dual_approval.py`, `db/repositories.py` (`DualApprovalRepo`), `services/approve.py`, `services/dual_denied.py` | `unit/test_dual_approval.py`, `unit/test_dual_denied.py`, `integration/test_approve.py`, `integration/test_dual_approval.py` |
 | PAY-402 | `events/envelope.py`, `events/outbox.py`, `events/relay.py`, `contracts/events/payout.requested.v1.json` | `unit/test_event_envelope.py`, `integration/test_outbox.py`, `contract/test_event_schema.py` |
 | PAY-405 | `domain/state.py` (`decide_result`), `services/record_result.py`, `api/internal_router.py` | `unit/test_state_transitions.py`, `integration/test_internal_result.py`, `integration/test_idempotency.py` |
 | PAY-406 | `domain/state.py` (`run_status_from_payouts`), `services/record_result.py`, `services/retry.py`, `services/resolve.py`, `services/approve.py` | `unit/test_run_status.py`, `unit/test_payout_model.py`, `integration/test_internal_result.py`, `integration/test_resolve.py` |
@@ -1874,7 +1905,7 @@ harness that mirrors the services layer. It runs with no I/O.
 | PAY-409 | `domain/state.py`, `services/record_result.py` | `integration/test_internal_result.py` |
 | PAY-410 | `services/instruction.py` (`requested_at`), `services/record_result.py` (poison reason) | `integration/test_internal_instruction.py`, `integration/test_internal_result.py` |
 | PAY-411 | `api/internal_router.py`, `services/instruction.py`, `api/deps.py` | `unit/test_state_transitions.py`, `unit/test_authz_matrix.py`, `integration/test_internal_instruction.py` |
-| PAY-500 | `domain/retry.py`, `domain/dual_approval.py`, `services/retry.py` | `unit/test_retry_rules.py`, `unit/test_dual_approval.py`, `integration/test_retry.py` |
+| PAY-500 | `domain/retry.py`, `domain/dual_approval.py`, `services/retry.py`, `services/dual_denied.py` | `unit/test_retry_rules.py`, `unit/test_dual_approval.py`, `integration/test_retry.py`, `integration/test_dual_approval.py`, `integration/test_resolve.py` |
 | PAY-501 | `api/pay_runs_router.py` (payouts), `api/schemas.py` (`PayoutOut`) | `integration/test_retry.py` |
 | PAY-502 | `domain/resolve.py`, `services/resolve.py`, `api/pay_runs_router.py` (resolve) | `unit/test_resolve_rules.py`, `unit/test_payout_model.py`, `unit/test_validation.py`, `integration/test_resolve.py` |
 | PAY-600 | `api/deps.py` (pycommon JWT) | `unit/test_authz_matrix.py` |
@@ -1934,6 +1965,14 @@ PAY-403, PAY-404, PAY-408 and PAY-412 are owned by payout-worker and bank-stub. 
   - **OpenAPI:** resolve's 409 documents the `Retry-After` header (§4.4).
   - **Docs:** the §5.3 pseudo-code now matches the code (`:now`, the capped exponent, the payout locks, the refused-row filter). Retry step 8 and resolve step 6 log after commit (§4.4).
   - **Tests:** unit `test_state_transitions.py` (`is_late_settlement`), `test_retry_rules.py` (`envelope_invalid`) and `test_metrics.py` (pre-initialised counter); integration `test_resolve.py` (both late-settlement paths and the not-late cases) and `test_republish.py` (refused envelope, sendable row still blocks, clock read after locks, two rows of one attempt relayed); contract `test_openapi.py` (`Retry-After`).
+
+- 2026-11-11 (security review, C73):
+  - **Dual approval (MEDIUM-1):** the approver must not be the calculator, the run's creator, the last editor of any hours row of the run, or the last bank editor of any employee in the run whose details changed after their last four-eyes snapshot (`vetted_at`), instead of "after the run's `created_at`". Retry uses the same bank-editor window. New internal rule values `creator`, `hours_editor`, `resolver`; the code stays `approver_must_differ` (§3.4, §4.4).
+  - **Resolve (MEDIUM-2, payroll part):** `payout_attempts.resolved_by`; with dual approval on, the operator who marked an attempt rejected can't retry it (`resolver`). Redrive of a `key_window_expired` attempt is refused with 422 `validation_error` (`body.action` / `redrive_not_allowed`), because the kept `requested_at` sends the worker down the GET-only path to the same 404 every time (§2.7, §3.5a, §4.4). The bank-statement confirmation on the resolve request would be a contract change (a required `ResolveIn` field) and isn't added.
+  - **Append-only audit (LOW-1):** migration `0003_c73_four_eyes` revokes `UPDATE, DELETE, TRUNCATE` on `audit_events` from `payroll_app`; `20-payroll.sql` re-revokes after a re-run (§2.8, §2.11).
+  - **Denials audited (LOW-4):** `payrun.approve_denied` and `payout.retry_denied` in their own transaction after the rollback; `audit.write_failed` if that fails (§2.8, §7.1).
+  - **OpenAPI:** no change (`details` is free-form; `AuditEventName` is a pattern, not an enum).
+  - **Tests:** unit `test_dual_approval.py` (rewritten), `test_resolve_rules.py`, `test_dual_denied.py`; integration `test_dual_approval.py` (new), `test_resolve.py`, `test_grants.py`, `test_migrations.py` (§9).
 
 **Open:**
 

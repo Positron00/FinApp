@@ -152,6 +152,18 @@ class AuthLimits:
         except _REDIS_ERRORS as exc:
             self._backend_error(exc)
 
+    async def clear_lockout(self, ek: str) -> None:
+        """After a confirmed password reset or an accepted invite (C74): end the account's lock,
+        drop its level and the current window's level-0 failure count, so the next login starts
+        fresh. Only the mailbox owner holds the token, so this is the owner's way out of a lock
+        someone else caused. Best effort, like ``clear_level``: the password is already set, so
+        a Redis error is logged and counted, and the lock simply runs out (§6.4)."""
+        keys = (self.lock_key(ek), self.level_key(ek), self.account_counter_key(f"{ek}:0"))
+        try:
+            await self._redis.delete(*keys)
+        except _REDIS_ERRORS as exc:
+            self._backend_error(exc)
+
     async def check_accept(self, ip_subject: str) -> int | None:
         """``accept_ip`` (R18); the ``Retry-After`` seconds when denied, else ``None``.
 

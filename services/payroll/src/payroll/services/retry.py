@@ -3,9 +3,11 @@
 One transaction: idempotency row when a key is sent (lock 1) → run ``FOR UPDATE`` (3) → payout
 ``FOR UPDATE`` (4) → current attempt ``FOR UPDATE`` (5) → employee ``FOR SHARE`` (6) → inserts.
 ``check_retry`` (not retryable → limit → bank details), then ``check_retry_dual`` with the run's
-``require_dual_approval`` snapshot (R34). Attempt n+1 gets a fresh bank snapshot under the active
-kid, the payout goes back to ``requested``, an outbox row is written (``republish_seq = 0``) and
-the run status is recomputed (back to ``processing``).
+``require_dual_approval`` snapshot (R34): the retrier is neither the employee's bank editor since
+the details were last vetted, nor the operator who marked the attempt rejected (C73). A denial is
+audited (``payout.retry_denied``) in its own transaction after the rollback. Attempt n+1 gets a
+fresh bank snapshot under the active kid, the payout goes back to ``requested``, an outbox row is
+written (``republish_seq = 0``) and the run status is recomputed (back to ``processing``).
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from payroll.db.models import Payout, PayoutAttempt
 from payroll.db.repositories import (
     AttemptRepo,
     AuditRepo,
+    DualApprovalRepo,
     EmployeeRepo,
     PayoutRepo,
     PayRunRepo,
@@ -41,11 +44,13 @@ from payroll.domain import (
     PayoutNotRetryable,
     RetryLimitReached,
 )
-from payroll.domain.dual_approval import check_retry_dual
+from payroll.domain.dual_approval import BankEdit, check_retry_dual
+from payroll.domain.resolve import OPERATOR_REJECTED
 from payroll.domain.retry import check_retry
 from payroll.domain.state import AttemptStatus, PayoutStatus
 from payroll.services import idempotency
 from payroll.services.common import decrypt_or_500, payout_view
+from payroll.services.dual_denied import record_dual_denied
 from payroll.services.record_result import ConcurrentUpdate
 from payroll.services.run_status import RunTransition, recompute_run_status, report_transition
 from payroll.services.runtime import Runtime
@@ -100,6 +105,9 @@ async def retry(
                 payout_id=str(payout_id), action="retry", rule=exc.rule,
                 employee_count=len(exc.employee_ids), actor_id=principal.sub,
             )  # fmt: skip
+            await record_dual_denied(
+                rt, principal, exc, action="retry", entity_id=payout_id, pay_run_id=run_id
+            )
             raise
         span.set_attribute("payroll.attempt", done.attempt)
     rt.wake_relay()
@@ -131,12 +139,18 @@ async def _retry_in_tx(
     )
     if emp is None:  # pragma: no cover  (check_retry refuses a missing employee)
         raise EmployeeBankDetailsMissing([payout.employee_id])
-    check_retry_dual(
-        require_dual_approval=bool(run.require_dual_approval),
-        retrier_id=principal.sub,
-        bank_updated_by=emp.bank_updated_by,
-        employee_id=emp.id,
-    )
+    if run.require_dual_approval:
+        edits = await DualApprovalRepo.bank_edits(session, cid, [emp.id], principal.sub)
+        check_retry_dual(
+            require_dual_approval=True,
+            retrier_id=principal.sub,
+            bank_edit=edits[0] if edits else BankEdit(emp.id, None, None),
+            resolved_by=(
+                current.resolved_by
+                if current is not None and current.failure_reason == OPERATOR_REJECTED
+                else None
+            ),
+        )
 
     routing = decrypt_or_500(
         rt.keyring, emp.bank_routing_enc or "", aad=employee_aad("bank_routing", emp.id),

@@ -3,6 +3,10 @@
 One transaction: idempotency row (lock 1) → run ``FOR UPDATE`` (3) → employees ``FOR SHARE`` (6)
 → inserts (payouts, attempts with encrypted bank snapshots, outbox rows, audit). The run moves to
 ``processing``, or straight to ``paid`` when every payout is ``no_transfer``.
+
+Dual approval (PAY-401, C73) reads the run's hours editors and the employees' unvetted bank edits
+after the employee locks. A denial is audited (``payrun.approve_denied``) in its own transaction
+after the rollback.
 """
 
 from __future__ import annotations
@@ -25,10 +29,17 @@ from sqlalchemy import func, insert, update
 from payroll.api.schemas import PayRunOut
 from payroll.crypto import employee_aad, snapshot_aad
 from payroll.db.models import Payout, PayoutAttempt, PayRun
-from payroll.db.repositories import AuditRepo, EmployeeRepo, PayRunRepo, PayslipRepo, rowcount
+from payroll.db.repositories import (
+    AuditRepo,
+    DualApprovalRepo,
+    EmployeeRepo,
+    PayRunRepo,
+    PayslipRepo,
+    rowcount,
+)
 from payroll.db.session import session_scope
 from payroll.domain import ApproverMustDiffer, EmployeeBankDetailsMissing, PayRunNotApprovable
-from payroll.domain.dual_approval import BankEdit, check_approve_dual
+from payroll.domain.dual_approval import check_approve_dual
 from payroll.domain.state import (
     PayoutStatus,
     RunStatus,
@@ -37,6 +48,7 @@ from payroll.domain.state import (
 )
 from payroll.services import idempotency
 from payroll.services.common import decrypt_or_500, pay_run_view
+from payroll.services.dual_denied import record_dual_denied
 from payroll.services.runtime import Runtime
 
 __all__ = ["ApproveResult", "approve"]
@@ -85,6 +97,9 @@ async def approve(
                 action="approve", rule=exc.rule, employee_count=len(exc.employee_ids),
                 actor_id=principal.sub,
             )  # fmt: skip
+            await record_dual_denied(
+                rt, principal, exc, action="approve", entity_id=run_id, pay_run_id=run_id
+            )
             raise
         span.set_attribute("payroll.payouts", stats["payouts"])
         span.set_attribute("payroll.transfers", stats["transfers"])
@@ -135,15 +150,17 @@ async def _approve_in_tx(
     employees = await EmployeeRepo.for_share(
         session, cid, sorted({p.employee_id for p in payslips})
     )
-    check_approve_dual(
-        require_dual_approval=bool(run.require_dual_approval),
-        approver_id=principal.sub,
-        calculated_by=run.calculated_by or "",
-        run_created_at=run.created_at,
-        bank_edits=[
-            BankEdit(e.id, e.bank_updated_by, e.bank_updated_at) for e in employees.values()
-        ],
-    )
+    if run.require_dual_approval:
+        check_approve_dual(
+            require_dual_approval=True,
+            approver_id=principal.sub,
+            calculated_by=run.calculated_by or "",
+            created_by=run.created_by,
+            hours_edits=await DualApprovalRepo.hours_edits(session, cid, run_id),
+            bank_edits=await DualApprovalRepo.bank_edits(
+                session, cid, sorted(employees), principal.sub
+            ),
+        )
     missing = [
         p.employee_id
         for p in payslips
