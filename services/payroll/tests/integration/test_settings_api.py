@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -102,6 +103,36 @@ async def test_anchor_locked_while_a_biweekly_run_exists(api: Api, db: Any) -> N
     await db.execute("UPDATE payroll.pay_runs SET deleted_at = now() WHERE id = $1", run["id"])
     r = await api.client.put("/v1/company/settings", json=back, headers=api.admin())
     assert r.status_code == 200
+
+
+async def test_put_racing_a_biweekly_create_never_leaves_a_run_on_the_old_anchor(
+    api: Api, db: Any
+) -> None:
+    """PAY-200, R33: a PUT moving the anchor and a biweekly create on the old anchor, in parallel.
+    The settings row lock (PUT ``FOR UPDATE``, create ``FOR SHARE``) serialises them, so either
+    the run exists on the old anchor and the PUT got 409 anchor_locked, or the anchor moved and the
+    create got 422 invalid_period_start; never both succeeding."""
+    await api.create_employee(schedule="biweekly", email="b@example.com")
+    moved = {**BODY, "biweekly_anchor": "2026-01-12"}
+    for start in ("2026-01-05", "2026-01-19", "2026-02-02", "2026-02-16"):
+        await db.execute("UPDATE payroll.pay_runs SET deleted_at = now() WHERE deleted_at IS NULL")
+        await db.execute("UPDATE payroll.company_settings SET biweekly_anchor = '2026-01-05'")
+        put, create = await asyncio.gather(
+            api.client.put("/v1/company/settings", json=moved, headers=api.admin()),
+            api.client.post(
+                "/v1/pay-runs", json={"schedule": "biweekly", "period_start": start},
+                headers=api.payroll_admin(),
+            ),
+        )  # fmt: skip
+        anchor = str(await db.fetchval("SELECT biweekly_anchor FROM payroll.company_settings"))
+        live = await db.fetchval("SELECT count(*) FROM payroll.pay_runs WHERE deleted_at IS NULL")
+        if create.status_code == 201:
+            assert (put.status_code, put.json()["error"]["code"]) == (409, "anchor_locked")
+            assert (anchor, live) == ("2026-01-05", 1)
+        else:
+            assert put.status_code == 200
+            assert create.json()["error"]["code"] == "invalid_period_start"
+            assert (anchor, live) == ("2026-01-12", 0)
 
 
 async def test_missing_settings_row_is_404(api: Api) -> None:

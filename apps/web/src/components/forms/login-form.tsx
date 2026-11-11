@@ -5,12 +5,25 @@ import { useEffect, useState, type FormEvent } from "react";
 import { ApiError, apiFetch } from "@/lib/client/api";
 import { LoginBody } from "@/lib/schemas/requests";
 
-/** Only a same-origin path: starts with "/" and not "//" or "/\" (the open-redirect guard). */
-export function safeNext(next: string | undefined): string {
-  if (!next || !next.startsWith("/") || next.startsWith("//") || next.startsWith("/\\")) {
-    return "/dashboard";
+/**
+ * The open-redirect guard (web LLD §6.2, C63): `next` must be a path that resolves to this
+ * origin. Control characters and backslashes are refused outright, because the URL parser
+ * strips tab/CR/LF and treats `\` as `/` (so "/\t/evil" would become "//evil").
+ */
+export function safeNext(
+  next: string | undefined,
+  origin: string = typeof window === "undefined" ? "http://invalid" : window.location.origin,
+): string {
+  const fallback = "/dashboard";
+  if (!next || !next.startsWith("/") || /[\u0000-\u001f\u007f\\]/.test(next)) return fallback;
+  let u: URL;
+  try {
+    u = new URL(next, origin);
+  } catch {
+    return fallback;
   }
-  return next;
+  if (u.origin !== new URL(origin).origin) return fallback;
+  return `${u.pathname}${u.search}`;
 }
 
 /** The sign-in form (web LLD §6.2, PAY-104). */

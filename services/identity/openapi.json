@@ -628,6 +628,25 @@
     "/v1/users/invite": {
       "post": {
         "operationId": "users_invite",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Client-IP",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Client-Ip"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {

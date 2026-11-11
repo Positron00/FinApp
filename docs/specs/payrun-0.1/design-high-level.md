@@ -76,12 +76,12 @@ stateDiagram-v2
     calculated --> paid: approve (all no_transfer)
     processing --> paid: all payouts paid
     processing --> partially_failed: no payout requested, some failed
-    partially_failed --> processing: retry / redrive
+    partially_failed --> processing: retry
   }
 ```
 
 - **Payout:** `requested` (current attempt requested, indeterminate or needs_operator) → `paid` (settled, or `no_transfer`) | `failed` (rejected) → retry → `requested`.
-- **Run:** `draft` ⇄ `calculated` → (approve) `processing` | `paid` → `paid` | `partially_failed`. Retry or redrive: `partially_failed` → `processing`. `draft` and `calculated` can be soft-deleted (`deleted_at`, PAY-304), which frees the period. The rule is PAY-406.
+- **Run:** `draft` ⇄ `calculated` → (approve) `processing` | `paid` → `paid` | `partially_failed`. Retry: `partially_failed` → `processing`. A redrive doesn't change the run: a `needs_operator` attempt counts as payout `requested`, so its run is already `processing`, and stays so. `draft` and `calculated` can be soft-deleted (`deleted_at`, PAY-304), which frees the period. The rule is PAY-406.
 
 ## 3. Data layout
 
@@ -100,8 +100,9 @@ The tables are listed in plan §6 and given exactly in each low-level design.
 
 ## 4. Failure handling
 
-This is the full fault table, copied from plan §12.1 with requirement IDs added. Every alerted row
-has a runbook at `docs/runbooks/<AlertName>.md`.
+This is the full fault table and the source for it (C43): plan §12.1 mirrors these rows with the same
+log events, metrics and alerts, and adds test layers. Every alerted row has a runbook at
+`docs/runbooks/<AlertName>.md`.
 
 | Failure | Detection | Behaviour | Log event / metric | Alert | Requirement |
 |---|---|---|---|---|---|
@@ -115,6 +116,7 @@ has a runbook at `docs/runbooks/<AlertName>.md`.
 | Two consumers on one message | — | Unique disbursement plus bank key | — | — | PAY-403, NFR-02 |
 | Re-publish racing a live consumer | — | Same key; second result 200 with the stored outcome | `payout.republished` | — | PAY-405, 407 |
 | `indeterminate` after `settled` (and the reverse) | — | No change / applies | `payout.result_recorded` | — | PAY-405 |
+| Late definite answer for a `needs_operator` attempt | Result endpoint | `settled`/`rejected` applies (the bank's answer wins); `indeterminate`/`poison` → 200, no change (R7, C42) | `payout.result_recorded` | — | PAY-405, 502 |
 | payroll down during processing | Worker client errors | Pending → DLQ; re-publish after recovery | `queue.message.failed` / `queue_messages_total{outcome="dlq"}` | `PayoutDLQ`, `PayoutsStuck` | PAY-407, 408 |
 | Poison message | Schema, amount or payout_not_found check | DLQ at once; `needs_operator`; operator resolves (PAY-502) | `payout.needs_operator` / `payroll_attempts_needs_operator` | `PayoutDLQ`, `PayoutNeedsOperator` | PAY-409 |
 | Key window expired | Attempt age | GET only; 404 → needs_operator | `payout.key_window_expired` | `PayoutNeedsOperator` | PAY-410 |

@@ -20,6 +20,7 @@ from payroll.crypto import FieldKeyring
 __all__ = ["STARTUP_CHECKS", "Settings"]
 
 SERVICE_NAME: Final = "payroll"
+ACCEPTED_ISSUERS: Final = frozenset({"web", "payout-worker"})
 
 
 class Settings(BaseServiceSettings):
@@ -69,12 +70,15 @@ def check_payroll_field_keys(base: BaseServiceSettings) -> Iterable[CheckFailure
 
 
 def check_jwt_issuers(base: BaseServiceSettings) -> Iterable[CheckFailure]:
-    """At least one kid each for ``web`` and ``payout-worker`` (PAY-600)."""
+    """Every kid's issuer is ``web`` or ``payout-worker``, with at least one kid each (PAY-600,
+    design §6.2 item 3)."""
     keyset = base.internal_jwt_public_keys
     if keyset is None:
         return  # pycommon's own JWT check reports "missing"
     issuers = {entry.iss for kid in keyset.kids if (entry := keyset.get(kid)) is not None}
-    if not {"web", "payout-worker"} <= issuers:
+    if issuers - ACCEPTED_ISSUERS:
+        yield CheckFailure("INTERNAL_JWT_PUBLIC_KEYS", "issuer_unexpected")
+    if not issuers >= ACCEPTED_ISSUERS:
         yield CheckFailure("INTERNAL_JWT_PUBLIC_KEYS", "issuer_missing")
 
 

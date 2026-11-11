@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import json
 from typing import Any
 
 import pytest
@@ -10,22 +11,16 @@ import pytest
 from tests.helpers import (
     CLOSED_ACCOUNT,
     KEY,
-    FakeRepo,
-    Sleeps,
     body,
     headers,
     make_settings,
-    running,
-    runtime,
+    stubbed,
 )
 
 
 @pytest.fixture
 async def stub() -> Any:
-    async with running(make_settings(bank_stub_latency_ms=20)) as (app, client):
-        rt = runtime(app)
-        rt.repo = FakeRepo()
-        rt.sleep = Sleeps()
+    async with stubbed(make_settings(bank_stub_latency_ms=20)) as (app, client, rt):
         yield app, client, rt
 
 
@@ -115,7 +110,7 @@ async def test_api_key_uses_compare_digest(stub: Any, monkeypatch: pytest.Monkey
         calls.append((a, b))
         return original(a, b)
 
-    monkeypatch.setattr("bank_stub.api.auth.hmac.compare_digest", spy)
+    monkeypatch.setattr("bank_stub.api.auth.compare_digest", spy)  # module-local, not stdlib
     r = await client.get(f"/v1/transfers/{KEY}", headers=headers(None))
     assert r.status_code == 404
     assert len(calls) == 1
@@ -140,17 +135,22 @@ async def test_malformed_idempotency_key_is_422(stub: Any) -> None:
 
 
 async def test_invalid_body_on_new_key_is_422_without_values(stub: Any) -> None:
-    """C14: field names and error types only; the submitted values are never echoed."""
+    """C14: field names and error types only; the submitted values are never echoed.
+
+    The values are checked in the body without its random ``request_id``: the old check of
+    ``"-5"`` against the whole text failed whenever the request ID had a group starting with 5
+    (the C61 flake)."""
     _, client, rt = stub
-    bad = {"amount_cents": -5, "currency": "USD", "routing": "98765", "account": "55556666"}
+    bad = {"amount_cents": -987654, "currency": "USD", "routing": "98765", "account": "55556666"}
     r = await client.post("/v1/transfers", json=bad, headers=headers())
     assert r.status_code == 422
     err = r.json()["error"]
     assert err["code"] == "validation_error"
     fields = {d["field"] for d in err["details"]}
     assert fields == {"body.amount_cents", "body.routing"}
-    assert "98765" not in r.text
-    assert "-5" not in r.text
+    echoed = json.dumps({k: v for k, v in err.items() if k != "request_id"})
+    for value in ("98765", "-987654", "987654", "55556666"):
+        assert value not in echoed
     assert rt.repo.inserted == []
 
 
@@ -174,6 +174,8 @@ async def test_get_found_not_found_and_malformed(stub: Any) -> None:
     assert r200.json() == created
     bad = await client.get("/v1/transfers/a%20b", headers=headers(None))
     assert bad.status_code == 422
+    newline = await client.get(f"/v1/transfers/{KEY}%0A", headers=headers(None))  # C63
+    assert newline.status_code == 422
     assert bad.json()["error"]["details"] == [{"field": "path.key", "issue": "pattern"}]
 
 

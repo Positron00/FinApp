@@ -1,6 +1,6 @@
 # Low-level design: payroll service
 
-Status: draft v2, 2026-11-10 · Sources: [architecture plan](../../plan/architecture-plan.md) v1.2 (accepted 2026-11-10), [requirements](requirements.md), [high-level design](design-high-level.md), the [spec README](README.md) "Spec resolutions" (R1–R37) and "Contract decisions" (C1–C55) tables, ADRs [0003](../../adr/0003-payout-flow.md), [0004](../../adr/0004-bank-details-at-rest.md), [0005](../../adr/0005-four-eyes-approval.md), [0006](../../adr/0006-money-and-rounding.md) · Event contracts: [`contracts/events/payout.requested.v1.json`](../../../contracts/events/payout.requested.v1.json), [`contracts/events/payout.requested.dlq.v1.json`](../../../contracts/events/payout.requested.dlq.v1.json) (written by payout-worker)
+Status: draft v3, 2026-11-11 (S5 review fixes, C63) · Sources: [architecture plan](../../plan/architecture-plan.md) v1.2 (accepted 2026-11-10), [requirements](requirements.md), [high-level design](design-high-level.md), the [spec README](README.md) "Spec resolutions" (R1–R37) and "Contract decisions" (C1–C63) tables, ADRs [0003](../../adr/0003-payout-flow.md), [0004](../../adr/0004-bank-details-at-rest.md), [0005](../../adr/0005-four-eyes-approval.md), [0006](../../adr/0006-money-and-rounding.md) · Event contracts: [`contracts/events/payout.requested.v1.json`](../../../contracts/events/payout.requested.v1.json), [`contracts/events/payout.requested.dlq.v1.json`](../../../contracts/events/payout.requested.dlq.v1.json) (written by payout-worker)
 
 This document is the contract between the payroll implementers, the payout-worker team (§4.6, §4.7, §5)
 and the web team (§4.2–§4.5). Precedence: the README C-table, then the R-table, then `requirements.md`,
@@ -30,7 +30,8 @@ All paths are under `services/payroll/`. The package is `payroll`.
 | `src/payroll/metrics.py` | new | Every OTel instrument in §7.2, plus `register_collection_gauges(sync_engine)` (the collection-time gauge callbacks, including `outbox_*`; C18). |
 | `src/payroll/maintenance.py` | new | `build_maintenance(ctx) -> pycommon.maintenance.MaintenanceRunner` with lock name `payroll:maintenance` and the tasks `republish`, `purge_outbox`, `purge_idempotency_keys` and `purge_bank_details` (§5.3, §5.4). |
 | `src/payroll/api/__init__.py` | new | `routers: list[APIRouter]`. |
-| `src/payroll/api/deps.py` | new | `get_session`, `principal`, `require_roles(*roles)`, `require_web_user`, `require_worker`, `idempotency(required: bool)` (§4.8, §8). |
+| `src/payroll/api/deps.py` | new | `require_web_user`, `require_worker`, `require_roles(*roles)` (§8), `get_runtime`, the `IdempotencyHeader` parameter (pattern-checked, so a malformed key is 422) and `idem_request(...)`, which raises 400 `idempotency_key_required` and builds the §4.8 scope and hash. |
+| `src/payroll/api/responses.py` | new | `errors(*statuses)`: the OpenAPI error responses (401, 403, 422, 429, 500, 503 plus the route's own), all with pycommon's `ErrorBody`. |
 | `src/payroll/api/errors.py` | new | `ErrorCode` (a StrEnum with every code in §4.1), plus the mapping from `DomainError` subclasses to `(status, code)`. |
 | `src/payroll/api/schemas.py` | new | Every Pydantic request and response model in §4. |
 | `src/payroll/api/pagination.py` | new | `encode_cursor(after_id)` and `decode_cursor(cursor) -> UUID` (§4.9). |
@@ -39,7 +40,7 @@ All paths are under `services/payroll/`. The package is `payroll`.
 | `src/payroll/api/pay_runs_router.py` | new | `/v1/pay-runs*`: create, list, get, delete, hours, calculate, approve, payslips, payouts, retry and resolve. |
 | `src/payroll/api/audit_router.py` | new | `GET /v1/audit-events`. |
 | `src/payroll/api/internal_router.py` | new | `/v1/internal/payouts/{id}/instruction` and `/result`. |
-| `src/payroll/services/` | new | Application services, one per use case (`create_run.py`, `hours.py`, `calculate.py`, `approve.py`, `retry.py`, `resolve.py`, `record_result.py`, `instruction.py`, `employees.py`, `settings.py`). Each one owns its transaction and its lock order (§4.10), calls the domain functions and the repositories, writes the audit rows, and emits the logs and metrics. Routers call only these. |
+| `src/payroll/services/` | new | Application services, one per use case (`create_run.py`, `hours.py`, `calculate.py`, `approve.py`, `retry.py`, `resolve.py`, `record_result.py`, `instruction.py`, `employees.py`, `settings.py`, plus `reads.py` for the unlocked read endpoints). Each one owns its transaction and its lock order (§4.10), calls the domain functions and the repositories, writes the audit rows, and emits the logs and metrics. Routers call only these. Shared helpers: `idempotency.py` (the §4.8 algorithm: `begin`, `store`, `scope`, `request_hash`), `run_status.py` (`recompute_run_status` and `report_transition`, PAY-406, shared by result, retry and resolve), `common.py` (`decrypt_or_500` with the PAY-204 handling; `pay_run_view`), `runtime.py` (`Runtime`: settings, sessions, keyring, metrics, outbox writer, relay). |
 | `src/payroll/domain/__init__.py` | new | `DomainError` base class and all its subclasses (§3.7). |
 | `src/payroll/domain/periods.py` | new | Period derivation, `period_index`, the overlap test and the hours bounds (§3.1). |
 | `src/payroll/domain/calc.py` | new | Gross, tax, retirement, net and totals in integer arithmetic (§3.2). |
@@ -49,7 +50,7 @@ All paths are under `services/payroll/`. The package is `payroll`.
 | `src/payroll/domain/resolve.py` | new | `ResolveAction`, `check_resolve` and `resolve_transition` (PAY-502) (§3.5a). |
 | `src/payroll/domain/validation.py` | new | `aba_checksum_ok`, `is_monday` and the IANA timezone check. |
 | `src/payroll/db/models.py` | new | SQLAlchemy 2.0 declarative models for the 10 tables in §2 (`__table_args__ = {"schema": "payroll"}`). |
-| `src/payroll/db/session.py` | new | The async engine from `pycommon.db.create_engine(settings)` (asyncpg; `DB_*` keys; `statement_timeout` = `DB_STATEMENT_TIMEOUT_MS`, pool timeout `DB_POOL_TIMEOUT_S`); a sync engine (psycopg, pool size 1, same `DB_*` credentials) for the collection-time gauges; and `session_scope()`. |
+| `src/payroll/db/session.py` | new | `session_scope(sessions, operation)`: one READ COMMITTED transaction, with pycommon's DB error mapping. The async engine and sessionmaker come from `pycommon.create_app` (asyncpg; `DB_*` keys; `statement_timeout` = `DB_STATEMENT_TIMEOUT_MS`, pool timeout `DB_POOL_TIMEOUT_S`). The sync engine for the collection-time gauges (psycopg, pool size 1) arrives with them in F4a. |
 | `src/payroll/db/repositories.py` | new | `SettingsRepo`, `EmployeeRepo`, `PayRunRepo`, `PayslipRepo`, `HoursRepo`, `PayoutRepo`, `AttemptRepo`, `AuditRepo`, `OutboxRepo`, `IdempotencyRepo`. Every method takes `company_id` first and uses bound parameters only. |
 | `src/payroll/events/envelope.py` | new | `build_payout_requested(...)` and `validate_envelope(...)` (against the committed JSON Schema) (§5.1). |
 | `src/payroll/events/outbox.py` | new | `OutboxWriter.add_payout_requested(session, ...)`. It runs inside the caller's transaction and wakes the local relay after commit. |
@@ -351,7 +352,7 @@ Audit events and the shape of `details`:
 | `payrun.calculated` | `{tax_bps, retirement_bps, require_dual_approval, payslips: n}` | PAY-302 |
 | `payrun.approved` | `{payouts: n, transfers: n, no_transfer: n, status}` | PAY-400 |
 | `payrun.deleted` | `{status_at_delete}` | PAY-304 |
-| `payout.result_recorded` | `{attempt, outcome, applied: bool, failure_reason?}` | PAY-405 |
+| `payout.result_recorded` | `{attempt, outcome, applied: true, failure_reason?}`, written **only when the result is applied** (§4.7 APPLY). A STORED (no-change) result writes no audit row; it is visible in the log `payout.result_recorded` with `applied=false` | PAY-405 |
 | `payout.retry_requested` | `{attempt, account_last4}` | PAY-500 |
 | `payout.needs_operator` | `{attempt, reason}` (`poison`, `republish_limit` or the worker's reason) | PAY-407, PAY-409 |
 | `payout.operator_resolved` | `{attempt, action, note_len}` (`action` is `redrive` or `mark_rejected`; the note's length, never its text) | PAY-502 |
@@ -742,7 +743,7 @@ def snapshot_aad(payout_id: UUID, attempt: int) -> str:
 | Class | HTTP | Code | `details` |
 |---|---|---|---|
 | `InvalidPeriodStart` | 422 | `invalid_period_start` | `{schedule, period_start}` |
-| `PayRunExists` | 409 | `pay_run_exists` | `{pay_run_id}` |
+| `PayRunExists` | 409 | `pay_run_exists` | `{pay_run_id}`: always the live run's ID, including on the unique-index race path (C63) |
 | `NoEmployees` | 409 | `no_employees` | — |
 | `EmployeeInOverlappingRun` | 409 | `employee_in_overlapping_run` | `{employee_ids: [...]}` |
 | `PayRunLocked` | 409 | `pay_run_locked` | `{status}` |
@@ -787,11 +788,13 @@ def snapshot_aad(payout_id: UUID, attempt: int) -> str:
   | 503 | `db_timeout` / `db_unavailable` | Statement or pool timeout / connection failure |
 
 - **Full code list** (`api.errors.ErrorCode`): `invalid_token`, `forbidden_role`, `not_found`, `method_not_allowed`, `payload_too_large`, `validation_error`, `rate_limited`, `internal_error`, `db_timeout`, `db_unavailable`, `company_settings_not_found`, `anchor_locked`, `employee_not_found`, `employee_email_taken`, `pay_run_not_found`, `pay_run_exists`, `invalid_period_start`, `no_employees`, `employee_in_overlapping_run`, `pay_run_locked`, `not_hourly`, `employee_not_in_run`, `hours_missing`, `pay_run_not_approvable`, `approver_must_differ`, `idempotency_key_required`, `idempotency_key_reused`, `payslip_not_found`, `payout_not_found`, `payout_not_retryable`, `payout_not_blocked`, `retry_limit_reached`, `employee_bank_details_missing`, `attempt_not_current`. All are defined in PAY-602 or the requirement that raises them (R3), `resolve_too_early`.
+- **NUL characters (C63):** Postgres `text` can't store U+0000, so every free-text request field (`Name`, `CompanySettingsIn.timezone`, `ResultIn.bank_reference`) carries the `NoNul` validator and rejects it with 422 `validation_error`, issue `nul_character`. Fields with a strict pattern (routing, account, reason, keys) or `EmailStr` already exclude it. pycommon also maps SQLSTATE 22021 to 422 as defence in depth. The validator adds no OpenAPI keyword.
 - **Request models** use `model_config = ConfigDict(extra="forbid")`. Response models use `ConfigDict(from_attributes=True)`.
 - **Shared Pydantic types** (`api/schemas.py`):
 
 ```python
-Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+NoNul = AfterValidator(_no_nul)          # U+0000 → 422 [{field, issue: "nul_character"}] (C63)
+Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200), NoNul]
 Email = Annotated[EmailStr, StringConstraints(max_length=320)]
 SalaryCents = Annotated[int, Field(ge=1, le=1_000_000_000)]
 RateCents = Annotated[int, Field(ge=1, le=100_000)]
@@ -819,7 +822,7 @@ class CompanySettingsIn(BaseModel):
     name: Name
     tax_rate_bps: Annotated[int, Field(ge=0, le=5000)]
     retirement_bps: Annotated[int, Field(ge=0, le=2000)]
-    timezone: Annotated[str, StringConstraints(min_length=1, max_length=64)]   # zoneinfo-valid
+    timezone: Annotated[str, StringConstraints(min_length=1, max_length=64), NoNul]   # zoneinfo-valid
     biweekly_anchor: date                                                       # must be a Monday
     require_dual_approval: bool
 
@@ -1019,7 +1022,7 @@ class ResolveIn(BaseModel):              # PAY-502, R8
 - **Create (PAY-300).** Lock order is in §4.10.
   1. Load the settings with `SELECT … FROM company_settings WHERE company_id=:cid FOR SHARE` (so the anchor can't change underneath; R33).
   2. Call `derive_period` (`InvalidPeriodStart` → 422).
-  3. Check for a non-deleted run on `(cid, schedule, period_start)` → 409 `pay_run_exists`. A unique-index violation in a race maps to the same code.
+  3. Check for a non-deleted run on `(cid, schedule, period_start)` → 409 `pay_run_exists`. A unique-index violation in a race maps to the same code: the run insert is flushed inside a savepoint, and on the violation the live run is re-read (READ COMMITTED sees the winner, since the index waited for it to commit), so `details.pay_run_id` is the real ID (C63). The advisory lock (§4.10) normally serialises creates first.
   4. Load the active employees on `schedule`. If there are none → 409 `no_employees`.
   5. Load coverage for those employees: `SELECT ps.employee_id, r.period_start, r.period_end FROM payslips ps JOIN pay_runs r ON r.id = ps.pay_run_id WHERE r.company_id=:cid AND r.deleted_at IS NULL AND ps.employee_id = ANY(:ids) AND r.period_start <= :new_end AND r.period_end >= :new_start`. Then call `find_overlapping_employees`. Any hit → 409 `employee_in_overlapping_run` with `employee_ids`.
   6. Insert the run (`draft`, with `employee_count`) and one `pending` payslip per employee (snapshotting `employee_name`, `pay_type`, salary or rate).
@@ -1100,7 +1103,7 @@ class AuditEventOut(BaseModel):
 
 **`GET /v1/internal/payouts/{payout_id}/instruction?attempt={n}`**
 - **Caller:** `iss=payout-worker`, `sub=service:payout-worker` (§8.2).
-- **Query:** `attempt: Annotated[int, Field(ge=1)]` (required).
+- **Query:** `attempt: Annotated[int, Field(ge=1, le=32767)]` (required; `payout_attempts.attempt` is `smallint`).
 - **Success:** 200 `InstructionOut`.
 - **Errors:**
   - 401 `invalid_token` for any other issuer (PAY-411), and 403 `forbidden_role` for an `iss=payout-worker` token whose `sub` isn't `service:payout-worker` (C30; §8.2);
@@ -1141,10 +1144,10 @@ class InstructionOut(BaseModel):
 
 ```python
 class ResultIn(BaseModel):
-    attempt: Annotated[int, Field(ge=1)]
+    attempt: Annotated[int, Field(ge=1, le=32767)]                            # smallint (C63)
     outcome: Literal["settled", "rejected", "indeterminate", "poison"]
     reason: Annotated[str, StringConstraints(pattern=r"^[a-z0-9_]{1,100}$")] | None = None
-    bank_reference: Annotated[str, StringConstraints(min_length=1, max_length=64)] | None = None   # C26
+    bank_reference: Annotated[str, StringConstraints(min_length=1, max_length=64), NoNul] | None = None   # C26
     # model_validator:
     #   settled  ⇒ bank_reference required, reason None
     #   rejected ⇒ reason required (e.g. account_closed, insufficient_funds_at_bank)
@@ -1191,7 +1194,7 @@ Whether the call changed anything is not in the response; it is in the log `payo
 - **`scope`:** `f"{iss}|{sub}|{method} {route_template}|{sorted path params as k=v joined by ','}"`. So the same key on another run, or from another user, never collides.
 - **`request_hash`:** `sha256(method + "\n" + route_template + "\n" + canonical_path_params + "\n" + canonical_body).hexdigest()`. `canonical_body` is `json.dumps(parsed_body, sort_keys=True, separators=(",", ":"))`, or `""` when there is no body.
 - **TTL:** `expires_at = now() + IDEMPOTENCY_TTL_H` (24 h). Maintenance purges rows past `expires_at` (§5.4).
-- **Algorithm** (`api.deps.idempotency`, the first statements of the handler's transaction, before any domain lock):
+- **Algorithm** (`services/idempotency.py` `begin` and `store`, called by the service with the `IdemRequest` that `api.deps.idem_request` built; the first statements of the handler's transaction, before any domain lock):
   1. Run `DELETE FROM idempotency_keys WHERE company_id=:cid AND scope=:scope AND key=:key AND expires_at < now()`.
   2. Run `INSERT INTO idempotency_keys (company_id, scope, key, request_hash, response_status, response_body, expires_at) VALUES (…, 0, 'null', …) ON CONFLICT DO NOTHING RETURNING key`.
      - A concurrent request with the same key blocks here on the unique index until the first transaction ends. So two in-flight duplicates are serialised, and the second sees the committed result.
@@ -1333,7 +1336,11 @@ span = tracer.start_span("payroll.outbox.publish", context=ctx, kind=PRODUCER,
                          "stream:payout.requested", messaging.message.id: row.id, payroll.payout_id,
                          payroll.attempt})
 envelope_json = json(row.payload with traceparent := inject(span context))   # worker becomes a child of the publish span
+if PAYROLL_VALIDATE_EVENTS: validate_envelope(final payload)                 # C60, C63
+  invalid → mark_failed(error_type="EnvelopeInvalidError"), log outbox.relay.error, don't publish
 ```
+
+- **Re-validation (C60, C63):** with `PAYROLL_VALIDATE_EVENTS` on, the relay validates the envelope it is about to publish (after the traceparent rewrite), not only the one written at approve. An invalid row is a bug: it is never published, it is marked failed (`relay_attempts`, `last_error = EnvelopeInvalidError`), `outbox.relay.error` is logged, and it stays unsent, so `OutboxStuck` fires. The valid rows of the same batch still go out.
 
 - **Loop:** wait for the wake event or `PAYROLL_OUTBOX_POLL_MS` (200 ms), whichever is first; this is pycommon `RelayLoop` (platform §3.9, C22) over `PayrollOutboxSource`: it calls `claim_unsent`, publishes the batch in one `publish_many` pipeline (under `REDIS_SOCKET_TIMEOUT_MS`), then `mark_sent` or `mark_failed`, and commits. On any failure log `outbox.relay.error` (`error_type`, `batch_size`, `failed`, `backoff_ms`) and back off `min(0.2 × 2^k, 5)` s with full jitter; a clean batch resets `k`. A full batch loops at once.
 - **Stream fields** (the contract with payout-worker, R7):
@@ -1554,7 +1561,7 @@ Payroll calls `pycommon.startup_checks.run_startup_checks(settings, extra=STARTU
 | `idempotency.replayed` | info | `route`, `status` | stored response replayed | PAY-400 |
 | `idempotency.key_reused` | warning | `route` | 422 `idempotency_key_reused` | PAY-400 |
 | `outbox.relay.error` | error | `error_type`, `batch_size`, `failed`, `backoff_ms` | XADD or batch failure | PAY-402 |
-| `outbox.relay.published` | debug | `count`, `duration_ms` | batch sent | PAY-402 |
+| `outbox.relay.published` (pycommon `RelayLoop`, C63) | debug | `count`, `duration_ms` | batch sent | PAY-402 |
 | `maintenance.task.completed` (pycommon) | info | `task` (`republish`, `purge_outbox`, `purge_idempotency_keys`, `purge_bank_details`), `affected`, `duration_ms` | each task per tick | PAY-407, PAY-608, C44 |
 | `maintenance.task.failed` (pycommon) | error | `task`, `error_type` (with traceback) | a task raised | PAY-608, C44 |
 | `maintenance.skipped` (pycommon) | debug | — | advisory lock held by another replica | PAY-608 |
@@ -1690,14 +1697,13 @@ issuer/kid mismatch → 401 `invalid_token` (C30). The route guards then apply:
 | `test_payout_model.py` | **Hypothesis `RuleBasedStateMachine`** (§9.4). Owned by payroll only (C44) | PAY-NFR-02, PAY-406, PAY-405, PAY-411, PAY-500, PAY-502 |
 | `test_field_crypto.py` | Round trip; token format `kid:nonce:ct`; a fresh nonce per call; a tampered ciphertext, nonce, kid or AAD (swapping between employees) raises `FieldDecryptError`; an unknown kid raises; decrypt with an old kid after rotation; bad key length refused; the error message holds no plaintext | PAY-204, ADR 0004 |
 | `test_validation.py` | ABA checksum (valid and invalid), account 4–17 digits, salary and rate bounds, the settings ranges, a non-Monday anchor, a bad timezone, `HoursIn` duplicate IDs, `ResultIn` per-outcome field rules and `bank_reference` ≤ 64 (C26), `ResolveIn` (unknown action, empty note, 501-character note), `EmployeeUpdate` with no fields; every 422 has `details = [{field, issue}]` with no input value (C14) | PAY-200, PAY-201, PAY-301, PAY-405, PAY-502, PAY-602 |
-| `test_authz_matrix.py` | Parametrised over every route (resolve included) × {admin, payroll_admin, approver, no-role, web token on an internal route → 401, worker token on a public route → 401, `sub=service:web` on a public route → 403, worker-issued token with another `sub` on an internal route → 403, bad signature / expired / issuer-kid mismatch → 401}: the exact status and code of §8.1–§8.2 (C30); every non-health route has a guard | PAY-601, PAY-411, PAY-600 |
+| `test_app.py` (the authorization matrix) | Parametrised over every route (resolve included) × {admin, payroll_admin, approver, no-role, web token on an internal route → 401, worker token on a public route → 401, `sub=service:web` on a public route → 403, worker-issued token with another `sub` on an internal route → 403, bad signature / expired / issuer-kid mismatch → 401}: the exact status and code of §8.1–§8.2 (C30); every non-health route has a guard | PAY-601, PAY-411, PAY-600 |
 | `test_errors.py` | Each `DomainError` maps to the status, code and details shape of §3.7 (including `anchor_locked` and `payout_not_blocked`); `ErrorCode` equals the list in §4.1; validation details are a `[{field, issue}]` list (C14); a 500 holds no traceback; `FieldDecryptError` → 500 `internal_error` plus the `crypto.decrypt_failed` log; 413 over `MAX_BODY_BYTES` | PAY-602, PAY-204, PAY-604 |
 | `test_idempotency_hash.py` | Canonical hash stable across key order and whitespace; it differs by path parameter, route and body; scope composition | PAY-400 |
 | `test_cursor.py` | Encode and decode round trip; a garbage, wrong-version or non-UUID cursor → `validation_error` with `details = [{field: "query.cursor", issue: "invalid_cursor"}]` | PAY-202, PAY-303, PAY-602 |
 | `test_event_envelope.py` | `build_payout_requested` output validates against the schema; `traceparent` is taken from the active span, or synthesised when there is none; the schema rejects extra properties, a wrong currency, amount 0 and a negative `republish_seq` | PAY-402 |
 | `test_settings.py` | Settings load the pycommon names (`DB_*`, `REDIS_*`, `DEBUG`, `DOCS_ENABLED`, `MAX_BODY_BYTES`; C1) and the `PAYROLL_*` keys; `LOG_LEVEL=info` is accepted as `INFO` (C24); startup checks through `run_startup_checks`: a `dev-` field kid in uat → `startup.check_failed` and exit 2 (C29); wrong key length; an active kid missing; `DOCS_ENABLED` on in prod; `PAYOUT_REPUBLISH_AFTER_S` = 360 passes and 300 fails the timing check (R1) → exit 2 in uat, warning in dev; logs the setting name and never the value | PAY-605 |
 | `test_metrics.py` | `InMemoryMetricReader`: each business counter and histogram increments with the right labels on its path (including `payroll_payouts_total{outcome="operator_rejected"}`); the settlement histogram is observed once per run; exported Prometheus names are exact | PAY-NFR-10, PAY-406 |
-| `test_log_redaction.py` | Every §7.1 event emitted on its path holds no key or value matching the salary, amount, employee or staff name, email, routing, account or resolve-note values used in the test | PAY-NFR-07 |
 
 ### 9.2 `services/payroll/tests/integration/`
 
@@ -1708,7 +1714,7 @@ issuer/kid mismatch → 401 `invalid_token` (C30). The route guards then apply:
 | `test_grants.py` | `payroll_app` can't `SELECT` from `identity.users`, `payouts.disbursements` or `bank_stub.transfers` (`permission denied`), can't run DDL in `payroll`, and can read but not write `payroll.alembic_version` | PAY-606 |
 | `test_settings_api.py` | GET and PUT; out-of-range 422 with `[{field, issue}]` details; `settings.updated` audit with the changed fields; admin-only PUT; changing `biweekly_anchor` with a non-deleted biweekly run → 409 `anchor_locked` and no change, allowed again once that run is deleted, and allowed with only monthly runs; a PUT racing a biweekly create never leaves a run on the old anchor (R33) | PAY-200 |
 | `test_employees_api.py` | Create, list (cursor, status filter, order), get, patch; `employee_email_taken` (case-insensitive); another company → 404; responses never contain the routing or account digits (scanned); `bank_updated_by` and `bank_updated_at` set; audit diff has only field names and `account_last4`; reactivation after purge needs bank details | PAY-201, PAY-202, PAY-203, PAY-NFR-08 |
-| `test_pay_run_create.py` | Monthly and biweekly creation; `pay_run_exists`; recreate after delete succeeds; `invalid_period_start`; `no_employees`; `employee_in_overlapping_run` after a schedule change (with IDs); inactive employees excluded; snapshot fields; two concurrent creates for the same period → one 201 and one 409 | PAY-300 |
+| `test_pay_runs.py` (create) | Monthly and biweekly creation; `pay_run_exists`; recreate after delete succeeds; `invalid_period_start`; `no_employees`; `employee_in_overlapping_run` after a schedule change (with IDs); inactive employees excluded; snapshot fields; two concurrent creates for the same period → one 201 and one 409; the unique-index race path returns the real `pay_run_id` (C63) | PAY-300 |
 | `test_hours_calculate.py` | Hours upsert returns `HoursOut` (C7); `not_hourly`; `employee_not_in_run`; bounds per schedule; a calculated run reverts to draft and its payslips reset (`calculated_by_name` cleared); `hours_missing`; calculate snapshots the rates and dual flag and stores `calculated_by_name` from the token's `name` (NULL without the claim); totals = Σ stored payslips; summary has exactly the six `counts` keys, `require_dual_approval`, `calculated_by_name`, `approved_by_name` and `funding_required_cents` (C9); the payslips list pages with `cursor`/`limit` until `next_cursor` is null (C8); `pay_run_locked` after approval; delete only in draft or calculated | PAY-301, PAY-302, PAY-303, PAY-304 |
 | `test_approve.py` | Approve creates payouts, attempt 1, snapshots and outbox rows in one transaction; `approved_by_name` stored from the token; a net = 0 payout → `paid` + `no_transfer` with no outbox row; an all-zero run → `paid` straight away; dual approval (calculator, bank editor after `created_at`, creator of the employee counts as a bank editor); setting off after calculate keeps the snapshot; missing or purged bank details → 409 `employee_bank_details_missing` (C40); rollback on failure leaves no payouts or outbox rows | PAY-400, PAY-401, PAY-402 |
 | `test_approve_concurrency.py` | Two parallel approves with different keys → exactly one 200 and one 409 `pay_run_not_approvable`, one set of payouts; two parallel with the **same** key → both 200 with the same body, one set of payouts | PAY-400 |
@@ -1723,14 +1729,14 @@ issuer/kid mismatch → 401 `invalid_token` (C30). The route guards then apply:
 | `test_collection_gauges.py` | `payroll_runs_processing_oldest_age_seconds`, `payroll_payouts_stuck`, `payroll_attempts_needs_operator`, `outbox_unsent` and `outbox_oldest_age_seconds` computed at collection on two app instances against the same DB give the same fresh values; zero when nothing matches; DB down → no observation plus a warning | plan §2.1, §11; PAY-NFR-11 |
 | `test_rate_limit.py` | Per-caller limit shared across two app instances (Redis) → 429 with `Retry-After`; the worker uses the worker limit; Redis down → fail open, `rate_limiter_errors_total` incremented | PAY-603 |
 | `test_readyz.py` | `/readyz` fails when the DB or Redis is down, or when migrations aren't at head; `/livez` stays up; a uat-mode start with a placeholder secret exits 2 before connecting (C29) | PAY-605 |
-| `test_secret_not_logged.py` | With captured logs over a full create → calculate → approve → result → retry → resolve flow: no field-key bytes, JWT, routing or account number, salary value, or employee name or email appears | PAY-NFR-07 |
+| `test_secret_not_logged.py` | With captured JSON logs (after pycommon's redaction) over a full settings PUT → create employee (plus a rejected duplicate) → create run → calculate → approve → instruction → result flow (retry and resolve join in F4a): no salary, gross or net amount, employee or staff name, email, routing or account number, field-key value, DB password or JWT appears. This also covers the unit `test_log_redaction.py` row of earlier drafts | PAY-NFR-07 |
 
 ### 9.3 `services/payroll/tests/contract/`
 
 | File | Covers | Requirement |
 |---|---|---|
-| `test_openapi_snapshot.py` | `scripts/export_openapi.py payroll` output equals the committed `openapi.json` (CI also runs the git-diff drift job); every route documents its error responses with the shared error schema | PAY-NFR-12 |
-| `test_event_schema.py` | `contracts/events/payout.requested.v1.json` is a valid draft 2020-12 schema; the §5.1 example (dev `COMPANY_ID`, C28) validates; mutated examples fail (extra property in the envelope or `data`, `version: 2`, `type` wrong, `producer` wrong, currency not USD, amount 0, a non-UUID ID, a missing or bad `traceparent`); `contracts/events/payout.requested.dlq.v1.json` (C21) is a valid draft 2020-12 schema and its example validates, with an `envelope` string that validates against the v1 schema | PAY-402, PAY-NFR-12 |
+| `test_openapi.py` | `scripts/export_openapi.py payroll` output equals the committed `openapi.json` (CI also runs the git-diff drift job); every route documents its error responses with the shared error schema | PAY-NFR-12 |
+| `test_event_schema.py` | `contracts/events/payout.requested.v1.json` is a valid draft 2020-12 schema; the §5.1 example (dev `COMPANY_ID`, C28) and both lead-owned examples `examples/payout.requested.v1.{first,republished}.json` (C57) validate; mutated examples fail (extra property in the envelope or `data`, `version: 2`, `type` wrong, `producer` wrong, currency not USD, amount 0, a non-UUID ID, a missing or bad `traceparent`); `contracts/events/payout.requested.dlq.v1.json` (C21) is a valid draft 2020-12 schema and its example validates, with an `envelope` string that validates against the v1 schema | PAY-402, PAY-NFR-12 |
 | `test_error_codes.py` | Every code in §4.1 is reachable or documented in the OpenAPI spec, and none is outside the list | PAY-602 |
 
 Schemathesis runs in CI against the running service (testing.md §4). It is not a file here.
@@ -1811,7 +1817,7 @@ harness that mirrors the services layer. It runs with no I/O.
 | PAY-NFR-02 | `domain/state.py`, `domain/retry.py`, services | `unit/test_payout_model.py`, `integration/test_retry.py`, `integration/test_internal_result.py` |
 | PAY-NFR-03 | `events/republish.py` | `integration/test_republish.py`, `unit/test_payout_model.py` (liveness) |
 | PAY-NFR-06 | `metrics.py` (settlement histogram) | `unit/test_metrics.py`, `integration/test_internal_result.py` |
-| PAY-NFR-07 | logging calls, redactor | `unit/test_log_redaction.py`, `integration/test_secret_not_logged.py` |
+| PAY-NFR-07 | logging calls, redactor | `integration/test_secret_not_logged.py` |
 | PAY-NFR-08 | `api/schemas.py` (`account_last4` only), `maintenance.py` | `integration/test_employees_api.py`, `integration/test_maintenance.py` |
 | PAY-NFR-09 | `events/relay.py` (traceparent) | `integration/test_outbox.py` |
 | PAY-NFR-10, PAY-NFR-11 | `metrics.py` | `unit/test_metrics.py`, `integration/test_collection_gauges.py` |
@@ -1824,6 +1830,8 @@ PAY-403, PAY-404, PAY-408 and PAY-412 are owned by payout-worker and bank-stub. 
 ## 10. Change log
 
 - 2026-11-10: incorporated README R-table and C-table decisions (R1, R2, R3, R4, R7, R8, R9, R11, R13, R21, R22, R26, R27, R33, R34, R37; C1, C2, C5, C7, C8, C9, C10, C13, C14, C17, C18, C21, C22, C23, C24, C26, C28, C29, C30, C34, C40, C44).
+
+- 2026-11-11 (S5 review, C63): NUL characters rejected in free-text request fields (§4.1); `ResultIn.attempt` ≤ 32767 (§4.7; OpenAPI `maximum`); the relay re-validates envelopes (§5.2, C60); `pay_run_exists` returns the real ID on the race path (§3.7, §4.4); the overlap check (`employee_in_overlapping_run`, §4.4 step 5) is implemented at create from S5 on, ahead of schedule edits (F2); `check_jwt_issuers` also refuses issuers other than `web` and `payout-worker` (§6.2 item 3); §1 lists the actual modules; §2.8 states that the result audit row is written only when applied; §9 file names match the suites. Also folded in C57 and C60.
 
 **Open:**
 

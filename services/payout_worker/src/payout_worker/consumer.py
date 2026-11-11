@@ -1,10 +1,12 @@
 """The worker's own consumer (design §3.2, §3.3; PAY-403, PAY-408, C21, C27).
 
 * ``XGROUP CREATE <stream> <group> 0 MKSTREAM`` (BUSYGROUP ignored).
-* Pending entries first (``XREADGROUP … <last>`` from ``0``), then new ones (``>``, BLOCK).
+* Pending entries first (``XREADGROUP … <last>`` from ``0``) at start and after NOGROUP, then new
+  ones (``>``, BLOCK); after any other Redis error the reader resumes with ``>`` (C63).
 * ``XAUTOCLAIM`` every ``PAYOUT_CLAIM_INTERVAL_S`` for entries idle ≥ ``PAYOUT_CLAIM_MIN_IDLE_MS``.
 * Delivery numbers: 1 for ``>``; ``XPENDING`` times-delivered for pending and claimed entries.
-* At most ``PAYOUT_CONCURRENCY`` handlers across the reader and the claim loop.
+* At most ``PAYOUT_CONCURRENCY`` messages held: slots are reserved before each XREADGROUP and
+  XAUTOCLAIM, which ask for no more entries than were reserved (C63).
 * After each message: ``Ack`` → XACK; ``DeadLetter`` → DLQ XADD then XACK; ``Retry`` →
   ``decide_after_failure``: leave pending, or dead-letter at the delivery budget.
 
@@ -97,12 +99,23 @@ def _text(value: bytes | str) -> str:
 
 
 class Slots:
-    """Handler slots shared by the reader and the claim loop (``PAYOUT_CONCURRENCY``)."""
+    """Handler slots shared by the reader and the claim loop (``PAYOUT_CONCURRENCY``).
+
+    Slots are **reserved before** an XREADGROUP or XAUTOCLAIM, and the read asks for at most the
+    reserved number, so the process never holds more messages than slots (C63): an entry never
+    waits for a slot outside the handler deadline while its idle time runs towards
+    ``PAYOUT_CLAIM_MIN_IDLE_MS``. Each spawned handler owns one reserved slot and releases it.
+    Reservations are served first come, first served, so the claim loop isn't starved by the
+    reader re-reserving every free slot before each blocking read.
+    """
 
     def __init__(self, n: int) -> None:
         self._n = n
         self._used = 0
         self._cond = asyncio.Condition()
+        self._next_ticket = 0
+        self._serving = 0
+        self._abandoned: set[int] = set()
 
     @property
     def free(self) -> int:
@@ -112,18 +125,44 @@ class Slots:
     def used(self) -> int:
         return self._used
 
-    async def wait_free(self) -> None:
-        async with self._cond:
-            await self._cond.wait_for(lambda: self.free > 0)
+    def _skip_abandoned(self) -> None:
+        while self._serving in self._abandoned:
+            self._abandoned.discard(self._serving)
+            self._serving += 1
 
-    async def acquire(self) -> None:
+    async def reserve(self, max_n: int | None = None) -> int:
+        """Wait (in turn) for at least one free slot, then reserve up to ``max_n`` (default: all
+        free slots). Returns the number reserved, always ≥ 1."""
+        ticket = self._next_ticket
+        self._next_ticket += 1
         async with self._cond:
-            await self._cond.wait_for(lambda: self.free > 0)
-            self._used += 1
+            try:
+                await self._cond.wait_for(lambda: self._serving == ticket and self.free > 0)
+            except asyncio.CancelledError:
+                self._abandoned.add(ticket)
+                self._skip_abandoned()
+                self._cond.notify_all()
+                raise
+            n = self.free if max_n is None else max(1, min(self.free, max_n))
+            self._used += n
+            self._serving += 1
+            self._skip_abandoned()
+            self._cond.notify_all()
+            return n
 
-    async def release(self) -> None:
+    def try_reserve(self) -> int:
+        """Reserve every free slot without waiting; 0 when none is free or someone is queued."""
+        if self._serving != self._next_ticket:
+            return 0
+        n = self.free
+        self._used += n
+        return n
+
+    async def release(self, n: int = 1) -> None:
+        if n <= 0:
+            return
         async with self._cond:
-            self._used -= 1
+            self._used -= n
             self._cond.notify_all()
 
 
@@ -251,14 +290,19 @@ class Consumer:
     # --- reading --------------------------------------------------------------------------------
 
     async def _read_loop(self) -> None:
+        """Pending-first at start and after NOGROUP only; after any other Redis error the
+        reader resumes with ``>`` (C63), so retrying entries keep their claim-idle spacing."""
         errors = 0
         group_ready = False
+        pending_first = True
         while True:
             try:
                 if not group_ready:
                     await self.ensure_group()
                     group_ready = True
-                await self._read_pending()
+                if pending_first:
+                    await self._read_pending()
+                    pending_first = False
                 while True:
                     await self._read_new()
                     errors = 0
@@ -266,7 +310,8 @@ class Consumer:
                 raise
             except RedisError as exc:
                 if await self._recover_nogroup(exc):
-                    continue  # restart at pending-first
+                    pending_first = True  # restart at pending-first (§3.3.6)
+                    continue
                 await self._backoff(errors, exc)
                 errors += 1
 
@@ -289,31 +334,41 @@ class Consumer:
         """Pending first: this consumer's PEL from ``0`` until nothing is returned (§3.3.2)."""
         last = "0"
         while True:
-            await self._slots.wait_free()
-            entries = await self._xreadgroup(last, self._slots.free, None)
-            if not entries:
-                return
-            for entry_id, fields in entries:
-                eid = _text(entry_id)
-                last = eid
-                if not fields:
-                    await self._trimmed(eid, ack=True)
-                    continue
-                if eid in self._state.in_flight:
-                    continue
-                delivery = await self._delivery_count(eid)
-                if delivery is not None:
-                    await self._spawn(StreamMessage(eid, fields), delivery)
+            reserved = await self._slots.reserve()
+            spawned = 0
+            try:
+                entries = await self._xreadgroup(last, reserved, None)
+                if not entries:
+                    return
+                for entry_id, fields in entries:
+                    eid = _text(entry_id)
+                    last = eid
+                    if not fields:
+                        await self._trimmed(eid, ack=True)
+                        continue
+                    if eid in self._state.in_flight:
+                        continue
+                    delivery = await self._delivery_count(eid)
+                    if delivery is not None:
+                        self._spawn(StreamMessage(eid, fields), delivery)
+                        spawned += 1
+            finally:
+                await self._slots.release(reserved - spawned)
 
     async def _read_new(self) -> None:
-        await self._slots.wait_free()
-        entries = await self._xreadgroup(">", self._slots.free, self._s.payout_xread_block_ms)
-        for entry_id, fields in entries:
-            eid = _text(entry_id)
-            if not fields:  # pragma: no cover  (">" never returns a nil body)
-                await self._trimmed(eid, ack=True)
-                continue
-            await self._spawn(StreamMessage(eid, fields), 1)
+        reserved = await self._slots.reserve()
+        spawned = 0
+        try:
+            entries = await self._xreadgroup(">", reserved, self._s.payout_xread_block_ms)
+            for entry_id, fields in entries:
+                eid = _text(entry_id)
+                if not fields:  # pragma: no cover  (">" never returns a nil body)
+                    await self._trimmed(eid, ack=True)
+                    continue
+                self._spawn(StreamMessage(eid, fields), 1)
+                spawned += 1
+        finally:
+            await self._slots.release(reserved - spawned)
 
     async def _trimmed(self, entry_id: str, *, ack: bool) -> None:
         log_event(_log, logging.WARNING, "queue.message.trimmed", stream_id=entry_id)
@@ -348,43 +403,55 @@ class Consumer:
                 errors += 1
 
     async def claim_once(self) -> int:
-        """One XAUTOCLAIM sweep from ``0-0``, while slots are free; returns messages handed over."""
+        """One XAUTOCLAIM sweep from ``0-0``: waits its turn for a slot, then follows the cursor
+        while slots are free; returns the messages handed over.
+
+        Each XAUTOCLAIM asks for at most the slots reserved just before it (C63)."""
         cursor = "0-0"
         handed = 0
-        while self._slots.free > 0:
-            resp: Any = await self._redis.xautoclaim(
-                self._s.payout_stream,
-                self._s.payout_group,
-                self.name,
-                min_idle_time=self._s.payout_claim_min_idle_ms,
-                start_id=cursor,
-                count=self._slots.free,
-            )
-            cursor = _text(resp[0])
-            claimed: list[Entry] = list(resp[1])
-            deleted = list(resp[2]) if len(resp) > 2 else []
-            for d in deleted:
-                await self._trimmed(_text(d), ack=False)
-            for entry_id, fields in claimed:
-                eid = _text(entry_id)
-                if not fields:  # pragma: no cover  (Redis 7 reports these as deleted)
-                    await self._trimmed(eid, ack=False)
-                    continue
-                if eid in self._state.in_flight:
-                    continue
-                delivery = await self._delivery_count(eid)
-                if delivery is None:
-                    continue
-                await self._spawn(StreamMessage(eid, fields), delivery)
-                handed += 1
+        reserved = await self._slots.reserve()
+        while True:
+            spawned = 0
+            try:
+                resp: Any = await self._redis.xautoclaim(
+                    self._s.payout_stream,
+                    self._s.payout_group,
+                    self.name,
+                    min_idle_time=self._s.payout_claim_min_idle_ms,
+                    start_id=cursor,
+                    count=reserved,
+                )
+                cursor = _text(resp[0])
+                claimed: list[Entry] = list(resp[1])
+                deleted = list(resp[2]) if len(resp) > 2 else []
+                for d in deleted:
+                    await self._trimmed(_text(d), ack=False)
+                for entry_id, fields in claimed:
+                    eid = _text(entry_id)
+                    if not fields:  # pragma: no cover  (Redis 7 reports these as deleted)
+                        await self._trimmed(eid, ack=False)
+                        continue
+                    if eid in self._state.in_flight:
+                        continue
+                    delivery = await self._delivery_count(eid)
+                    if delivery is None:
+                        continue
+                    self._spawn(StreamMessage(eid, fields), delivery)
+                    spawned += 1
+            finally:
+                await self._slots.release(reserved - spawned)
+            handed += spawned
             if cursor in {"0-0", "0"}:
+                break
+            reserved = self._slots.try_reserve()  # next page only with slots free right now
+            if reserved == 0:
                 break
         return handed
 
     # --- one message ----------------------------------------------------------------------------
 
-    async def _spawn(self, msg: StreamMessage, delivery: int) -> None:
-        await self._slots.acquire()
+    def _spawn(self, msg: StreamMessage, delivery: int) -> None:
+        """Start a handler on a slot the caller has already reserved (C63)."""
         self._state.in_flight.add(msg.id)
         task = asyncio.create_task(self._run_one(msg, delivery), name=f"payout-{msg.id}")
         self._state.tasks.add(task)

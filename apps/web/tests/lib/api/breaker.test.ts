@@ -50,6 +50,27 @@ describe("Breaker", () => {
     expect(b.acquire(59_999)).toBe("reject");
   });
 
+  // plan §4: a probe the caller aborts gives no verdict but frees the probe slot, so the
+  // breaker can't stick in half-open rejecting everything.
+  it("frees the half-open probe when the caller aborts it", async () => {
+    const b = breakerFor("payroll");
+    for (let i = 0; i < 5; i++) b.onFailure(Date.now() - 31_000);
+    const ac = new AbortController();
+    const f = resilientFetch("payroll", {
+      fetchImpl: (_r, init) =>
+        new Promise((_, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("aborted", "AbortError")),
+          );
+        }),
+    });
+    const pending = f(new Request(`${PAYROLL}/v1/x`, { signal: ac.signal }));
+    ac.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(b.current).toBe("half_open");
+    expect(b.acquire()).toBe("probe");
+  });
+
   // plan §4: while open, calls fail fast with 503 and no network call; 4xx and 500 don't count.
   it("fails fast without fetching while open, and ignores 4xx and 500", async () => {
     let calls = 0;

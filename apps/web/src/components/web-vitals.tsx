@@ -3,14 +3,18 @@
 import { useReportWebVitals } from "next/web-vitals";
 import { useEffect } from "react";
 
+import { TelemetryRoute } from "@/lib/schemas/requests";
+
 /**
  * Web Vitals and browser errors to `/api/telemetry` (web LLD §7.5). `route` is a template with
  * IDs replaced, never the real path, the query or the fragment.
  */
 export function routeTemplate(pathname: string): string {
-  return pathname
+  const t = pathname
     .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "[id]")
     .slice(0, 100);
+  // The BFF accepts templates only (TelemetryRoute); anything else is reported generically.
+  return TelemetryRoute.safeParse(t).success ? t : "/[other]";
 }
 
 export function send(payload: Record<string, unknown>): void {

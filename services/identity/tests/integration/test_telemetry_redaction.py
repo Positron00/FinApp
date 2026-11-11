@@ -14,6 +14,35 @@ NEW_PW = "invitee passphrase 0002"
 WRONG_PW = "not the passphrase 0003"
 INVITEE = "secret.invitee@example.com"
 
+BASE_FIELDS = frozenset(
+    {"ts", "level", "service", "env", "version", "logger", "event", "msg", "trace_id"}
+    | {"span_id", "request_id"}
+)
+# identity LLD §5.1: the only fields each identity log event may carry.
+ALLOWED_FIELDS: dict[str, frozenset[str]] = {
+    "identity.bootstrap.completed": frozenset({"user_id", "company_id", "mode"}),
+    "identity.bootstrap.refused": frozenset({"company_id"}),
+    "identity.bootstrap.skipped": frozenset({"company_id"}),
+    "identity.bootstrap.failed": frozenset({"reason", "detail", "error_type", "exc"}),
+    "user.invited": frozenset({"user_id", "invite_id", "actor_user_id", "roles"}),
+    "user.invite_accepted": frozenset({"user_id", "invite_id"}),
+    "invite.invalid": frozenset({"reason"}),
+    "auth.signin.succeeded": frozenset({"user_id", "ip_hash", "rehashed"}),
+    "auth.signin.failed": frozenset({"user_id", "reason", "ip_hash"}),
+    "auth.signin.rate_limited": frozenset({"scope", "ip_hash", "retry_after_s"}),
+    "auth.lockout": frozenset({"user_id", "lock_level", "lock_seconds", "ip_hash"}),
+    "auth.forbidden": frozenset({"route", "reason"}),
+    "email.queued": frozenset({"email_id", "template", "user_id"}),
+    "email.sent": frozenset({"email_id", "template", "attempts", "duration_ms"}),
+    "email.send_failed": frozenset(
+        {"email_id", "template", "attempts", "error", "next_attempt_in_s"}
+    ),
+    "email.failed": frozenset({"email_id", "template", "attempts", "error"}),
+    "email.cancelled": frozenset({"email_id", "template", "reason"}),
+    "email.relay.error": frozenset({"error"}),
+    "ratelimit.backend_error": frozenset({"component", "fail_mode", "error_type"}),
+}
+
 
 def _span_text(otel: OtelMemory) -> str:
     parts: list[str] = []
@@ -44,7 +73,8 @@ async def test_no_secret_reaches_logs_or_spans(
 ) -> None:
     """PAY-NFR-07, PAY-NFR-08: invite → email → accept → failed and successful login, fully
     instrumented; no password, raw token, JWT, client IP, email, AUDIT_IP_HASH_KEY, DB or Redis
-    password appears in any log line or span attribute."""
+    password appears in any log line or span attribute, and every identity log event carries only
+    its §5.1 fields."""
     smtp_server.messages.clear()
     jwts: list[str] = []
     async with harness(
@@ -87,6 +117,14 @@ async def test_no_secret_reaches_logs_or_spans(
         }
 
     logs = caplog_json.text
+    # Every identity log line uses a §5.1 event with only its allow-listed fields.
+    own = [r for r in caplog_json.records() if str(r["logger"]).startswith("identity.")]
+    assert own
+    for rec in own:
+        allowed = ALLOWED_FIELDS.get(rec["event"])
+        assert allowed is not None, f"unlisted identity event {rec['event']}"
+        extra = set(rec) - BASE_FIELDS - allowed
+        assert not extra, f"{rec['event']} has unlisted fields {sorted(extra)}"
     spans = _span_text(otel_memory)
     otel_logs = _otel_log_text(otel_memory)
     assert "auth.signin.failed" in logs

@@ -71,3 +71,102 @@ def test_exporter_is_read_only(redis_acl: RedisAcl) -> None:
     r.xlen(STREAM)
     with pytest.raises(NoPermissionError):
         r.set("stream:x", "1")
+
+
+USERS = ("web", "identity", "payroll", "payout-worker", "exporter")
+
+
+def _exec(acl: RedisAcl, *cmd: str, env: dict[str, str] | None = None) -> tuple[int, str]:
+    container = acl.container.get_wrapped_container()
+    code, out = container.exec_run(list(cmd), environment=env or {}, demux=False)
+    return int(code), (out or b"").decode()
+
+
+@pytest.mark.parametrize("user", USERS)
+def test_every_user_can_ping_and_none_can_script(redis_acl: RedisAcl, user: str) -> None:
+    """PAY-607, R12, C3: PING for every ACL user; EVAL, FCALL and SCRIPT give NOPERM."""
+    r = _client(redis_acl, user)
+    assert r.ping()
+    with pytest.raises(NoPermissionError):
+        r.eval("return 1", 0)
+    with pytest.raises(NoPermissionError):
+        r.fcall("f", 0)
+    with pytest.raises(NoPermissionError):
+        r.script_load("return 1")
+
+
+@pytest.mark.parametrize("user", ["web", "identity", "payroll"])
+def test_no_key_enumeration(redis_acl: RedisAcl, user: str) -> None:
+    """C63: key patterns don't filter SCAN or RANDOMKEY, so both are denied (and KEYS)."""
+    r = _client(redis_acl, user)
+    for call in (lambda: r.scan(0), r.randomkey, lambda: r.keys("*")):
+        with pytest.raises(NoPermissionError):
+            call()
+
+
+def test_payroll_cannot_touch_sessions(redis_acl: RedisAcl) -> None:
+    """PAY-607: payroll's keys are payroll:* only, so web sessions are out of reach."""
+    _client(redis_acl, "web").set("web:sess:platform-test", "1")
+    r = _client(redis_acl, "payroll")
+    with pytest.raises(NoPermissionError):
+        r.get("web:sess:platform-test")
+    assert r.set("payroll:platform-test", "1")
+
+
+def test_worker_pending_info_and_dlq_is_write_only(redis_acl: RedisAcl) -> None:
+    """PAY-607, R12: XPENDING and XINFO on the stream; only XADD and XINFO on the DLQ."""
+    r = _client(redis_acl, "payout-worker")
+    if not any(g["name"] == b"payout-worker" for g in _groups(r)):
+        r.xgroup_create(STREAM, "payout-worker", id="0", mkstream=True)
+    r.xpending(STREAM, "payout-worker")
+    r.xinfo_groups(STREAM)
+    r.xinfo_stream(STREAM)
+    r.xadd(DLQ, {"envelope": "{}"}, maxlen=10000, approximate=True)
+    r.xinfo_stream(DLQ)
+    with pytest.raises(NoPermissionError):
+        r.xrange(DLQ)
+    with pytest.raises(NoPermissionError):
+        r.set("payout-worker:x", "1")
+
+
+def test_exporter_cannot_read_string_keys(redis_acl: RedisAcl) -> None:
+    """PAY-607, R12: the exporter reads stream info only."""
+    _client(redis_acl, "web").set("web:exporter-probe", "1")
+    r = _client(redis_acl, "exporter")
+    assert r.xlen(STREAM) >= 0
+    with pytest.raises(NoPermissionError):
+        r.get("web:exporter-probe")
+
+
+def test_acl_file_holds_hashes_only(redis_acl: RedisAcl) -> None:
+    """PAY-607: the generated ACL file has SHA-256 hashes and no plaintext password."""
+    code, text = _exec(redis_acl, "cat", "/run/redis/users.acl")
+    assert code == 0
+    assert text.count("user ") == 6
+    for password in redis_acl.passwords.values():
+        assert password not in text
+
+
+def test_print_masks_hashes_and_omits_default(redis_acl: RedisAcl) -> None:
+    """PAY-607: --print gives the runbook rule strings with the hashes masked."""
+    code, text = _exec(redis_acl, "sh", "/usr/local/etc/redis/entrypoint.sh", "--print")
+    assert code == 0, text
+    lines = text.strip().splitlines()
+    assert [ln.split()[1] for ln in lines] == list(USERS)
+    assert all(" #<sha256> " in ln for ln in lines)
+    assert "-scan -randomkey" in lines[0]
+    for password in redis_acl.passwords.values():
+        assert password not in text
+
+
+def test_missing_password_env_aborts(redis_acl: RedisAcl) -> None:
+    """PAY-607: a missing password variable stops the entrypoint, naming the variable only."""
+    code, text = _exec(
+        redis_acl,
+        "sh",
+        "/usr/local/etc/redis/entrypoint.sh",
+        "--print",
+        env={"REDIS_WEB_PASSWORD": ""},
+    )
+    assert code == 1
+    assert "redis-acl: missing REDIS_WEB_PASSWORD" in text

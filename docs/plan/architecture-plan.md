@@ -1,6 +1,6 @@
 # Architecture plan: PayRun
 
-Status: v1.2 accepted 2026-11-10: the user signed off the service map, the J1–J5 scope and all ADRs · Repo: `/Users/danc/Repos/FinApp` (remote `github.com/Positron00/FinApp`, public) · First release: 0.1.0 · Specs: `docs/specs/payrun-0.1/` (aligned 2026-11-10)
+Status: v1.3, 2026-11-10 (v1.2 accepted 2026-11-10: the user signed off the service map, the J1–J5 scope and all ADRs; v1.3 folds in spec decisions C46–C63 after S1–S7) · Repo: `/Users/danc/Repos/FinApp` (remote `github.com/Positron00/FinApp`, public) · First release: 0.1.0 · Specs: `docs/specs/payrun-0.1/` (aligned 2026-11-10, through C63)
 
 ## 1. Summary
 
@@ -97,16 +97,19 @@ flowchart LR
 | `PAYOUT_REPUBLISH_AFTER_S` | 360 | 360 | Base re-publish backoff. A startup check requires it to be > `PAYOUT_MAX_DELIVERIES` × claim idle (s) + `BANK_TOTAL_DEADLINE_S` |
 | `PAYOUT_REPUBLISH_MAX_BACKOFF_S` / `PAYOUT_REPUBLISH_MAX` | 900 / 10 | same | Backoff cap; re-publishes before `needs_operator` |
 | `PAYOUT_CLAIM_MIN_IDLE_MS` | 60000 | 60000 | XAUTOCLAIM idle time. A startup check requires it to be > `BANK_TOTAL_DEADLINE_S` + 2 × `PAYOUT_PAYROLL_CALL_DEADLINE_S` + 10 s |
+| `PAYOUT_MARK_REJECTED_MIN_WAIT_S` | 120 | 120 | Shared timing key: `mark_rejected` is refused with 409 `resolve_too_early` until this long after the attempt became `needs_operator`. A startup check (payroll) requires it to be > `BANK_TOTAL_DEADLINE_S` + 2 × `PAYOUT_PAYROLL_CALL_DEADLINE_S` + 10 + 30 s (spec C48) |
+| `PAYOUT_CONSUMER_GC_IDLE_S` | 3600 | 3600 | Worker maintenance deletes stream consumers idle this long with no pending entries (`XGROUP DELCONSUMER`; spec C47) |
 | `BANK_TOTAL_DEADLINE_S` | 15 | 15 | Total deadline for one bank call, including retries |
 | `PAYOUT_PAYROLL_CALL_DEADLINE_S` | 5 | 5 | Total deadline per worker → payroll call, including retries |
 | `BANK_KEY_SAFE_WINDOW_S` | 86400 | provider's key retention | Past this age, an attempt is re-driven only via GET by key, never a new POST ([ADR 0003](../adr/0003-payout-flow.md)) |
 | `DB_STATEMENT_TIMEOUT_MS` / `DB_POOL_TIMEOUT_S` | 2000 / 2 | same | Postgres statement and pool timeouts. A timeout returns 503 `db_timeout` |
 | `REDIS_SOCKET_TIMEOUT_MS` / `PAYOUT_XREAD_BLOCK_MS` | 500 / 5000 | same | Redis client timeout; XREADGROUP block |
 | `STREAM_MAXLEN` | 100000 | 100000 | Approximate MAXLEN on `stream:payout.requested` |
+| `PAYROLL_VALIDATE_EVENTS` | true | true | payroll's internal endpoints and outbox relay validate envelopes against the JSON Schema (spec C60, C63) |
 | `MAINTENANCE_INTERVAL_S` / `PAYOUT_STUCK_AFTER_S` | 60 / 600 | same | Maintenance tick; threshold for `payroll_payouts_stuck` |
 | `BREAKER_FAILURES` / `BREAKER_RESET_S` | 5 / 30 | same | Circuit breaker per target |
 | `RETENTION_OUTBOX_DAYS` / `RETENTION_PROCESSED_EVENTS_DAYS` / `RETENTION_TOKENS_DAYS` / `RETENTION_BANK_DETAILS_DAYS` / `IDEMPOTENCY_TTL_H` | 7 / 30 / 7 / 30 / 24 | same | Purge windows (§6) |
-| `TRUSTED_PROXY_HOPS` | 0 | 1 | Client-IP extraction at the BFF |
+| `TRUSTED_PROXY_HOPS` | 0 | 1 | Client-IP extraction at the BFF: entry `n − hops` of `X-Forwarded-For`, or the right-most entry for 0 (dev). uat and prod refuse values below 1 (`config.invalid`, exit 2; spec C62) |
 | `COMPANY_ID` | fixed dev UUID | per environment | The seeded company (0.1.0 is single-company) |
 | `PAYOUT_CONCURRENCY` | 16 | 16 | Messages handled at once per worker replica (2 replicas in Kubernetes; `terminationGracePeriodSeconds: 75`) |
 | `PAYOUT_MAX_ATTEMPTS` | 5 | 5 | Maximum attempts per payout, **including the first**. A retry when `current_attempt = 5` returns 409 `retry_limit_reached` |
@@ -120,6 +123,7 @@ flowchart LR
 | `BFF_RATE_LIMIT_SESSION` / `_IP` | 120 / 300 per min | same | Raised in the test env, so k6 at 30 req/s from one IP isn't throttled; an integration test proves the production values limit |
 | `SERVICE_RATE_LIMIT_USER` / `_WORKER` | 600 / 6000 per min | same | Per-caller limit in services as defense in depth. The key is `(iss, sub)`, so per user for web tokens and per worker for `service:payout-worker`. `service:web` (public flows) is exempt and limited per IP instead (spec R18, C17) |
 | `EMAIL_MAX_ATTEMPTS` | 10 | 10 | The identity relay then marks the email `failed` (alert `EmailOutboxStuck`) |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_STARTTLS` / `SMTP_USERNAME` / `SMTP_PASSWORD` | mailpit / 1025 / false / unset / unset | provider | Unprefixed infrastructure keys, like `DB_*` (spec C49) |
 | `OTEL_TRACES_SAMPLER` | parentbased_always_on | same | Apps send every span; prod keeps errors, slow traces and 10% of the rest at the Collector (`tail_sampling`) |
 | `company_settings.require_dual_approval` | true | true | Per company, audited ([ADR 0005](../adr/0005-four-eyes-approval.md)) |
 
@@ -168,7 +172,7 @@ flowchart LR
 
 | Service | Owns (data) | Exposes (API) | Publishes / consumes | Calls (sync, timeout, fallback) | Why separate (and the merge alternative) |
 | --- | --- | --- | --- | --- | --- |
-| **web** (Next.js BFF) | Redis `web:sess:*`, `web:user-sess:*`, `web:rl:*` | Pages; `/api/*` BFF routes | — | identity and payroll: connect 1 s, read 3 s (calculate and approve: 10 s); GETs retried twice on 429/502/503/504; breaker per target. Fallback: an error page or toast with the mapped message, never stale money data | Default stack: the only public entry |
+| **web** (Next.js BFF) | Redis `web:sess:*`, `web:user-sess:*`, `web:rl:*` | Pages; `/api/*` BFF routes | — | identity and payroll: 3 s per attempt, covering connect and read (calculate and approve: 10 s; spec C62); GETs retried twice on 429/502/503/504; breaker per target. Fallback: an error page or toast with the mapped message, never stale money data | Default stack: the only public entry |
 | **identity** | schema `identity`: `users`, `credentials`, `invites`, `password_resets`, `audit_log`, `email_outbox` | `/v1/auth/*`, `/v1/users/*`, `/v1/invites/*`, `/v1/audit-log` | — (sends email from its own `email_outbox` through an in-process relay) | SMTP (Mailpit) through the resilient client's breaker and metrics (`external_requests_total{provider="smtp"}`): 5 s timeout, retried by the relay with backoff up to `EMAIL_MAX_ATTEMPTS`, then `failed`. Fallback: the email stays queued; invites and resets still succeed, and an admin can re-send an invite (`POST /v1/invites/{id}/resend`) | Credentials have a different blast radius from payroll data; this is pattern A's standard identity service. *Merge alternative:* auth tables inside payroll, which would mix credential handling with money logic and give payroll's DB role access to password hashes. Rejected |
 | **payroll** | schema `payroll`: `company_settings`, `employees`, `pay_runs`, `pay_run_hours`, `payslips`, `payouts`, `payout_attempts`, `audit_events`, `outbox`, `idempotency_keys` | `/v1/company/settings`, `/v1/employees*`, `/v1/pay-runs*`, `/v1/audit-events`, internal `/v1/internal/payouts/*` | publishes `payout.requested.v1` (outbox) | — (no outbound sync calls) | The core domain: all money rules and the run state machine in one place, with one transaction per state change |
 | **payout-worker** | schema `payouts`: `disbursements`, `processed_events` | `/livez`, `/readyz` only | consumes `payout.requested.v1` (group `payout-worker`) | payroll internal API: connect 1 s, read 2 s, 3 retries on 429/502/503/504, connect errors and read timeouts (both calls are idempotent) within `PAYOUT_PAYROLL_CALL_DEADLINE_S` (5 s), breaker. bank-stub: connect 1 s, read 5 s, 3 retries on 429/502/503/504 and timeouts, with the same Idempotency-Key, within `BANK_TOTAL_DEADLINE_S` (15 s), breaker. Fallback: leave the message pending, so it's redelivered through XAUTOCLAIM; after `PAYOUT_MAX_DELIVERIES`, report the attempt `indeterminate` (**never** `failed`) and ACK. payroll then re-publishes the same attempt with the same key until the bank gives a definite answer | Background work with its own scaling and failure profile. It isolates the slow, unreliable bank dependency from user requests. *Merge alternative:* a background task inside payroll, which would tie bank latency to API latency and make crash-mid-payout testing harder. Rejected |
@@ -268,7 +272,7 @@ sequenceDiagram
   X->>K: POST /v1/transfers (Idempotency-Key = payout_id:attempt, amount from instruction)
   K-->>X: settled | rejected(reason)  (same answer for a repeated key)
   X->>P: POST /v1/internal/payouts/{id}/result {attempt, outcome} (Idempotency-Key = event_id:outcome)
-  P->>P: attempt → settled|rejected|indeterminate (only if current and requested|indeterminate; already final → 200 with stored outcome)<br/>payout → paid|failed; run status recomputed (§2.1)
+  P->>P: attempt → settled|rejected|indeterminate (only if current and requested|indeterminate, or needs_operator for a definite settled|rejected; already final → 200 with stored outcome)<br/>payout → paid|failed; run status recomputed (§2.1)
   X->>X: disbursement = done, processed_events insert (1 tx), XACK
   U->>W: GET /api/pay-runs/{id} (polled every 2 s by TanStack Query)
 ```
@@ -294,6 +298,7 @@ sequenceDiagram
 - **payroll down when the worker needs the instruction or reports a result:** the message stays pending and is retried. After the budget it goes to `payout.requested.dlq` and alert `PayoutDLQ` fires. The attempt is still `requested`, so payroll's re-publish redrives it after recovery. `payroll_payouts_stuck` (attempts non-final for more than 10 min) raises `PayoutsStuck`.
 - **Redis loses the stream** (failover, trim): payroll's re-publish redrives every non-final attempt ([§2.1](#21-domain-rules-that-shape-the-design)).
 - **Late result for an old attempt:** payroll returns 409 `attempt_not_current`; the worker treats it as final and ACKs.
+- **Late definite answer for a blocked attempt:** a `settled` or `rejected` result for a current `needs_operator` attempt applies, because the bank's answer wins (spec R7, C42; [ADR 0003](../adr/0003-payout-flow.md) c). An `indeterminate` or `poison` report for it returns 200 and changes nothing.
 - **Concurrent retry and late result:** both lock the `pay_runs` row. A retry is only possible after a definite `rejected`, and a late result for that attempt then finds it no longer current.
 
 ### J5 Recover failed payouts
@@ -320,12 +325,12 @@ Each schema has a migrator role and a runtime role (`architecture.md` §6).
 | Schema | Main tables | Personal data | Retention (0.1.0) |
 | --- | --- | --- | --- |
 | `identity` | `users` (email, name, roles[], roles_version, status, company_id), `credentials` (argon2id hash), `invites`/`password_resets` (token hash, expiry), `audit_log` (user_id, event, ip_hash = HMAC-SHA256 keyed with `AUDIT_IP_HASH_KEY`, at), `email_outbox` (recipient, template, token reference; the rendered body with the link is never stored) | email, name, IP hash | Users are deactivated, not deleted. Tokens are purged 7 days after expiry. Audit log 400 days. Sent and failed emails purged after 7 days |
-| `payroll` | `company_settings` (incl. timezone, biweekly_anchor, require_dual_approval), `employees` (name, email, type, annual_salary_cents/hourly_rate_cents, schedule, bank_routing_enc, bank_account_enc, account_last4, bank_updated_by, bank_updated_at, status, deactivated_at), `pay_runs` (period, status, tax_bps, retirement_bps, require_dual_approval snapshot, totals, calculated_by, approved_by, approved_at, processing_since), `pay_run_hours`, `payslips` (snapshot of name and pay basis, gross/tax/deduction/net cents), `payouts` (one per payslip: current_attempt, status requested/paid/failed, no_transfer), `payout_attempts` (`UNIQUE(payout_id, attempt)`, status requested/indeterminate/needs_operator/settled/rejected, failure_reason, bank_reference, bank_snapshot_enc, requested_at, last_published_at, publish_count, final_at), `audit_events`, `outbox`, `idempotency_keys` | name, email, salary, bank details (encrypted) | Payroll records are kept (statutory retention is a post-0.1 ADR). **Bank details of deactivated employees are purged 30 days after deactivation**, if no attempt for them is non-final. The purge also nulls `bank_snapshot_enc` on their final attempts (maintenance task, with a test). Audit diffs for bank edits record only `account_last4` and the names of the changed fields. Sent outbox rows purged after 7 days. Idempotency keys expire after 24 h |
+| `payroll` | `company_settings` (incl. timezone, biweekly_anchor, require_dual_approval), `employees` (name, email, type, annual_salary_cents/hourly_rate_cents, schedule, bank_routing_enc, bank_account_enc, account_last4, bank_updated_by, bank_updated_at, status, deactivated_at), `pay_runs` (period, status, tax_bps, retirement_bps, require_dual_approval snapshot, totals, calculated_by, approved_by, approved_at, processing_since, first_final_at), `pay_run_hours`, `payslips` (snapshot of name and pay basis, gross/tax/deduction/net cents), `payouts` (one per payslip: current_attempt, status requested/paid/failed, no_transfer), `payout_attempts` (`UNIQUE(payout_id, attempt)`, status requested/indeterminate/needs_operator/settled/rejected, failure_reason, bank_reference, bank_snapshot_enc, requested_at, last_published_at, publish_count, needs_operator_at, final_at), `audit_events`, `outbox`, `idempotency_keys` | name, email, salary, bank details (encrypted) | Payroll records are kept (statutory retention is a post-0.1 ADR). **Bank details of deactivated employees are purged 30 days after deactivation**, if no attempt for them is non-final. The purge also nulls `bank_snapshot_enc` on their final attempts (maintenance task, with a test). Audit diffs for bank edits record only `account_last4` and the names of the changed fields. Sent outbox rows purged after 7 days. Idempotency keys expire after 24 h |
 | `payouts` | `disbursements` (payout_id, attempt, company_id, status submitting/done, outcome, reason, bank_reference, last_event_id, deliveries), `processed_events` | none (no account numbers are stored by the worker) | processed_events 30 days; disbursements kept |
 | `bank_stub` | `transfers` (id, idempotency_key unique, amount_cents, currency, account_last4, status, reason, bank_reference, timestamps) | last 4 digits only | dev and uat only; truncated by `stack.sh reset` |
 
 - **Migrations:** Alembic per service, with the version table in the service's own schema. Changes are expand-then-contract only. A `migrate-<svc>` one-shot (Compose) or Job (Kubernetes) runs before the service starts.
-- **Redis** (one instance, `noeviction` + AOF; **an ACL user per service**: web `~web:*`; identity `~identity:*`; payroll `~payroll:*` plus XADD on `stream:payout.requested`; payout-worker gets XREADGROUP, XACK, XAUTOCLAIM, XPENDING, XINFO and XGROUP CREATE on that stream, and XADD on the `.dlq`; it recreates its group on NOGROUP (after data loss). An integration test checks that web can't XADD; [ADR 0007](../adr/0007-data-stores.md)): `web:sess:*`, `web:user-sess:*`, `web:rl:*`, `identity:rl:*`, `payroll:rl:*`, `stream:payout.requested`, `stream:payout.requested.dlq`. Streams are written with `MAXLEN ~ 100000`, about 200× a full run.
+- **Redis** (one instance, `noeviction` + AOF; **an ACL user per service**, each with PING and none with scripting, `SCAN` or `RANDOMKEY` (spec R12, C3, C63): web `~web:*`; identity `~identity:*`; payroll `~payroll:*` plus XADD on `stream:payout.requested`; payout-worker gets XREADGROUP, XACK, XAUTOCLAIM, XPENDING, XINFO, XGROUP CREATE and XGROUP DELCONSUMER on that stream (spec C27), and XADD and XINFO on the `.dlq`; it recreates its group on NOGROUP (after data loss); a read-only `exporter` user reads stream info. An integration test checks that web can't XADD; [ADR 0007](../adr/0007-data-stores.md)): `web:sess:*`, `web:user-sess:*`, `web:rl:*`, `identity:rl:*`, `payroll:rl:*`, `stream:payout.requested`, `stream:payout.requested.dlq`. Streams are written with `MAXLEN ~ 100000`, about 200× a full run.
 
 ## 7. APIs and events
 
@@ -487,13 +492,14 @@ Loki → Grafana, plus Alertmanager. The BFF records the journey SLI with an exp
   - `payroll_attempts_needs_operator` (gauge);
   - `payroll_payouts_stuck` (gauge: attempts non-final for more than 10 min, computed per replica at metric collection);
   - `payroll_payouts_republished_total`;
-  - `rate_limiter_errors_total{component}`;
+  - `rate_limiter_errors_total{component}` and `rate_limited_total{scope}` (pycommon's limiter; services report their own denials and Redis errors through it, spec C63);
   - `payouts_bank_transfers_total{outcome, reason}`;
-  - `auth_signins_total{outcome}`;
+  - `auth_signins_total{outcome}` with `outcome` ∈ `success`, `failure`, `rate_limited` (spec C19);
   - `identity_emails_pending`, `identity_emails_failed_total` (counter), `identity_email_oldest_pending_age_seconds`;
   - `bank_stub_transfers_total{outcome}` (dev and uat);
-  - `external_requests_total{provider="bank"|"smtp"}`.
-- **Queue metrics:** `queue_*` and `outbox_*` as in `observability.md` §5.
+  - `external_requests_total{provider, operation, outcome}` with `provider` ∈ `bank`, `payroll`, `smtp` (spec R35) and `outcome` ∈ `ok`, `client_error`, `rate_limited`, `server_error`, `timeout`, `connect_error`, `breaker_open` (spec C55); `circuit_breaker_state{target}`.
+- **Queue metrics:** `queue_messages_total{stream, group, outcome}` with `outcome` ∈ `ok`, `retry`, `dlq`, pre-initialised at 0 (spec C21); `queue_processing_seconds`, `queue_consumer_lag`, `queue_dlq_messages`; `outbox_unsent`, `outbox_oldest_age_seconds`. The authoritative name and label list is platform LLD §5 plus the service LLDs (PAY-NFR-10).
+- **Naming:** gauges never use unit `1`, which the Collector's Prometheus exporter would turn into a `_ratio` suffix (spec C63).
 - **Log events of note:** `payrun.created`, `payrun.calculated`, `payrun.approved`, `payrun.completed`, `payout.result_recorded`, `payout.retry_requested`, `payout.attempt_not_current`, `payout.indeterminate`, `payout.republished`, `bank.transfer.submitted`, `bank.transfer.rejected`, `auth.signin.failed`, `auth.lockout`, `email.send_failed`. Amounts and names never appear in logs, only IDs and counts.
 - **Dashboards:** Service overview, Journeys (J1–J5), Queues and workers, Bank (stub) dependency, Platform.
 - **Alerts:**
@@ -555,7 +561,9 @@ All layers and gates come from the skill's `testing.md`, at the values below fro
 
 ### 12.1 Failure-mode table
 
-Every row with an alert has a runbook at `docs/runbooks/<AlertName>.md`, linked from the alert's `runbook_url`.
+The source of this table is the spec's high-level design §4 (spec C43): these rows mirror its log events,
+metrics and alerts. Every row with an alert has a runbook at `docs/runbooks/<AlertName>.md`, linked from
+the alert's `runbook_url`.
 
 | Fault | Expected behaviour | Test layer | Log event | Metric | Alert |
 | --- | --- | --- | --- | --- | --- |
@@ -570,12 +578,14 @@ Every row with an alert has a runbook at `docs/runbooks/<AlertName>.md`, linked 
 | Redis down | Session 503; login limiter fails closed, session limiter open; outbox holds rows; `/readyz` fails | resilience | `ratelimit.backend_error` | `rate_limiter_errors_total`, `outbox_unsent` | `OutboxStuck`, `RateLimiterErrors` |
 | Redis data loss (FLUSHALL) mid-run | Re-publish redrives non-final attempts; the run completes | resilience | `payout.republished` | `payroll_payouts_republished_total` | `PayoutsStuck` if prolonged |
 | Slow DB (2 s latency) | Requests time out at budget with 503 `db_timeout` | resilience (PR fault smoke) | `http.request` | `http_server_request_duration_seconds` | `BffAvailabilityFastBurn` |
-| Poison message (schema-invalid, amount mismatch, `payout_not_found`) | DLQ at once; `needs_operator` where the payout is known; operator resolves (PAY-502) | integration | `payout.needs_operator` | `payroll_attempts_needs_operator` | `PayoutDLQ` |
+| Poison message (schema-invalid, amount mismatch, `payout_not_found`) | DLQ at once; `needs_operator` where the payout is known; operator resolves (PAY-502) | integration | `payout.needs_operator` | `payroll_attempts_needs_operator` | `PayoutDLQ`, `PayoutNeedsOperator` |
+| Key window expired (attempt older than `BANK_KEY_SAFE_WINDOW_S`) | GET by key only, never a new POST; not found → `needs_operator` | integration | `payout.key_window_expired` | `payroll_attempts_needs_operator` | `PayoutNeedsOperator` |
 | SMTP down | Email queued; invite returns 201; failed after 10 attempts | integration | `email.send_failed` | `identity_emails_pending` | `EmailOutboxStuck` |
 | Re-publish racing a live consumer | Fresh `event_id`; both deliveries pass the instruction check; same bank key, so one transfer; the second result gets 200 with the stored outcome | integration | `payout.republished` | `payroll_payouts_republished_total` | — |
 | `indeterminate` posted after `settled` (or the reverse) | After `settled`: no change, 200. After `indeterminate`: `settled` applies | integration | `payout.result_recorded` | `payroll_payouts_total` | — |
+| Late definite answer for a `needs_operator` attempt | `settled`/`rejected` applies (the bank's answer wins); `indeterminate`/`poison` → 200, no change (spec R7, C42) | integration | `payout.result_recorded` | `payroll_payouts_total` | — |
 | Poison message looping through re-publish | Attempt `needs_operator`; re-publish stops; UI shows "blocked" | integration | `payout.needs_operator` | `payroll_attempts_needs_operator` | `PayoutNeedsOperator` |
-| Consumer group lost (NOGROUP after FLUSHALL) | The worker recreates the group from `0` with MKSTREAM; re-publish redrives | resilience | `queue.group.recreated` | — | — |
+| Consumer group lost (NOGROUP after FLUSHALL) | The worker recreates the group from `0` with MKSTREAM; re-publish redrives | integration + resilience | `queue.group.recreated`, `payout.republished` | `payroll_payouts_republished_total` | `PayoutsStuck` if prolonged |
 | Outbox relay crash | Unsent rows stay; another replica's relay (SKIP LOCKED) or the restart sends them | integration | `outbox.relay.error` | `outbox_oldest_age_seconds` | `OutboxStuck` |
 | Postgres down or failing over | `/readyz` fails; 503 `db_unavailable` fast; recovery without stuck pool connections | resilience | `db.unavailable` | `http_server_request_duration_seconds` | `BffAvailabilityFastBurn` |
 | identity down at login | BFF 503 `service_unavailable`; breaker; other journeys still work for signed-in users | resilience (PR fault smoke) | `bff.upstream_error` | `circuit_breaker_state{target="identity"}` | `BffAvailabilityFastBurn` |
@@ -653,11 +663,11 @@ The layout follows `architecture.md` §2:
 - `services/{identity,payroll,payout_worker,bank_stub}` (Python package names; the Compose and Kubernetes names use hyphens);
 - `libs/pycommon`;
 - `packages/api-client`;
-- `contracts/events/payout.requested.v1.json`;
+- `contracts/events/`: `payout.requested.v1.json`, `payout.requested.dlq.v1.json` (spec C21) and `examples/` (spec C57);
 - `deploy/{compose,observability,k8s}`;
 - `load/`;
 - `tests/resilience/`;
-- `scripts/` (`dev-env.sh`, `stack.sh`, `seed.py`, `export_openapi.py`, `ci/*.sh`);
+- `scripts/` (`dev-env.sh`, `stack.sh`, `seed.py`, `export_openapi.py`, `mint_token.py` (spec C35), `sync-k8s-assets.sh` (spec R32), `ci/*.sh`);
 - `docs/{plan,specs,adr,runbooks}`;
 - `.github/workflows/{ci,nightly}.yml`.
 
@@ -671,3 +681,5 @@ The layout follows `architecture.md` §2:
 | 2026-11-10 | Spec Step 2: lead resolutions of the low-level design issues | 37 resolutions (spec README, R1–R37), including R1, the re-publish default that failed the startup check | Plan §2.2, §5, §7, §11, §12.1 and §13 updated; new PAY-502 (operator resolution) |
 | 2026-11-10 | Spec Step 2: two independent spec reviews (contracts: 30 findings; plan alignment: 22 findings; all held) | Env var and DB role names differed between the platform and services; Lua blocked by the ACLs; web port and health route mismatch; BFF schemas didn't match service models; redrive violated a CHECK; prod worker crash-loop; skeleton tasks couldn't deliver the skeleton; and others | 45 contract decisions C1–C45 in the spec README; design bodies rewritten; plan §2, §4, §5, §6, §8 and §12.1 and ADRs 0002 and 0007 updated; PAY-NFR-15 added; tasks F4 split into F4a and F4b, with a parallel column |
 | 2026-11-10 | Spec Step 2: final decision-application review (6 breaking, 12 minor; all held) | The C48 wait was half-wired (column never set, error code missing, e2e conflict); the C50 revoke broke the audit purge; payroll's relay didn't fit pycommon's protocol; `check_metrics.sh` required series that don't exist on a healthy stack; plus label, scope and convention drift | Fixed in the design bodies; C56 (validation field paths) and C57 (example files) added; identity audit purge via a `SECURITY DEFINER` function |
+| 2026-11-10 | Implementation follow-ups S2–S7 (spec C58–C62) | Tool and dependency hygiene; dev accounts on `.local` rejected by email-validator; `lock_timeout` not mapped; SQLAlchemy instrumentation gated on its version; OTel globals leaking between test suites; Next 16 `X-Forwarded-For` behaviour | C58 (two-week rule in uv and pnpm, pytest-socket flags), C59 (`payrun.example.com`, `check_secrets` skips optional secrets), C60 (`55P03` → 503, idempotency scope), C61 (`skip_dep_check`, UUIDv7 `jti`), C62 (client IP from `n − hops`, refuse hops < 1 in uat/prod, one per-attempt timeout) |
+| 2026-11-10 | Step 5 alignment review (five independent reviews of S1–S7; spec C63) | ADR 0003 (c) and J4 dropped late definite answers on `needs_operator` attempts, and ADRs sat outside the precedence chain; gauges with unit `1` would be renamed `_ratio`; bare `OSError`/`TimeoutError` mapped to DB errors; no `fail_under`; bootstrap re-run restored `alembic_version` writes; Redis users could enumerate keys with SCAN; a missing JWT keyset only warned in dev; static test secrets; stale §2.2, §4, §6, §11, §12.1 and §17 entries | ADRs join the precedence chain (C > R > requirements > ADRs > designs > plan); ADR 0003 (c) and J4 apply a late `settled`/`rejected`; ADRs 0002, 0004 and 0008 corrected; §2.2 adds `PAYOUT_MARK_REJECTED_MIN_WAIT_S`, `PAYOUT_CONSUMER_GC_IDLE_S`, `PAYROLL_VALIDATE_EVENTS` and the SMTP keys; §4, §6, §11 labels, §12.1 (mirrors HLD §4), §17 updated; code fixes per C63 |

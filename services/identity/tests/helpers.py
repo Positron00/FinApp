@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 from typing import Any, Final
 from uuid import UUID
 
@@ -11,9 +12,11 @@ from pycommon.testing import TokenFactory
 from pydantic import SecretStr
 
 COMPANY_ID: Final = UUID("0193a000-0000-7000-8000-000000000001")
-AUDIT_KEY: Final = "k3y-for-ip-hashes-in-tests-0123456789abcdef"
+# Test secrets are generated per run, so no static credential-like literal lives in the repo
+# (C63). The "k" prefix keeps them clear of the dev-/test- startup-check prefixes.
+AUDIT_KEY: Final = "k" + secrets.token_urlsafe(32)
 BASE_URL: Final = "http://127.0.0.1:4100"
-STRONG_SECRET: Final = "s3cr3t-Value-For-Tests-0123456789"
+STRONG_SECRET: Final = "k" + secrets.token_urlsafe(24)
 # Cheap argon2 for most tests; the timing and lockout tests use the production parameters.
 FAST_ARGON2: Final[dict[str, int]] = {
     "identity_argon2_time_cost": 1,

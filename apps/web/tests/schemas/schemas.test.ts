@@ -215,5 +215,12 @@ describe("request schemas (§2.3)", () => {
     expect(
       TelemetryBody.safeParse({ type: "error", message: "x".repeat(501), route: "/" }).success,
     ).toBe(false);
+    // PAY-NFR-07, C63: `route` is a template, never free text.
+    for (const route of ["/pay-runs/[id]", "/login", "/"]) {
+      expect(TelemetryBody.safeParse({ type: "error", message: "m", route }).success).toBe(true);
+    }
+    for (const route of ["free text", "/a b", "/x?token=1", "/X", "pay-runs"]) {
+      expect(TelemetryBody.safeParse({ type: "error", message: "m", route }).success).toBe(false);
+    }
   });
 });

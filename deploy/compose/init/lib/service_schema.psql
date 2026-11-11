@@ -13,6 +13,16 @@
   \echo 'bootstrap: missing env' :runtime_env
   DO $$ BEGIN RAISE EXCEPTION 'bootstrap: required password env var is not set'; END $$;
 \endif
+-- An empty value counts as missing.
+SELECT (:'migrator_pw' = '') AS migrator_pw_empty, (:'runtime_pw' = '') AS runtime_pw_empty \gset
+\if :migrator_pw_empty
+  \echo 'bootstrap: missing env' :migrator_env
+  DO $$ BEGIN RAISE EXCEPTION 'bootstrap: required password env var is empty'; END $$;
+\endif
+\if :runtime_pw_empty
+  \echo 'bootstrap: missing env' :runtime_env
+  DO $$ BEGIN RAISE EXCEPTION 'bootstrap: required password env var is empty'; END $$;
+\endif
 
 SELECT format('CREATE ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT', :'migrator')
  WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'migrator') \gexec
@@ -43,6 +53,10 @@ SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT EXECUTE O
 -- Tables that already exist (a re-run after migrations) get the same grants.
 SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %I TO %I', :'schema', :'runtime') \gexec
 SELECT format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %I TO %I', :'schema', :'runtime') \gexec
+-- C63: the grant above would give the runtime role write access to the Alembic version table
+-- again (run_alembic_env revokes it after each upgrade), so revoke it whenever the table exists.
+SELECT format('REVOKE INSERT, UPDATE, DELETE ON TABLE %I.alembic_version FROM %I', :'schema', :'runtime')
+ WHERE to_regclass(format('%I.alembic_version', :'schema')) IS NOT NULL \gexec
 
 SELECT format('ALTER ROLE %I SET search_path = %I', :'migrator', :'schema') \gexec
 SELECT format('ALTER ROLE %I SET search_path = %I', :'runtime', :'schema') \gexec

@@ -120,3 +120,119 @@ def test_rerun_keeps_audit_log_append_only(pg_bootstrapped: PgBootstrapped) -> N
 def test_server_does_not_log_statements(pg_bootstrapped: PgBootstrapped) -> None:
     """PAY-NFR-07: passwords set by ALTER ROLE never reach the server log."""
     assert _run(pg_bootstrapped, pg_bootstrapped.admin_user, "show log_statement") == "none"
+
+
+def _psql(
+    pg: PgBootstrapped, sql_file: str, *, env: dict[str, str] | None = None, unset: str = ""
+) -> subprocess.CompletedProcess[str]:
+    """Run one init file inside the Postgres container as the bootstrap admin."""
+    prefix = f"env -u {unset} " if unset else ""
+    flags = " ".join(f"-e {k}={v}" for k, v in (env or {}).items())
+    cmd = (
+        f"docker exec {flags} {pg.container.get_wrapped_container().id} sh -c "
+        f"'cd /docker-entrypoint-initdb.d && {prefix}psql -v ON_ERROR_STOP=1 -X -q "
+        f"-U {pg.admin_user} -d payrun -f {sql_file}'"
+    )
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True, check=False)  # noqa: S602
+
+
+def test_each_migrator_owns_its_schema(pg_bootstrapped: PgBootstrapped) -> None:
+    """PAY-606, C2: <schema>_migrator owns <schema>; public has no rights on it."""
+    for schema in ("identity", "payroll", "payouts", "bank_stub"):
+        owner = _run(
+            pg_bootstrapped,
+            pg_bootstrapped.admin_user,
+            f"select nspowner::regrole::text from pg_namespace where nspname = '{schema}'",
+        )
+        assert owner == f"{schema}_migrator"
+        assert (
+            _run(
+                pg_bootstrapped,
+                pg_bootstrapped.admin_user,
+                f"select has_schema_privilege('public', '{schema}', 'USAGE')",
+            )
+            is False
+        )
+
+
+def test_default_privileges_give_runtime_dml_on_migrator_tables(
+    pg_bootstrapped: PgBootstrapped,
+) -> None:
+    """PAY-606: a table the migrator creates later is DML-able by the runtime role, no DDL."""
+    pg = pg_bootstrapped
+    _run(pg, "payouts_migrator", "create table if not exists payouts.t_defaults(i int)")
+    assert _run(pg, "payouts_app", "insert into payouts.t_defaults values (1) returning i") == 1
+    assert _run(pg, "payouts_app", "update payouts.t_defaults set i = 2 returning i") == 2
+    assert _run(pg, "payouts_app", "delete from payouts.t_defaults returning i") == 2
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        _run(pg, "payouts_app", "drop table payouts.t_defaults")
+
+
+def test_exporter_cannot_read_table_data(pg_bootstrapped: PgBootstrapped) -> None:
+    """PAY-606: postgres_exporter reads stats views only, never table rows."""
+    pg = pg_bootstrapped
+    _run(pg, "payroll_migrator", "create table if not exists payroll.t_secret(i int)")
+    assert _run(pg, "postgres_exporter", "select count(*) from pg_stat_database") >= 1
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        _run(pg, "postgres_exporter", "select * from payroll.t_secret")
+
+
+@pytest.mark.parametrize("how", ["unset", "empty"])
+def test_missing_password_fails_naming_the_variable(
+    pg_bootstrapped: PgBootstrapped, how: str
+) -> None:
+    """PAY-606: an unset or empty password variable fails with its NAME, never a value."""
+    if how == "unset":
+        result = _psql(pg_bootstrapped, "20-payroll.sql", unset="PAYROLL_DB_PASSWORD")
+    else:
+        result = _psql(pg_bootstrapped, "20-payroll.sql", env={"PAYROLL_DB_PASSWORD": ""})
+    assert result.returncode != 0
+    output = result.stdout + result.stderr
+    assert "PAYROLL_DB_PASSWORD" in output
+    assert "bootstrap: required password env var" in output
+    for password in pg_bootstrapped.passwords.values():
+        assert password not in output
+
+
+def test_rerun_rotates_a_changed_password(pg_bootstrapped: PgBootstrapped) -> None:
+    """PAY-606: re-running a file with a new password rotates it; the old one stops working."""
+    pg = pg_bootstrapped
+    original = pg.passwords["BANK_STUB_DB_PASSWORD"]
+    rotated = original[::-1] + "R"
+    try:
+        result = _psql(pg, "40-bank-stub.sql", env={"BANK_STUB_DB_PASSWORD": rotated})
+        assert result.returncode == 0, result.stderr
+        pg.passwords["BANK_STUB_DB_PASSWORD"] = rotated
+        assert _run(pg, "bank_stub_app", "select current_user") == "bank_stub_app"
+        pg.passwords["BANK_STUB_DB_PASSWORD"] = original
+        with pytest.raises(asyncpg.InvalidPasswordError):
+            _run(pg, "bank_stub_app", "select 1")
+    finally:
+        pg.passwords["BANK_STUB_DB_PASSWORD"] = original
+        assert _psql(pg, "40-bank-stub.sql").returncode == 0
+    assert _run(pg, "bank_stub_app", "select 1") == 1
+
+
+def test_rerun_keeps_alembic_version_read_only(pg_bootstrapped: PgBootstrapped) -> None:
+    """PAY-606, C63: after a re-run the runtime role can read the version table, never write it."""
+    pg = pg_bootstrapped
+    _run(
+        pg,
+        "payroll_migrator",
+        "create table if not exists payroll.alembic_version(version_num varchar(32) primary key)",
+    )
+    _run(
+        pg,
+        "payroll_migrator",
+        "revoke insert, update, delete on payroll.alembic_version from payroll_app",
+    )
+    result = _psql(pg, "20-payroll.sql")
+    assert result.returncode == 0, result.stderr
+    privileges = _run(
+        pg,
+        pg.admin_user,
+        "select string_agg(privilege_type, ',' order by privilege_type) "
+        "from information_schema.role_table_grants where table_schema='payroll' "
+        "and table_name='alembic_version' and grantee='payroll_app'",
+    )
+    assert privileges == "SELECT"

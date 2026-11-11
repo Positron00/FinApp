@@ -25,6 +25,7 @@ from pycommon.errors import (
     ValidationFailed,
     db_error_kind,
     install_handlers,
+    is_invalid_text,
 )
 from pycommon.testing import JsonLogCapture
 from pydantic import BaseModel
@@ -33,6 +34,14 @@ from starlette.exceptions import HTTPException
 from tests.helpers import make_settings
 
 SECRET_DETAIL = "internal-detail-do-not-leak"
+
+# Functions whose frames belong to a module named "asyncpg.*", as if the driver raised the error.
+_DRIVER_SHIM: dict[str, Any] = {"__name__": "asyncpg.test_shim"}
+exec(  # noqa: S102  (fixed test code: fakes a traceback frame inside the driver)
+    "def refuse():\n    raise ConnectionRefusedError(61, 'refused')\n"
+    "def time_out():\n    raise TimeoutError\n",
+    _DRIVER_SHIM,
+)
 
 
 class Entry(BaseModel):
@@ -69,7 +78,7 @@ def _router() -> APIRouter:
         return {"limit": limit}
 
     @r.get("/driver/{kind}")
-    async def driver(kind: str) -> None:
+    async def driver(kind: str) -> None:  # noqa: PLR0912  (one branch per error kind)
         if kind == "query_canceled":
             raise asyncpg.QueryCanceledError("canceling statement due to statement timeout")
         if kind == "pool_timeout":
@@ -80,6 +89,18 @@ def _router() -> APIRouter:
             )
         if kind == "oserror":
             raise ConnectionRefusedError(61, "refused")
+        if kind == "driver_oserror":
+            _DRIVER_SHIM["refuse"]()
+        if kind == "driver_timeout":
+            _DRIVER_SHIM["time_out"]()
+        if kind == "bare_timeout":
+            raise TimeoutError
+        if kind == "nul":
+            raise asyncpg.CharacterNotInRepertoireError("invalid byte sequence 0x00")
+        if kind == "nul_wrapped":
+            raise sqlalchemy.exc.DataError(
+                "INSERT", {}, asyncpg.CharacterNotInRepertoireError("0x00")
+            )
         if kind == "mapped_timeout":
             with map_db_errors("load"):
                 raise TimeoutError
@@ -191,7 +212,8 @@ def test_starlette_404_and_405(client: TestClient) -> None:
         ("query_canceled", "db_timeout", "db.timeout"),
         ("pool_timeout", "db_timeout", "db.timeout"),
         ("connection", "db_unavailable", "db.unavailable"),
-        ("oserror", "db_unavailable", "db.unavailable"),
+        ("driver_oserror", "db_unavailable", "db.unavailable"),
+        ("driver_timeout", "db_timeout", "db.timeout"),
         ("mapped_timeout", "db_timeout", "db.timeout"),
         ("redis", "service_unavailable", "redis.unavailable"),
         ("redis_timeout", "service_unavailable", "redis.unavailable"),
@@ -210,11 +232,14 @@ def test_driver_errors_map_to_503(
     assert logged["operation"] == expected
 
 
-@pytest.mark.parametrize("kind", ["boom", "programming"])
+@pytest.mark.parametrize("kind", ["boom", "programming", "oserror", "bare_timeout"])
 def test_unhandled_errors_are_500_without_internals(
     client: TestClient, caplog_json: JsonLogCapture, kind: str
 ) -> None:
-    """PAY-602: any other exception → 500 internal_error; traceback in logs, never the body."""
+    """PAY-602, C63: any other exception → 500 internal_error; traceback in logs, never the body.
+
+    A bare OSError or TimeoutError raised outside the DB driver is not a DB error (C63).
+    """
     resp = client.get(f"/driver/{kind}")
     assert resp.status_code == 500
     err = _error(resp)
@@ -271,7 +296,13 @@ def test_db_error_kind_classification() -> None:
             super().__init__("x")
             self.sqlstate = sqlstate
 
-    assert db_error_kind(TimeoutError()) == "timeout"
+    assert db_error_kind(TimeoutError()) is None  # C63: not raised inside the driver
+    assert db_error_kind(ConnectionRefusedError()) is None
+    assert db_error_kind(TimeoutError(), in_db_call=True) == "timeout"
+    assert db_error_kind(ConnectionRefusedError(), in_db_call=True) == "unavailable"
+    httpish = RuntimeError("connect failed")
+    httpish.__context__ = OSError("refused")
+    assert db_error_kind(httpish) is None
     assert db_error_kind(PgError("57014")) == "timeout"
     assert db_error_kind(PgError("55P03")) == "timeout"  # lock_timeout (S5 finding)
     assert db_error_kind(PgError("08006")) == "unavailable"
@@ -288,3 +319,25 @@ def test_db_error_kind_classification() -> None:
         raise DbTimeout()
     with pytest.raises(KeyError), map_db_errors():
         raise KeyError("not a db error")
+
+
+@pytest.mark.parametrize("kind", ["nul", "nul_wrapped"])
+def test_invalid_text_is_422_validation_error(client: TestClient, kind: str) -> None:
+    """C63: SQLSTATE 22021 (a NUL byte in text) → 422 validation_error, never 500 or 503."""
+    resp = client.get(f"/driver/{kind}")
+    assert resp.status_code == 422
+    err = _error(resp)
+    assert err["code"] == "validation_error"
+    assert err["details"] == [{"field": "body", "issue": "invalid_character"}]
+    assert "0x00" not in resp.text
+
+
+def test_map_db_errors_maps_invalid_text_to_validation_failed() -> None:
+    """C63: inside a DB call, 22021 raises ValidationFailed (422)."""
+    with pytest.raises(ValidationFailed) as info, map_db_errors("save"):
+        raise asyncpg.CharacterNotInRepertoireError("0x00")
+    assert info.value.status == 422
+    assert is_invalid_text(info.value.__cause__ or ValueError())
+    assert not is_invalid_text(ValueError("x"))
+    with pytest.raises(ValidationFailed), map_db_errors():
+        raise ValidationFailed()

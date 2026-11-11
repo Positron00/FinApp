@@ -1,0 +1,3 @@
+# Reviewed false positives only (fingerprint per finding). Each line needs a reason above it.
+# generic-api-key matched the code expression `internal_jwt_public_keys=tf.keyset` (a variable, not a secret).
+67f00185ae777f232a4db8460745ff329d8cce1b:libs/pycommon/tests/unit/test_app.py:generic-api-key:60

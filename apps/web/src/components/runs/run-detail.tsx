@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 
 import { CursorPager, useCursorStack } from "@/components/cursor-pager";
 import { ErrorBanner } from "@/components/error-banner";
@@ -57,7 +57,7 @@ export function RunDetail({ runId, me }: { runId: string; me: { id: string; role
     refetchIntervalInBackground: false,
   });
   const status = run.data?.status;
-  const [tab, setTab] = useState<"payslips" | "payouts" | null>(null);
+  const [tab, setTab] = useState<Tab | null>(null);
   const activeTab = tab ?? (run.data?.approved_at ? "payouts" : "payslips");
 
   // When polling stops at a final status, refetch the payouts once so the rows are complete.
@@ -187,30 +187,71 @@ export function RunDetail({ runId, me }: { runId: string; me: { id: string; role
         ) : null}
       </section>
 
-      <div role="tablist" aria-label="Run details" className="mt-6 flex gap-2 border-b">
-        {(["payslips", "payouts"] as const).map((t) => (
-          <button
-            key={t}
-            type="button"
-            role="tab"
-            id={`tab-${t}`}
-            aria-selected={activeTab === t}
-            aria-controls={`panel-${t}`}
-            className={`px-3 py-2 ${activeTab === t ? "border-b-2 border-brand font-semibold" : ""}`}
-            onClick={() => setTab(t)}
-          >
-            {t === "payslips" ? "Payslips" : "Payouts"}
-          </button>
-        ))}
-      </div>
-      <div role="tabpanel" id={`panel-${activeTab}`} aria-labelledby={`tab-${activeTab}`}>
-        {activeTab === "payslips" ? (
-          <PayslipsTable run={r} />
-        ) : (
-          <PayoutsTable runId={runId} polling={r.status === "processing"} />
-        )}
-      </div>
+      <RunTabs active={activeTab} onSelect={setTab} />
+      {TABS.map((t) => (
+        <div
+          key={t}
+          role="tabpanel"
+          id={`panel-${t}`}
+          aria-labelledby={`tab-${t}`}
+          hidden={t !== activeTab}
+          tabIndex={0}
+        >
+          {t !== activeTab ? null : t === "payslips" ? (
+            <PayslipsTable run={r} />
+          ) : (
+            <PayoutsTable runId={runId} polling={r.status === "processing"} />
+          )}
+        </div>
+      ))}
     </>
+  );
+}
+
+const TABS = ["payslips", "payouts"] as const;
+type Tab = (typeof TABS)[number];
+
+/**
+ * The WAI-ARIA tabs pattern (web LLD §6.3, PAY-NFR-14): a roving tabIndex (only the selected
+ * tab is in the tab order) and automatic activation with ArrowLeft/ArrowRight/Home/End.
+ */
+export function RunTabs({ active, onSelect }: { active: Tab; onSelect: (t: Tab) => void }) {
+  function onKeyDown(e: KeyboardEvent<HTMLButtonElement>) {
+    const i = TABS.indexOf(active);
+    const next =
+      e.key === "ArrowRight"
+        ? TABS[(i + 1) % TABS.length]
+        : e.key === "ArrowLeft"
+          ? TABS[(i - 1 + TABS.length) % TABS.length]
+          : e.key === "Home"
+            ? TABS[0]
+            : e.key === "End"
+              ? TABS[TABS.length - 1]
+              : undefined;
+    if (!next) return;
+    e.preventDefault();
+    onSelect(next);
+    document.getElementById(`tab-${next}`)?.focus();
+  }
+  return (
+    <div role="tablist" aria-label="Run details" className="mt-6 flex gap-2 border-b">
+      {TABS.map((t) => (
+        <button
+          key={t}
+          type="button"
+          role="tab"
+          id={`tab-${t}`}
+          aria-selected={active === t}
+          aria-controls={`panel-${t}`}
+          tabIndex={active === t ? 0 : -1}
+          className={`px-3 py-2 ${active === t ? "border-b-2 border-brand font-semibold" : ""}`}
+          onClick={() => onSelect(t)}
+          onKeyDown={onKeyDown}
+        >
+          {t === "payslips" ? "Payslips" : "Payouts"}
+        </button>
+      ))}
+    </div>
   );
 }
 

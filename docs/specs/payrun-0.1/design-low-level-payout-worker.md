@@ -15,12 +15,12 @@ All paths are under `services/payout_worker/`. The package is `payout_worker` (C
 
 | Module (path) | New / changed | Responsibility |
 |---|---|---|
-| `src/payout_worker/main.py` | New | Builds the health-only app with `pycommon.app.create_app(settings, use_jwt=False, migrations_script_location="migrations", extra_health_checks=…, startup_checks=[…] (§3.7), background=[consumer, gauge poller, maintenance], on_startup=…, shutdown_timeout_s=PAYOUT_SHUTDOWN_DRAIN_S)`: only `/livez` and `/readyz`, no routers. pycommon's lifespan runs the startup checks before any connection, sets up logging and OTel, opens the DB engine and the command Redis client; `on_startup` opens the blocking-read Redis client (§3.3.1), ensures the consumer group and pre-initialises the counters (§5.2). On shutdown pycommon sets the shared `stop` event, which runs `Consumer.stop()` (§3.3.7), then closes the clients. Entry point: `python -m pycommon.serve` with `PYCOMMON_APP=payout_worker.main:app`, `PORT=8000`, `timeout_graceful_shutdown=70`. |
-| `src/payout_worker/consumer.py` | New | `Consumer` (the worker's own; not pycommon's, C21): group creation and NOGROUP recovery, the pending-first reader, the `>` reader, the XAUTOCLAIM loop, delivery counts from XPENDING, the concurrency semaphore, the budget decision after a failed delivery (`decide_after_failure`), DLQ writes, XACK, the lag/DLQ gauge poller, graceful stop. |
+| `src/payout_worker/main.py` | New | Builds the health-only app with `pycommon.app.create_app(settings, use_jwt=False, migrations_script_location="migrations", extra_health_checks=…, startup_checks=[…] (§3.7), background=[consumer, gauge poller, maintenance], on_startup=…, shutdown_timeout_s=PAYOUT_SHUTDOWN_DRAIN_S + 5)`: only `/livez` and `/readyz`, no routers. pycommon's lifespan runs the startup checks before any connection, sets up logging and OTel, opens the DB engine and the command Redis client; `on_startup` opens the blocking-read Redis client (§3.3.1), ensures the consumer group and pre-initialises the counters (§5.2). On shutdown pycommon sets the shared `stop` event, which runs `Consumer.stop()` (§3.3.7), then closes the clients. Entry point: `python -m pycommon.serve` with `PYCOMMON_APP=payout_worker.main:app`, `PORT=8000`, `timeout_graceful_shutdown=70`. |
+| `src/payout_worker/consumer.py` | New | `Consumer` (the worker's own; not pycommon's, C21): group creation and NOGROUP recovery, the pending-first reader, the `>` reader, the XAUTOCLAIM loop, delivery counts from XPENDING, the handler slots (`Slots`, reserved before each read or claim; C63), the budget decision after a failed delivery (`decide_after_failure`), DLQ writes, XACK, the lag/DLQ gauge poller, graceful stop. |
 | `src/payout_worker/handler.py` | New | `PayoutHandler.handle(msg, delivery) -> HandleResult`: the per-message algorithm of PAY-403 (§3.1). Pure orchestration over the ports `PayrollPort`, `BankPort`, `DisbursementRepo`, `Clock`; no Redis calls (it returns an action the consumer executes). |
 | `src/payout_worker/classify.py` | New | `classify_transfer_response(...)` and `classify_lookup_response(...)`: PAY-404 rules (§3.5.3). Pure functions. |
 | `src/payout_worker/models.py` | New | Pydantic models: `Envelope`, `PayoutRequestedData`, `Instruction`, `ResultRequest`, `ResultResponse`, `TransferRequest`, `TransferResponse`, and the answer types `Settled`, `Rejected`, `NoAnswer`, `NotFound` (§2.3). `parse_envelope()` validates against `contracts/events/payout.requested.v1.json` first, then Pydantic. |
-| `src/payout_worker/errors.py` | New | Worker exception set (§3.2): `InvalidMessage`, `AttemptNotCurrent`, `PayoutNotFound`, `PayrollUnavailable`, `PayrollRejected`, `BankNoAnswer`, `WorkerInternalError`. |
+| `src/payout_worker/errors.py` | New | Worker exception set (§3.2): `InvalidMessage`, `AttemptNotCurrent`, `PayoutNotFound`, `PayrollUnavailable`, `PayrollRejected`, `WorkerInternalError`. A bank no-answer is not an exception: `classify.py` returns `NoAnswer` and the handler returns `Retry("bank", …)`. |
 | `src/payout_worker/clients/payroll.py` | New | `PayrollClient`: `get_instruction()` and `post_result()` on pycommon's `ResilientClient.request_raw` (provider `payroll`), with a JWT minted per HTTP try through `auth_headers` (§3.4). |
 | `src/payout_worker/clients/bank.py` | New | `BankClient`: `create_transfer()` and `get_transfer()` on `ResilientClient.request_raw` (provider `bank`), the ADR 0003 (e) override: non-2xx responses are returned to `classify.py`, never mapped to `ProviderRejected` (§3.5). |
 | `src/payout_worker/jwt_signer.py` | New | `WorkerJwtSigner.mint(company_id) -> str`: EdDSA token, `iss=payout-worker`, `sub=service:payout-worker`, `aud=payroll`, `cid`, 60 s (§3.6). |
@@ -28,7 +28,7 @@ All paths are under `services/payout_worker/`. The package is `payout_worker` (C
 | `src/payout_worker/db/repo.py` | New | `DisbursementRepo`: `is_processed`, `upsert_submitting`, `record_answer`, `finish`, `purge_processed_events` (§3.1.1). |
 | `src/payout_worker/settings.py` | New | `Settings(BaseServiceSettings)` (pycommon; no env prefix; names exactly as §4, C1) and the worker's extra startup checks (§3.7). |
 | `src/payout_worker/metrics.py` | New | Instruments of §5.2, created once from the global meter; `preinit()` adds 0 to every `queue_messages_total` series at start (C21); observable-gauge callbacks read the cached values the poller writes. |
-| `src/payout_worker/maintenance.py` | New | The tasks run by pycommon's `MaintenanceRunner` (lock `payout-worker:maintenance`, every `MAINTENANCE_INTERVAL_S`): purge `processed_events` older than `RETENTION_PROCESSED_EVENTS_DAYS` (PAY-608), and remove idle consumers with no pending entries from the group (§3.8). |
+| `src/payout_worker/maintenance.py` | New | The tasks run by pycommon's `MaintenanceRunner` (lock `payout-worker:maintenance`, every `MAINTENANCE_INTERVAL_S`): purge `processed_events` older than `RETENTION_PROCESSED_EVENTS_DAYS` (PAY-608), and (F4b) remove idle consumers with no pending entries from the group (§3.8). S6 ships the purge only. |
 | `migrations/` (`env.py`, `versions/0001_payouts_initial.py`) | New | Alembic via `pycommon.db.run_alembic_env(metadata, schema="payouts", runtime_role="payouts_app")`; version table `payouts.alembic_version` (§2.2). |
 | `tests/{unit,integration,contract}/` | New | §6. Resilience tests live in the repo-level `tests/resilience/`. |
 | `Dockerfile` | New | Non-root, read-only root filesystem; `ENV OTEL_SEMCONV_STABILITY_OPT_IN=http`. |
@@ -80,7 +80,7 @@ CREATE INDEX processed_events_processed_at_idx ON payouts.processed_events (proc
 ```
 
 Column notes:
-- `disbursements` is a record of tries, not a gate (plan §2.1: a `done` row never blocks a new event; the upsert resets it to `submitting`). `deliveries` counts upserts across all events for that attempt. `reason` holds the bank's rejection reason or the poison reason. `outcome` and `bank_reference` are written as soon as the bank answers (`record_answer`), before the result post, so an operator can see a settled transfer whose result post is still pending.
+- `disbursements` is a record of tries, not a gate (plan §2.1: a `done` row never blocks a new event; the upsert resets it to `submitting`). A **definite bank answer is never overwritten** (C63): once `outcome` is `settled` or `rejected`, the upsert keeps `outcome` and `reason`, and a later `record_answer` or `finish` with a non-definite outcome (`indeterminate`, `poison`, `attempt_not_current`) keeps them too. The bank's answer for one key never changes, and step 3 reports it on `attempt_not_current`. Non-definite outcomes are still cleared by the upsert. `deliveries` counts upserts across all events for that attempt. `reason` holds the bank's rejection reason or the poison reason. `outcome` and `bank_reference` are written as soon as the bank answers (`record_answer`), before the result post, so an operator can see a settled transfer whose result post is still pending.
 - `bank_reference` is at most 64 characters, as everywhere in the system (C26).
 - `processed_events` is written only for messages that were fully handled and ACKed through the normal path (§3.1 step 8). Dead-lettered messages are **not** recorded, so an operator's DLQ replay of the same `event_id` (runbook `PayoutDLQ`) is not skipped.
 - `updated_at` is set by the repository on every UPDATE (no trigger).
@@ -142,9 +142,12 @@ class Instruction(BaseModel):                  # extra="ignore"
     requested_at: AwareDatetime
 ```
 
-`routing` and `account` are `SecretStr`, unwrapped only inside `BankClient.create_transfer` when
-the request body is built. A 200 body that fails validation is treated as a payroll error
-(`PayrollRejected`, code `malformed_instruction`).
+`routing` and `account` are `SecretStr`, unwrapped only when the bank request body is built.
+`Instruction` also checks them against the bank's patterns (`^\d{9}$`, `^\d{4,17}$`) with
+`field_validator`s that raise fixed messages. A 200 body that fails validation, including those
+patterns, is a payroll error: `PayrollRejected("malformed_response")`, raised `from None`, so the
+pydantic error text (which would hold the digits) never reaches a traceback or a log (C63,
+PAY-NFR-07). The handler maps a `TransferRequest` validation failure the same way.
 
 **Result** (PAY-405; `POST /v1/internal/payouts/{id}/result`):
 
@@ -223,8 +226,9 @@ never reclaimed while a live handler can still be working on it.
    - `InvalidMessage` → poison, dead-lettered **at once** whatever the delivery count (R5,
      PAY-408). If `payout_id`, `attempt` and `company_id` are all readable, first report `poison`
      with reason `schema_invalid` (as in step 7, key `<event_id>:poison`; `event_id` comes from
-     the envelope, else from the entry's `event_id` field, else the stream entry ID is used in
-     its place). A 200 (any stored outcome) or a 409 from payroll both count as delivered. Then
+     the envelope, else from the entry's `event_id` field when it **fully** matches
+     `[A-Za-z0-9._:-]{1,190}` (`re.fullmatch`, so a trailing newline is refused; C63), else the
+     stream entry ID is used in its place). A 200 (any stored outcome) or a 409 from payroll both count as delivered. Then
      return `DeadLetter("invalid", "schema_invalid")`. If the report fails with
      `PayrollUnavailable` or `PayrollRejected`, the payroll rules of §3.2 apply (leave pending,
      then DLQ at the budget). Nothing is written to the database.
@@ -234,7 +238,7 @@ never reclaimed while a live handler can still be working on it.
 1. **Processed?** `if await repo.is_processed(env.event_id)` → `Ack("duplicate")`. No DB write, no HTTP call.
 2. **Upsert the try.** `await repo.upsert_submitting(env)` (§3.1.1). Committed on its own.
 3. **Instruction, on every delivery.** `ins = await payroll.get_instruction(payout_id, attempt, company_id)`.
-   - `AttemptNotCurrent` (409 `attempt_not_current`) → `repo.finish(env, "attempt_not_current")`, log `payout.attempt_not_current`, `Ack("attempt_not_current")`. **No bank call.**
+   - `AttemptNotCurrent` (409 `attempt_not_current`) → if `repo.definite_answer(payout_id, attempt)` holds a recorded `settled`/`rejected`, first report it as in step 7 (key `<event_id>:<outcome>`; a 409 or any 200 counts as delivered; `PayrollUnavailable`/`PayrollRejected` follow §3.2). payroll still applies a definite answer to a `needs_operator` attempt (R7), so an answer whose result post failed until the attempt left `requested` isn't lost (C63). Then `repo.finish(env, "attempt_not_current")`, log `payout.attempt_not_current` (field `reported`: the outcome reported, or null), `Ack("attempt_not_current")`. **No bank call.**
    - `PayoutNotFound` (404 `payout_not_found`: unknown payout or another company's) → poison, `DeadLetter("invalid", "payout_not_found")` at once (R5). No poison report: payroll doesn't know the payout for this `cid`, so the report would get the same 404.
    - `PayrollUnavailable` / `PayrollRejected` propagate (§3.2).
 4. **Amount check.** If `ins.amount_cents != env.data.amount_cents`, or `ins.currency`, `ins.payout_id` or `ins.attempt` differ from the event → report `poison` with reason `amount_mismatch` (step 7 rules; a 200 with any stored outcome and a 409 are both accepted), `repo.record_answer(..., outcome="poison", reason="amount_mismatch")`, log `payout.poison_reported`, return `DeadLetter("invalid", "amount_mismatch")` at once (R5, PAY-409). The amounts themselves are never logged.
@@ -268,14 +272,18 @@ class DisbursementRepo:
     async def upsert_submitting(self, env: Envelope) -> None
         # INSERT INTO payouts.disbursements (id, payout_id, attempt, company_id, status, last_event_id)
         # VALUES (:uuid7, :payout_id, :attempt, :company_id, 'submitting', :event_id)
-        # ON CONFLICT (payout_id, attempt) DO UPDATE SET status='submitting', outcome=NULL, reason=NULL,
+        # ON CONFLICT (payout_id, attempt) DO UPDATE SET status='submitting',
+        #   outcome/reason = kept when outcome IN ('settled','rejected'), else NULL (C63),
         #   last_event_id=EXCLUDED.last_event_id, deliveries=payouts.disbursements.deliveries + 1, updated_at=now()
         # (bank_reference is kept)
     async def record_answer(self, payout_id: UUID, attempt: int, outcome: str,
                             reason: str | None, bank_reference: str | None) -> None
     async def finish(self, env: Envelope, outcome: str, reason: str | None = None,
                      bank_reference: str | None = None) -> None   # one transaction, step 8.1
-    async def purge_processed_events(self, older_than: datetime) -> int
+    async def definite_answer(self, payout_id: UUID, attempt: int) -> StoredAnswer | None
+        # the recorded settled/rejected answer (outcome, reason, bank_reference), if any (C63)
+    # record_answer and finish never replace a stored settled/rejected with a non-definite outcome
+async def purge_processed_events(session: AsyncSession, older_than: datetime) -> int  # module level
 ```
 
 Every statement runs with `statement_timeout = DB_STATEMENT_TIMEOUT_MS`; a pool wait over
@@ -292,7 +300,7 @@ Every statement runs with `statement_timeout = DB_STATEMENT_TIMEOUT_MS`; a pool 
 | `AttemptNotCurrent` (result) | step 7 | — | finish, ACK | same |
 | `PayoutNotFound` (poison) | step 3 | invalid | DLQ + ACK at once | same |
 | amount / currency / id mismatch (poison) | step 4 | invalid | poison report, DLQ + ACK at once | same |
-| `BankNoAnswer` (classified `NoAnswer`, including an open breaker) | steps 5–6 | bank | leave pending (`Retry`) | post `indeterminate`, finish, ACK |
+| Bank no answer (classified `NoAnswer`, including an open breaker; `Retry("bank", reason)`) | steps 5–6 | bank | leave pending (`Retry`) | post `indeterminate`, finish, ACK |
 | `PayrollUnavailable` (timeout, connect error, 429/502/503/504 after retries, other 5xx, breaker open) | steps 0, 3, 4, 5, 7 | payroll | leave pending | DLQ + ACK |
 | `PayrollRejected` (400 `idempotency_key_required`, 401 `invalid_token`, 403 `forbidden_role`, 404 on the result, 422, other unexpected 4xx, malformed 200 body) | steps 0, 3, 4, 5, 7 | payroll | leave pending | DLQ + ACK |
 | `WorkerInternalError` (DB error or timeout, `HANDLER_DEADLINE_S` exceeded) | any | internal | leave pending | DLQ + ACK |
@@ -344,15 +352,15 @@ Both clients are built by pycommon `create_redis(settings, …)` from the C1 key
 #### 3.3.2 Start-up and reading
 
 1. `XGROUP CREATE stream:payout.requested payout-worker 0 MKSTREAM`; a `BUSYGROUP` error is ignored. `0`, not `$`, so events published before the group existed are delivered.
-2. **Pending first:** `last = "0"`; loop `XREADGROUP GROUP payout-worker <me> COUNT <free> STREAMS stream:payout.requested <last>` until it returns no entries, setting `last` to the last returned ID each time. An entry returned with a nil body (trimmed from the stream) is XACKed and logged as `queue.message.trimmed`; payroll's re-publish covers it.
+2. **Pending first** (at start and after NOGROUP recovery only; after any other Redis error the reader resumes with `>`, so retrying entries keep their claim-idle spacing and delivery counts aren't burnt; C63): `last = "0"`; loop `XREADGROUP GROUP payout-worker <me> COUNT <free> STREAMS stream:payout.requested <last>` until it returns no entries, setting `last` to the last returned ID each time. An entry returned with a nil body (trimmed from the stream) is XACKed and logged as `queue.message.trimmed`; payroll's re-publish covers it.
 3. **Then new entries:** loop `XREADGROUP GROUP payout-worker <me> COUNT <free> BLOCK PAYOUT_XREAD_BLOCK_MS STREAMS stream:payout.requested >`.
 
-`<me>` is `PAYOUT_CONSUMER_NAME` (default: the hostname, i.e. the pod name in Kubernetes or the container hostname in Compose). `<free>` is the number of free semaphore slots; the reader waits for at least one free slot before each read, so it never holds more than `PAYOUT_CONCURRENCY` messages. A Redis connection error in any loop logs `queue.read.error` and backs off with full jitter (0.5 s doubling to 30 s), then resumes.
+`<me>` is `PAYOUT_CONSUMER_NAME` (default: the hostname, i.e. the pod name in Kubernetes or the container hostname in Compose). `<free>` is the number of slots **reserved before** the read (`Slots.reserve()`: wait in turn for at least one free slot, then take every free one); unused reservations are released after the read, and each handed-over entry keeps its slot until its handler ends. The claim loop does the same before each XAUTOCLAIM. So the reader and the claim loop together never hold more than `PAYOUT_CONCURRENCY` messages, and no delivered entry waits for a slot outside the handler deadline while its idle time runs towards `PAYOUT_CLAIM_MIN_IDLE_MS` (C63). Reservations are served first come, first served, so the reader re-reserving before each blocking read can't starve the claim loop (the claim waits at most one `PAYOUT_XREAD_BLOCK_MS`). A Redis connection error in any loop logs `queue.read.error` and backs off with full jitter (0.5 s doubling to 30 s), then resumes.
 
 #### 3.3.3 Delivery counts
 
 - An entry read with `>` is delivery 1 (no extra round trip).
-- For an entry from the pending-first read or from XAUTOCLAIM, the worker calls `XPENDING stream:payout.requested payout-worker <id> <id> 1` after the read or claim and uses the returned `times-delivered` as `delivery`. XAUTOCLAIM increments the counter; whether a history read (step 2) increments it is pinned by `test_delivery_counts.py`. If it does not, the count is conservative by one (one extra try), which is safe.
+- For an entry from the pending-first read or from XAUTOCLAIM, the worker calls `XPENDING stream:payout.requested payout-worker <id> <id> 1` after the read or claim and uses the returned `times-delivered` as `delivery`. On Redis 7 both a history read (step 2) and XAUTOCLAIM increment the counter; `test_delivery_counts.py` pins it (`>` → 1, history read → 2, XAUTOCLAIM → 3; C63).
 - If XPENDING returns nothing (the entry was ACKed by another consumer meanwhile), the entry is skipped.
 
 #### 3.3.4 After each message
@@ -372,9 +380,9 @@ pre-initialised to 0 at start (§5.2).
 
 #### 3.3.5 XAUTOCLAIM loop
 
-Every `PAYOUT_CLAIM_INTERVAL_S` (10 s), while there are free slots:
+Every `PAYOUT_CLAIM_INTERVAL_S` (10 s), after reserving slots (§3.3.2; it waits its turn for at least one):
 `XAUTOCLAIM stream:payout.requested payout-worker <me> PAYOUT_CLAIM_MIN_IDLE_MS <cursor> COUNT <free>`,
-starting at cursor `0-0` and following the returned cursor until it is `0-0` or no slot is free.
+with `<free>` = the slots reserved, starting at cursor `0-0` and following the returned cursor (reserving the slots free at that moment for each page) until it is `0-0` or no slot is free.
 - Each claimed entry gets its delivery count (§3.3.3) and is handed to the handler.
 - Entry IDs XAUTOCLAIM reports as deleted (trimmed while pending) are logged as `queue.message.trimmed`; Redis has already removed them from the PEL.
 - The claim recovers both this consumer's failed messages and messages of dead consumers (another replica or a previous pod name).
@@ -393,7 +401,7 @@ step 1 if already processed. Lost entries are redriven by payroll's re-publish (
 
 #### 3.3.7 Concurrency and graceful shutdown
 
-- `asyncio.Semaphore(PAYOUT_CONCURRENCY)` (16) bounds handlers across the reader and the claim loop together. One task per message; slots are released in `finally`.
+- `Slots(PAYOUT_CONCURRENCY)` (16; `consumer.py`) bounds the messages held across the reader and the claim loop together: slots are reserved before each read or claim (§3.3.2), one task per message owns one slot, and it is released in `finally`.
 - SIGTERM → uvicorn's lifespan shutdown → pycommon sets the shared `stop` event → `Consumer.stop()`:
   1. Set `stopping`; cancel the blocking reader and the claim loop, so no new message is read or claimed (log `worker.shutdown.started`, field `in_flight`).
   2. Wait for in-flight handlers up to `PAYOUT_SHUTDOWN_DRAIN_S` (60 s; a handler is bounded by `HANDLER_DEADLINE_S` = 35 s, so normally all finish).
@@ -487,7 +495,7 @@ Rules, in order:
    - `status == "settled"` and a `bank_reference` of 1–64 characters → `Settled`.
    - `status == "rejected"` and a non-empty `reason` matching `^[a-z0-9_]{1,100}$` → `Rejected` (the **only** definite rejection).
    - anything else (invalid JSON, unknown status, `rejected` without a valid reason, `settled` without a reference, a reference over 64 characters) → `NoAnswer("malformed_body")`.
-3. Lookup only: 404 → `NotFound`.
+3. Lookup only: 404 whose body carries the bank's error code `transfer_not_found` → `NotFound`. Any other 404 (a wrong base URL, a proxy page, no code) is `NoAnswer("http_404")`, so it never becomes poison `key_window_expired` (C63).
 4. Every other status → `NoAnswer` with its reason (`http_429`, `http_5xx`, `http_401`, `http_403`, `http_404` for POST, `http_409`, `http_422`, `http_4xx_other`, `http_other` for 1xx/3xx).
 
 Nothing in this module can return `rejected` for a non-2xx response; a unit test per row proves it.
@@ -611,7 +619,7 @@ header (PAY-NFR-07); the instruction is `SecretStr`, and the redactor masks `acc
 | `bank.transfer.submitted` | info | `transfer_id`, `operation` (create/get), `bank_reference` | Bank answered settled | PAY-404 |
 | `bank.transfer.rejected` | info | `transfer_id`, `reason`, `operation` | Bank answered a definite rejection | PAY-404 |
 | `bank.transfer.no_answer` | warning | `reason` (NoAnswerReason), `http_status`, `operation`, `delivery` | No answer | PAY-404 |
-| `payout.attempt_not_current` | info | `source` (instruction/result) | 409 from payroll | PAY-403, 411 |
+| `payout.attempt_not_current` | info | `source` (instruction/result); for `instruction` also `reported` (the stored definite outcome reported first, or null; C63) | 409 from payroll | PAY-403, 411 |
 | `payout.indeterminate` | warning | `last_reason`, `delivery` | Budget reached with no bank answer | PAY-404, 408 |
 | `payout.poison_reported` | error | `reason` | Poison posted to payroll | PAY-409 |
 | `payout.key_window_expired` | error | `requested_at` | Key-window GET returned 404 | PAY-410 |
@@ -631,8 +639,8 @@ header (PAY-NFR-07); the instruction is `SecretStr`, and the redactor masks `acc
 |---|---|---|---|---|
 | `queue_messages_total` | counter | `stream`=`stream:payout.requested`, `group`=`payout-worker`, `outcome` (exactly `ok`, `retry`, `dlq`; C21) | Per handled message (§3.3.4); **pre-initialised** with `add(0)` for each of the three outcomes in `on_startup`, before the first read, so the first DLQ after a restart is a visible 0 → 1 increase | PAY-403, 408, PAY-NFR-11; alert `PayoutDLQ` |
 | `queue_processing_seconds` | histogram (0.01–60 s) | `stream`, `group` | Per handled message | PAY-NFR-10 |
-| `queue_consumer_lag` | gauge | `stream`, `group` | Poller (XINFO GROUPS `lag`) | `ConsumerLagGrowing` |
-| `queue_dlq_messages` | gauge | `stream`=`stream:payout.requested.dlq` | Poller (XINFO STREAM `length`) | PAY-408 |
+| `queue_consumer_lag` | gauge (unit `{entry}`) | `stream`, `group` | Poller (XINFO GROUPS `lag`) | `ConsumerLagGrowing` |
+| `queue_dlq_messages` | gauge (unit `{entry}`) | `stream`=`stream:payout.requested.dlq` | Poller (XINFO STREAM `length`) | PAY-408 |
 | `payouts_bank_transfers_total` | counter | `outcome` (settled, rejected, no_answer, not_found), `reason` (bank reason for rejected — `account_closed`, `insufficient_funds_at_bank`, else `other`; NoAnswerReason for no_answer; `none` otherwise) | After each classified bank call | PAY-404 |
 | `external_requests_total` | counter | `provider` (bank, payroll; R35), `operation` (create_transfer, get_transfer, get_instruction, post_result), `outcome` (pycommon: ok, client_error, rate_limited, server_error, timeout, connect_error, breaker_open) | Per HTTP try (pycommon) | plan §11; `BankErrorRateHigh` |
 | `external_request_duration_seconds` | histogram | `provider`, `operation` | Per HTTP try (pycommon) | plan §11 |
@@ -641,7 +649,7 @@ header (PAY-NFR-07); the instruction is `SecretStr`, and the redactor masks `acc
 
 A bank 2xx `rejected` is `external_requests_total{outcome="ok"}`, so `BankErrorRateHigh` excludes
 business rejections. Amounts never appear as labels. Counters are created with the name minus
-`_total` (the Collector appends it; platform §3.3).
+`_total` (the Collector appends it; platform §3.3). Gauges never use unit `"1"`, which Prometheus would turn into a `_ratio` suffix; they use the annotation unit `{entry}` (C63).
 
 ### 5.3 Spans
 
@@ -665,10 +673,11 @@ check); the bank is either the **live bank-stub app** (`bank_stub.main.create_ap
 
 | Test file | Covers | Requirement |
 |---|---|---|
-| `tests/unit/test_classify.py` | One case per row: 201 settled; 200 settled (replay); 200 rejected with reason; rejected without reason; rejected with a reason outside `^[a-z0-9_]{1,100}$`; settled without reference; settled with a 65-character reference (→ `malformed_body`); malformed JSON; unknown status; 1xx/3xx; 401; 403; 404 (POST → no answer, GET → NotFound); 409; 422; 429; 500; 502; 503; 504; timeout; connect error; breaker open. Asserts no non-2xx ever yields `Rejected` | PAY-404 |
-| `tests/unit/test_handler.py` | Every branch of §3.1 with fakes: processed skip; attempt_not_current (no bank call); payout_not_found → DLQ at once, no poison report; schema-invalid with readable IDs → poison report then DLQ at once, unreadable IDs → DLQ only, both on delivery 1; amount and currency mismatch → poison + DLQ at once; key window found settled / rejected / 404 → poison `key_window_expired` with no POST; POST settled/rejected; no answer below and at the budget (→ `indeterminate`, never `rejected`); result 409 → ACK; result 200 with each stored status (`requested`, `indeterminate`, `needs_operator`, `settled`, `rejected`) → finish and ACK, `payout.result_already_final` only for a differing final status; result key `<event_id>:<outcome>`; finish order (DB tx before ACK action) | PAY-403, 404, 405, 408, 409, 410 |
+| `tests/unit/test_classify.py` | One case per row: 201 settled; 200 settled (replay); 200 rejected with reason; rejected without reason; rejected with a reason outside `^[a-z0-9_]{1,100}$`; settled without reference; settled with a 65-character reference (→ `malformed_body`); malformed JSON; unknown status; 1xx/3xx; 401; 403; 404 (POST → no answer; GET → NotFound only with `transfer_not_found`, any other 404 body → no answer, C63); 409; 422; 429; 500; 502; 503; 504; timeout; connect error; breaker open. Asserts no non-2xx ever yields `Rejected` | PAY-404 |
+| `tests/unit/test_handler.py` | Every branch of §3.1 with fakes: processed skip; attempt_not_current (no bank call; a stored definite answer is reported first with `<event_id>:<outcome>`, C63); bank details outside the bank patterns → `Retry(payroll, malformed_response)` with no digits logged; payout_not_found → DLQ at once, no poison report; schema-invalid with readable IDs → poison report then DLQ at once, unreadable IDs → DLQ only, both on delivery 1; amount and currency mismatch → poison + DLQ at once; key window found settled / rejected / 404 → poison `key_window_expired` with no POST; POST settled/rejected; no answer below and at the budget (→ `indeterminate`, never `rejected`); result 409 → ACK; result 200 with each stored status (`requested`, `indeterminate`, `needs_operator`, `settled`, `rejected`) → finish and ACK, `payout.result_already_final` only for a differing final status; result key `<event_id>:<outcome>`; finish order (DB tx before ACK action) | PAY-403, 404, 405, 408, 409, 410 |
+| `tests/unit/test_consumer.py` | Fake Redis: DLQ fields and order, `execute` per result, XACK failure, group creation, gauges, pending-first then `>` then XAUTOCLAIM, read-error backoff and NOGROUP, claim cursor and in-flight skip, shutdown drain; `Slots` reservation and first-come order; the reader and the claim loop together never hold more than `PAYOUT_CONCURRENCY` entries, and no read or claim asks for more than it reserved (C63) | PAY-403, 408, C21 |
 | `tests/unit/test_failure_policy.py` | `decide_after_failure` table of §3.2 for every kind × below/at budget; poison kinds dead-letter at delivery 1 | PAY-408 |
-| `tests/unit/test_dlq.py` | The DLQ XADD for every `error_code` of §3.2: exactly the eight C21 fields, all strings; `MAXLEN ~ 10000` (approximate) passed; `envelope` byte-for-byte (and `""` when missing); `error` ≤ 500 characters with no amount, routing, account, token or body; XADD before XACK; a failed XADD leaves the entry pending | PAY-408, NFR-07 |
+| `tests/unit/test_dlq.py` (F4b; S6 covers these in `tests/unit/test_consumer.py`) | The DLQ XADD for every `error_code` of §3.2: exactly the eight C21 fields, all strings; `MAXLEN ~ 10000` (approximate) passed; `envelope` byte-for-byte (and `""` when missing); `error` ≤ 500 characters with no amount, routing, account, token or body; XADD before XACK; a failed XADD leaves the entry pending | PAY-408, NFR-07 |
 | `tests/unit/test_payroll_client.py` | respx: URL, query, headers (Bearer, Idempotency-Key, X-Request-Id); a fresh JWT per try; retries on 429/502/503/504, connect errors and read timeouts only (R10); 5 s `PAYOUT_PAYROLL_CALL_DEADLINE_S` with a fake clock; breaker opens after 5 failures (429 not counted) and half-opens after 30 s; mapping table of §3.4, including 400 `idempotency_key_required`, 401 `invalid_token`, 403 `forbidden_role` → `PayrollRejected` and a 200 `ResultResponse` with `outcome="requested"` parsing | PAY-405, 411 |
 | `tests/unit/test_bank_client.py` | respx: headers (`Idempotency-Key`, `X-Api-Key`); the same key on every retry; retries on 429/502/503/504, connect errors and timeouts, not on 500/4xx; 15 s total deadline; breaker counting (2xx rejected, 429 and 4xx don't count); 4xx returned, not raised | PAY-404, 412 |
 | `tests/unit/test_jwt_signer.py` | Header `alg`/`kid`; claims `iss`, `sub`, `aud`, `cid` from the event, `roles == []`, `exp − iat = 60`, unique `jti`, no `sid`, no `name` (R9); verifies with pycommon's verifier and a keyset binding the kid to `payout-worker`; rejected when the kid is bound to `web` | PAY-600 |
@@ -680,19 +689,20 @@ check); the bank is either the **live bank-stub app** (`bank_stub.main.create_ap
 | `tests/integration/test_grants.py` | `payouts_app` gets `permission denied` on `payroll.*`, `identity.*`, `bank_stub.*` | PAY-606 |
 | `tests/integration/test_redis_acl.py` | The `payout-worker` ACL user can run every command of §3.3.1 (including PING, XGROUP CREATE … MKSTREAM on a missing stream, XGROUP DELCONSUMER, XINFO STREAM on the `.dlq` key; R12, C27) and can't read `web:sess:*` or XADD to `stream:payout.requested` | PAY-607 |
 | `tests/integration/test_consumer.py` | End to end with FakePayroll + live bank-stub: message → settled result → done row + processed_event + XACK; duplicate delivery of the same entry and the same `event_id` → no second bank row, no second result | PAY-403 |
-| `tests/integration/test_delivery_counts.py` | Delivery numbers for `>` reads, pending-first reads and XAUTOCLAIM, as returned by XPENDING on Redis 7 | PAY-408 |
+| `tests/integration/test_repo.py` | `DisbursementRepo` on Postgres: a recorded `settled`/`rejected` survives a new event's upsert, an `indeterminate` record and an `attempt_not_current` finish; non-definite outcomes are still cleared (C63) | PAY-403, R7 |
+| `tests/integration/test_delivery_counts.py` | Delivery numbers as returned by XPENDING on Redis 7, pinned: `>` → 1, then a pending-first read → 2, then XAUTOCLAIM → 3 (C63) | PAY-408 |
 | `tests/integration/test_budget.py` | Bank unreachable (respx timeout) → 5 deliveries → `indeterminate` posted, ACK, no DLQ entry; payroll unreachable → 5 deliveries → DLQ entry with the fields of §3.2, ACK, `queue_messages_total{outcome="dlq"}` +1 (from the pre-initialised 0); DB timeout → DLQ at the budget | PAY-404, 408 |
 | `tests/integration/test_poison.py` | Schema-invalid entry → poison reported when IDs are readable, DLQ on the first delivery, ACK, no processed_event; amount mismatch → poison + DLQ on the first delivery; `payout_not_found` → DLQ on the first delivery; unreadable IDs → DLQ only | PAY-408, 409 |
 | `tests/integration/test_key_window.py` | Attempt older than the window: existing bank row → its status reported, no POST; missing → poison `key_window_expired`, no POST (bank-stub row count unchanged) | PAY-410 |
 | `tests/integration/test_crash_points.py` | Crash injected (cancel) after step 2, after the bank call, after the result, after the DB tx: redelivery yields one bank row and one applied result | PAY-403, NFR-02 |
-| `tests/integration/test_two_consumers.py` | Two `Consumer`s; the first is paused after the bank call, the second XAUTOCLAIMs: one bank row, both results accepted (second gets 200 stored) | PAY-403, NFR-02 |
-| `tests/integration/test_republish_race.py` | Two entries, fresh `event_id`s, same attempt: both pass the instruction check, one bank row, second result 200 with the stored outcome | PAY-405, 407 |
+| `tests/integration/test_two_consumers.py` (F4b) | Two `Consumer`s; the first is paused after the bank call, the second XAUTOCLAIMs: one bank row, both results accepted (second gets 200 stored) | PAY-403, NFR-02 |
+| `tests/integration/test_republish_race.py` (F4b; S6 has the sequential case in `test_consumer.py`) | Two entries, fresh `event_id`s, same attempt: both pass the instruction check, one bank row, second result 200 with the stored outcome | PAY-405, 407 |
 | `tests/integration/test_old_attempt.py` | Attempt 1 rejected and recorded, attempt 2 settled, attempt 1 redelivered → 409 `attempt_not_current`, no bank call, ACK | PAY-403, 411 |
-| `tests/integration/test_nogroup.py` | `XGROUP DESTROY` and `FLUSHALL` during consumption → group recreated from `0` with MKSTREAM, `queue.group.recreated` logged, new entries consumed | PAY-408 |
-| `tests/integration/test_shutdown.py` | `stop()` with 16 in-flight slow handlers: no read after stop, all finish, pending ones left unACKed when the drain times out, total under 75 s (fake clock) | PAY-408 |
+| `tests/integration/test_nogroup.py` (S6, pulled forward) | `XGROUP DESTROY` and `FLUSHALL` during consumption → group recreated from `0` with MKSTREAM, `queue.group.recreated` logged, new entries consumed | PAY-408 |
+| `tests/integration/test_shutdown.py` (F4b; S6 has the unit test in `tests/unit/test_consumer.py`) | `stop()` with 16 in-flight slow handlers: no read after stop, all finish, pending ones left unACKed when the drain times out, total under 75 s (fake clock) | PAY-408 |
 | `tests/integration/test_trace_context.py` | In-memory span exporter: the consume span's parent is the envelope's span ID and trace ID; outgoing requests carry the same trace ID | PAY-NFR-09 |
-| `tests/integration/test_no_secrets_in_logs.py` | Captured logs and spans of a full run contain none of: routing, account, `BANK_STUB_API_KEY`, the JWT, the amount | PAY-NFR-07 |
-| `tests/integration/test_maintenance.py` | processed_events older than 30 days purged, newer kept; idle consumers with no pending entries removed, a consumer with pending entries and this consumer kept; `maintenance.task.completed` logged per task (C44); a second replica skips while the lock is held | PAY-608 |
+| `tests/integration/test_no_secrets_in_logs.py` (F4b) | Captured logs and spans of a full run contain none of: routing, account, `BANK_STUB_API_KEY`, the JWT, the amount | PAY-NFR-07 |
+| `tests/integration/test_maintenance.py` | processed_events older than 30 days purged, newer kept; (F4b, with `prune_consumers`) idle consumers with no pending entries removed, a consumer with pending entries and this consumer kept; `maintenance.task.completed` logged per task (C44); a second replica skips while the lock is held | PAY-608 |
 | `tests/integration/test_readyz.py` | 503 when Postgres or Redis is down, when migrations aren't at head, when the consumer task has died, and while stopping | PAY-605 |
 | `tests/contract/test_event_contract.py` | Every example in `contracts/events/examples/payout.requested.v1.*.json` (lead-owned files, created with S5; C57) (dev `COMPANY_ID`, C28) validates against `contracts/events/payout.requested.v1.json` and parses into `Envelope`; hypothesis-jsonschema samples from the schema parse too; invalid examples fail both | PAY-402, NFR-12 |
 | `tests/contract/test_dlq_contract.py` | The DLQ field maps the worker builds for every `error_code` (including the missing-`envelope` case), decoded as the schema describes (`delivery_count` as an integer), validate against `contracts/events/payout.requested.dlq.v1.json` (C21); so does the schema's own example | PAY-408, NFR-12 |
@@ -718,10 +728,10 @@ The stateful payout model (`test_payout_model.py`, PAY-NFR-02) is owned by payro
 | Requirement | Design section | Tests |
 |---|---|---|
 | PAY-402 (consumer side: envelope, stream fields, schema) | §2.3, §3.1 step 0 | `test_models.py`, `test_event_contract.py` |
-| PAY-403 | §3.1, §3.3 | `test_handler.py`, `test_consumer.py`, `test_crash_points.py`, `test_two_consumers.py`, `test_old_attempt.py` |
+| PAY-403 | §3.1, §3.3 | `test_handler.py`, `test_consumer.py` (unit and integration), `test_repo.py`, `test_crash_points.py`, `test_old_attempt.py`; `test_two_consumers.py` (F4b) |
 | PAY-404 | §3.1 step 6, §3.5 | `test_classify.py`, `test_bank_client.py`, `test_budget.py`, `test_bank_down.py`, `test_bank_timeout_after_settle.py` |
 | PAY-405 (client side; any stored outcome accepted) | §2.3, §3.1 step 7, §3.4 | `test_handler.py`, `test_payroll_client.py`, `test_republish_race.py`, `test_provider_contracts.py` |
-| PAY-407 (worker side: fresh event IDs pass, NOGROUP) | §3.1 step 1, §3.3.6 | `test_republish_race.py`, `test_redis_data_loss.py` |
+| PAY-407 (worker side: fresh event IDs pass, NOGROUP) | §3.1 step 1, §3.3.6 | `test_consumer.py::test_republished_event_same_attempt`, `test_nogroup.py`; `test_republish_race.py` (F4b), `test_redis_data_loss.py` |
 | PAY-408 (poison at once; payroll and DB failures at the budget; DLQ fields and MAXLEN) | §3.2, §3.3 | `test_failure_policy.py`, `test_dlq.py`, `test_dlq_contract.py`, `test_budget.py`, `test_poison.py`, `test_delivery_counts.py`, `test_nogroup.py`, `test_shutdown.py`, `test_worker_crash.py`, `test_payroll_down.py` |
 | PAY-409 | §3.1 steps 0 and 4, §3.2 | `test_poison.py` (integration and resilience) |
 | PAY-410 | §3.1 step 5 | `test_handler.py`, `test_key_window.py` |
@@ -742,5 +752,7 @@ The stateful payout model (`test_payout_model.py`, PAY-NFR-02) is owned by payro
 ## Change log
 
 - 2026-11-10: incorporated README R-table and C-table decisions (R1, R2, R5, R6, R7, R9, R10, R11, R12, R13, R14, R27, R35; C1, C2, C21, C22, C23, C24, C26, C27, C28, C29, C30, C32, C34, C44).
+
+- 2026-11-10 (Step 5, C63): slots reserved before each XREADGROUP/XAUTOCLAIM (never more than `PAYOUT_CONCURRENCY` held; FIFO reservations); pending-first only at start and after NOGROUP; a stored definite bank answer is kept in `disbursements` and reported on `attempt_not_current`; bank 404 is NotFound only with `transfer_not_found`; `Instruction` checks the bank patterns (→ `malformed_response`, raised `from None`); keys use `fullmatch`; gauges use unit `{entry}`; delivery counts pinned; `test_nogroup.py` and `test_repo.py` added, the remaining §6 rows marked F4b. Also folded in: no `BankNoAnswer` class, `shutdown_timeout_s = PAYOUT_SHUTDOWN_DRAIN_S + 5`, `prune_consumers` is F4b.
 
 Resolved after the change log entry: C46 (`PAYOUT_PAYROLL_*` keys), C47 (`COMPANY_ID` for every service, `PAYOUT_CONSUMER_GC_IDLE_S`, startup reason `not_deployable`). Nothing is open.

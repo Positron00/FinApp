@@ -71,6 +71,9 @@ const ROWS: [code: string, status: number, message: string][] = [
   ["pay_run_not_found", 404, "That pay run wasn't found."],
   ["payslip_not_found", 404, "That payslip wasn't found."],
   ["payout_not_found", 404, "That payout wasn't found."],
+  // C63: pycommon's generic status codes are catalogued too.
+  ["unsupported_media_type", 415, "That request format isn't supported."],
+  ["conflict", 409, "That change conflicts with the current state. Reload and try again."],
 ];
 
 describe("mapUpstreamError", () => {

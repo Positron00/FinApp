@@ -1,6 +1,6 @@
 # Tasks: PayRun 0.1.0
 
-Status (2026-11-11): S1–S7 done; S8 next. Release 0.1.0. Skeleton tasks (S*) run on `main`; feature,
+Status (2026-11-10): S1–S7 done, plus the Step 5 alignment fixes (C63); S8 next. Release 0.1.0. Skeleton tasks (S*) run on `main`; feature,
 hardening and release tasks (F*, H*, R1) run on `release/0.1.0`.
 
 **Rules for every task:**
@@ -40,13 +40,13 @@ The skeleton journey: sign in as the seeded owner → create a monthly run for s
 
 | ID | Task | Covers | Depends | Parallel with | Done when | Est. | Status |
 |---|---|---|---|---|---|---|---|
-| S1 | Repo scaffold: uv and pnpm workspaces, `.gitignore`, `.editorconfig`, pre-commit (ruff, Prettier, ESLint, gitleaks), pinned versions, `scripts/dev-env.sh` (all secrets and keys from plan §8) | PAY-NFR-12 | — | — | `uv sync --locked`, `pnpm install --frozen-lockfile` pass; `dev-env.sh` makes a complete `.env` idempotently | 2 h | done (2026-11-10) |
+| S1 | Repo scaffold: uv and pnpm workspaces, `.gitignore`, `.editorconfig`, pre-commit (ruff, Prettier, shellcheck, gitleaks; ESLint runs in CI, not as a hook), pinned versions, `scripts/dev-env.sh` (all secrets and keys from plan §8) | PAY-NFR-12 | — | — | `uv sync --locked`, `pnpm install --frozen-lockfile` pass; `dev-env.sh` makes a complete `.env` idempotently (`tests/platform/test_dev_env.py`) | 2 h | done (2026-11-10; `test_dev_env.py` added in Step 5) |
 | S2 | `libs/pycommon`: settings, JSON logging with redaction, OTel, errors, issuer-bound JWT verify and sign, health, DB, Redis Streams (producer, `RelayLoop` over an owner repository; no consumer base, C22), resilient client, rate limiter, startup checks, maintenance runner, `create_app` | PAY-600, PAY-602, PAY-603, PAY-605, PAY-NFR-07 | S1 | — | Unit tests pass at ≥ 90% coverage | 6 h | done (2026-11-10) |
-| S3 | DB bootstrap SQL (4 schemas, migrator and runtime roles, exporter role) and the Redis ACL file generation | PAY-606, PAY-607 | S2 | — | Integration: grants test passes; web ACL user can't XADD | 2 h | done (2026-11-10; `tests/platform`, 17 tests) |
-| S4 | identity skeleton: users and credentials tables, `bootstrap_owner` CLI, `POST /v1/auth/login`, `GET /v1/users/me`, invite and accept (for the seed), email relay to Mailpit | PAY-100, PAY-101, PAY-103, PAY-104, PAY-110 | S3 | S5 | Unit and integration tests pass; `openapi.json` exported | 5 h | done (2026-11-10; 98% coverage) |
+| S3 | DB bootstrap SQL (4 schemas, migrator and runtime roles, exporter role) and the Redis ACL file generation | PAY-606, PAY-607 | S2 | — | Integration: grants test passes; web ACL user can't XADD | 2 h | done (2026-11-10; `tests/platform`; Step 5 added the remaining platform LLD §6.2 cases, the `alembic_version` re-revoke and `-scan -randomkey`, C63) |
+| S4 | identity skeleton: users and credentials tables, `bootstrap_owner` CLI, `POST /v1/auth/login`, `GET /v1/users/me`, invite and accept (for the seed), email relay to Mailpit | PAY-100, PAY-101, PAY-103, PAY-104, PAY-110 | S3 | S5 | Unit and integration tests pass; `openapi.json` exported | 5 h | done (2026-11-10; 98% coverage; the email gauges were added in Step 5, C63) |
 | S5 | payroll skeleton: settings seed and `PUT /v1/company/settings`, employees (create, list), runs (create monthly, calculate, approve), payouts and attempts, outbox relay, internal instruction and result endpoints, run status rule | PAY-200, PAY-201, PAY-202, PAY-204, PAY-300, PAY-302, PAY-303, PAY-400, PAY-402, PAY-405, PAY-406, PAY-411 | S3 | S4 | Unit (calc properties) and integration (outbox, approve) tests pass; `openapi.json` and event schema committed | 8 h | done (2026-11-10; 98% coverage; stateful payout model started) |
-| S6 | payout-worker (consume, instruction, bank, result, idempotency) and bank-stub (persistent ledger) | PAY-403, PAY-404, PAY-412 | S3, S5 | S7 | Integration: outbox → stream → worker → bank → result path passes; duplicate delivery is a no-op | 6 h | done (2026-11-11; bank-stub 100%, worker 98%; key window and NOGROUP pulled forward from F4b) |
-| S7 | web: Next.js app, session and requireSession, internal JWT, generated api-client, login page, a minimal run page (create, calculate, approve, status), proxy.ts with CSP, OTel and pino | PAY-104, PAY-106, PAY-600, PAY-601, PAY-604, PAY-413 | S4, S5 | S6 | Vitest passes; `next build` passes with no secrets; contract drift check passes | 6 h | done (2026-11-11; 93% line coverage; R36 spike resolved, C62) |
+| S6 | payout-worker (consume, instruction, bank, result, idempotency) and bank-stub (persistent ledger) | PAY-403, PAY-404, PAY-408, PAY-410, PAY-412 | S3, S5 | S7 | Integration: outbox → stream → worker → bank → result path passes; duplicate delivery is a no-op | 6 h | done (2026-11-10; bank-stub 100%, worker 98%; key window (PAY-410) and NOGROUP recovery (PAY-408) pulled forward from F4b) |
+| S7 | web: Next.js app, session and requireSession, internal JWT, generated api-client, login page, a minimal run page (create, calculate, approve, status), proxy.ts with CSP, OTel and pino | PAY-104, PAY-106, PAY-600, PAY-601, PAY-604, PAY-413 | S4, S5 | S6 | Vitest passes; `next build` passes with no secrets; contract drift check passes | 6 h | done (2026-11-10; 93% line coverage; R36 spike resolved, C62) |
 | S8 | Compose (core, obs, test), `stack.sh`, Collector, Prometheus, Alertmanager and alert-sink, Tempo, Loki, Grafana (Service overview dashboard), `seed.py --skeleton` (5 salaried monthly employees, one calculated and one draft run, JSON summary), `mint_token.py`; tests at every layer: Schemathesis per service, one Playwright `@skeleton` journey (`skeleton.spec.ts`) with the trace assertion, k6 smoke, one Toxiproxy fault (slow DB) | PAY-609, PAY-NFR-09, PAY-NFR-13, PAY-NFR-15 | S6, S7 | — | `stack.sh up` is healthy; e2e trace spans web → payroll → worker → bank-stub; Loki logs link; k6 smoke meets thresholds | 8 h | |
 | S9 | Kubernetes base and overlays (dev, uat, prod), Jobs, NetworkPolicies; CI `ci.yml` and `nightly.yml` calling `scripts/ci/*.sh`, with every gate at its final threshold | PAY-NFR-12, PAY-NFR-13 | S8 | — | kubeconform passes on every overlay; every `scripts/ci/*.sh` passes locally | 5 h | |
 | S10 | First push: secret scan; fold the checkpoints into one commit; push `main`; fix CI until green | PAY-NFR-12 | S9 | — | First CI run on `main` is green | 2 h | |
@@ -56,10 +56,10 @@ The skeleton journey: sign in as the seeded owner → create a monthly run for s
 | ID | Task | Covers | Depends | Parallel with | Done when | Est. | Status |
 |---|---|---|---|---|---|---|---|
 | F1 | identity complete: resend invite, password reset, user admin (roles, deactivate, last-admin and self rules), `roles_version`, auth audit, lockout with production values, email retry limits, maintenance purges | PAY-102, PAY-105, PAY-107, PAY-108, PAY-109, PAY-110, PAY-608 | S10 | F2, F4b | identity unit and integration tests pass at ≥ 85% coverage | 6 h | |
-| F2 | payroll setup: settings PUT with audit, employees read, update and deactivate, bank-edit tracking, field-key rotation, audit events endpoint | PAY-200, PAY-202, PAY-203, PAY-204 | S10 | F1, F4b | payroll unit and integration tests pass | 4 h | |
-| F3 | payroll runs complete: biweekly periods, overlap check, hours, hourly calculation, delete, list endpoints, payslips, dual approval with snapshot | PAY-300, PAY-301, PAY-302, PAY-303, PAY-304, PAY-401, PAY-NFR-01 | F2 | F1, F4b | Property tests (PAY-NFR-01) and dual-approval tests pass | 6 h | |
+| F2 | payroll setup: settings PUT with audit, employees read, update and deactivate, bank-edit tracking, field-key rotation, audit events endpoint; the run-overlap check (PAY-300), moved from F3 so it exists before schedule edits (C63) | PAY-200, PAY-202, PAY-203, PAY-204, PAY-300 | S10 | F1, F4b | payroll unit and integration tests pass | 4 h | |
+| F3 | payroll runs complete: biweekly periods, hours, hourly calculation, delete, list endpoints, payslips, dual approval with snapshot | PAY-300, PAY-301, PAY-302, PAY-303, PAY-304, PAY-401, PAY-NFR-01 | F2 | F1, F4b | Property tests (PAY-NFR-01) and dual-approval tests pass | 6 h | |
 | F4a | Payroll payout robustness: retry, payout list with history, operator resolution (redrive, mark_rejected), re-publish with backoff, needs_operator, scrape-free gauges, maintenance purges (bank details, snapshots), the stateful payout model | PAY-407, PAY-409, PAY-500, PAY-501, PAY-502, PAY-608, PAY-NFR-02, PAY-NFR-03 | F3 | F1, F4b | `test_payout_model.py` and every payroll-side §12.1 integration row pass | 6 h | |
-| F4b | Worker robustness: poison and DLQ (schema `payout.requested.dlq.v1`), key window (GET only), NOGROUP recovery, graceful shutdown, delivery budget to indeterminate, counter pre-initialisation | PAY-403, PAY-404, PAY-408, PAY-409, PAY-410, PAY-NFR-02, PAY-NFR-03 | S10 | F1, F2, F3 | Every worker-side §12.1 integration row passes | 4 h | |
+| F4b | Worker robustness: poison and DLQ (schema `payout.requested.dlq.v1`), graceful shutdown, delivery budget to indeterminate, counter pre-initialisation, idle-consumer pruning (`XGROUP DELCONSUMER`, C47). The key window and NOGROUP recovery were done in S6 | PAY-403, PAY-404, PAY-408, PAY-409, PAY-NFR-02, PAY-NFR-03 | S10 | F1, F2, F3 | Every worker-side §12.1 integration row passes | 4 h | |
 | F5 | web complete: accept, reset, users, settings, employees, run list and detail (payslips and payouts tabs, polling, badges), retry, operator resolve dialog, audit pages; role re-check; rate limits; telemetry endpoint; error mapping | PAY-102, PAY-103, PAY-105, PAY-107, PAY-108, PAY-109, PAY-413, PAY-501, PAY-502, PAY-602, PAY-603, PAY-604, PAY-NFR-14 | F1, F3, F4a, F4b | — | Vitest ≥ 80% coverage; `next build` passes | 8 h | |
 | F6 | e2e for J1–J5 (access, employees, pay run, approve-pay, recover, role change, errors, trace, a11y); k6 `full.js` and `settlement.js`; `seed.py --employees 500` | PAY-NFR-05, PAY-NFR-06, PAY-NFR-09, PAY-NFR-14, PAY-609 | F5 | — | All Playwright specs pass on the stack | 6 h | |
 
@@ -67,7 +67,7 @@ The skeleton journey: sign in as the seeded owner → create a monthly run for s
 
 | ID | Task | Covers | Depends | Parallel with | Done when | Est. | Status |
 |---|---|---|---|---|---|---|---|
-| H1 | Gates at thresholds; every failure-table row (HLD §4) implemented with its test, log event and metric; resilience suite (worker kill, bank down and timeout, bank-stub restart, payroll down, Redis down and FLUSHALL, Postgres down, identity down, SMTP down) | PAY-NFR-02, PAY-NFR-03, PAY-NFR-12, PAY-NFR-15 | F6 | — | `tests/resilience` passes; all PR gates green locally | 8 h | |
+| H1 | Gates at thresholds; every failure-table row (HLD §4) implemented with its test, log event and metric; resilience suite (worker kill, bank down and timeout, bank-stub restart, payroll down, Redis down and FLUSHALL, Postgres down, identity down, SMTP down) | PAY-NFR-02, PAY-NFR-03, PAY-NFR-12, PAY-NFR-15 | F6 | — | `tests/resilience` passes; all PR gates green locally; the C61 bank-stub unit flake is reproduced and fixed or closed with its cause recorded (no retries); the C61 isolation gap is closed: the payout-worker unit, integration and contract suites pass in **one** pytest process (`pycommon.testing` keeps one provider set, C63) | 8 h | |
 | H2 | Full and soak load against the SLOs, with the capacity recorded in the plan; all five dashboards; every alert rule with a promtool test and a runbook; alert drills through Alertmanager to the sink | PAY-NFR-04, PAY-NFR-05, PAY-NFR-06, PAY-NFR-10, PAY-NFR-11 | H1 | — | SLOs met; each paging alert drilled; runbooks exist | 6 h | |
 | H3 | Security review (authz in every handler, JWT audiences and issuers, CSRF and Origin, rate limits, headers and CSP, no secrets in logs, non-root images, NetworkPolicies, audits); privacy checks; nightly workflow run on the release branch | PAY-601, PAY-604, PAY-NFR-07, PAY-NFR-08, PAY-NFR-12 | H2 | — | Review findings fixed; nightly passes once | 4 h | |
 
@@ -97,7 +97,7 @@ The skeleton journey: sign in as the seeded owner → create a monthly run for s
 | PAY-202 | S5, F2 |
 | PAY-203 | F2 |
 | PAY-204 | S5, F2 |
-| PAY-300 | S5, F3 |
+| PAY-300 | S5, F2, F3 |
 | PAY-301 | F3 |
 | PAY-302 | S5, F3 |
 | PAY-303 | S5, F3 |
@@ -110,9 +110,9 @@ The skeleton journey: sign in as the seeded owner → create a monthly run for s
 | PAY-405 | S5 |
 | PAY-406 | S5 |
 | PAY-407 | F4a |
-| PAY-408 | F4b |
+| PAY-408 | S6, F4b |
 | PAY-409 | F4a, F4b |
-| PAY-410 | F4b |
+| PAY-410 | S6 |
 | PAY-411 | S5 |
 | PAY-412 | S6 |
 | PAY-413 | S7, F5 |

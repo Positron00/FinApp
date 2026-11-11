@@ -12,6 +12,7 @@ from uuid import UUID
 import httpx
 from bank_stub.db.repo import NewTransfer, TransferRow
 from bank_stub.main import build_app
+from bank_stub.metrics import Metrics
 from bank_stub.runtime import Runtime
 from bank_stub.settings import Settings
 from fastapi import FastAPI
@@ -20,7 +21,7 @@ from pydantic import SecretStr
 COMPANY_ID = UUID("0193a000-0000-7000-8000-000000000001")
 # Built at runtime so no literal looks like a credential (testing.md §9).
 API_KEY = secrets.token_hex(20)
-STRONG_SECRET = "s3cr3t-Value-For-Tests-0123456789"
+STRONG_SECRET = secrets.token_urlsafe(24)
 ROUTING = "021000021"
 ACCOUNT = "000123456789"
 CLOSED_ACCOUNT = "000123450000"
@@ -100,6 +101,28 @@ async def running(
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
         async with httpx.AsyncClient(transport=transport, base_url="http://bank-stub") as client:
             yield app, client
+
+
+@contextlib.asynccontextmanager
+async def stubbed(
+    settings: Settings,
+) -> AsyncIterator[tuple[FastAPI, httpx.AsyncClient, Runtime]]:
+    """The real app (routes, middleware, error handlers) with a **stub lifespan** for unit tests:
+    no pycommon lifecycle (no logging reconfiguration, engine, startup checks or loop-lag
+    ticker), just a ``Runtime`` over ``FakeRepo`` and a recording sleep (C61, C63)."""
+    app = build_app(settings, instrument=False)
+
+    @contextlib.asynccontextmanager
+    async def stub_lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        yield
+
+    app.router.lifespan_context = stub_lifespan
+    rt = Runtime(settings=settings, repo=FakeRepo(), metrics=Metrics.create(), sleep=Sleeps())
+    app.state.bank_stub = rt
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://bank-stub") as client:
+            yield app, client, rt
 
 
 def runtime(app: FastAPI) -> Runtime:

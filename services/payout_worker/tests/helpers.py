@@ -11,6 +11,7 @@ from uuid import UUID
 
 import httpx
 from payout_worker.classify import BankCallResult
+from payout_worker.db.repo import StoredAnswer
 from payout_worker.errors import WorkerError
 from payout_worker.metrics import Metrics
 from payout_worker.models import (
@@ -37,9 +38,10 @@ ROUTING = "021000021"
 ACCOUNT = "000123456789"
 # Built at runtime so no literal looks like a credential (testing.md §9).
 API_KEY = secrets.token_hex(20)
-STRONG_SECRET = "s3cr3t-Value-For-Tests-0123456789"
+STRONG_SECRET = secrets.token_urlsafe(24)
 BANK_REF = "BSR-0123456789ABCDEF"
 KEY = f"{PAYOUT_ID}:1"
+NOT_FOUND_BODY = {"error": {"code": "transfer_not_found", "message": "No transfer."}}
 
 TOKENS = TokenFactory.create()
 
@@ -199,7 +201,7 @@ class FakeBank:
 
     async def get_transfer(self, key: str) -> BankCallResult:
         self.get_calls.append(key)
-        return self.lookups.pop(0) if self.lookups else bank_response(404, {"error": {}})
+        return self.lookups.pop(0) if self.lookups else bank_response(404, NOT_FOUND_BODY)
 
 
 @dataclass
@@ -207,6 +209,7 @@ class FakeRepo:
     processed: set[UUID] = field(default_factory=set)
     calls: list[tuple[str, Any]] = field(default_factory=list)
     fail: WorkerError | None = None
+    stored: StoredAnswer | None = None
 
     async def is_processed(self, event_id: UUID) -> bool:
         self.calls.append(("is_processed", event_id))
@@ -236,6 +239,10 @@ class FakeRepo:
     ) -> None:
         self.calls.append(("finish", (outcome, reason, bank_reference)))
         self.processed.add(env.event_id)
+
+    async def definite_answer(self, payout_id: UUID, attempt: int) -> StoredAnswer | None:
+        self.calls.append(("definite_answer", (payout_id, attempt)))
+        return self.stored
 
     def names(self) -> list[str]:
         return [c[0] for c in self.calls]

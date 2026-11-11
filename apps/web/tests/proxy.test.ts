@@ -22,19 +22,22 @@ describe("proxy", () => {
     "/api/telemetry",
     "/api/livez",
     "/api/readyz",
+    "/api/pay-runs",
+    "/api/no-such-path",
   ])("lets %s through without a cookie", (p) => {
     const res = proxy(req(p));
     expect(res.status).toBe(200);
     expect(res.headers.get("x-middleware-next")).toBe("1");
   });
 
-  // PAY-106: /api/* without the cookie → 401 JSON.
-  it("answers 401 JSON for /api/* without a cookie", async () => {
+  // PAY-604, C63: /api/* is never gated here, so the route handler answers 401 (or 404 for
+  // an unknown path) with x-request-id, x-trace-id and Cache-Control; the proxy adds no body.
+  it("never answers /api/* itself", () => {
     const res = proxy(req("/api/pay-runs"));
-    expect(res.status).toBe(401);
-    const body = (await res.json()) as { error: { code: string; request_id: string } };
-    expect(body.error.code).toBe("unauthenticated");
-    expect(body.error.request_id).toBe(res.headers.get("x-request-id"));
+    expect(res.headers.get("x-middleware-next")).toBe("1");
+    expect(res.headers.get("x-middleware-request-x-request-id")).toBe(
+      res.headers.get("x-request-id"),
+    );
   });
 
   // PAY-106: a page without the cookie → 307 /login?next=<path+search>.

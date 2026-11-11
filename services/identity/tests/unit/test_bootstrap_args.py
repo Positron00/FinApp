@@ -50,12 +50,14 @@ def test_parse_defaults_and_flags() -> None:
         ["--email", "owner@payrun.example.com", "--company-id", "nope"],
         [*BASE, "--name", "   "],
         [*BASE, "--name", "x" * 201],
+        [*BASE, "--name", "A\x00b"],
+        ["--email", "a\x00@payrun.example.com", "--company-id", str(COMPANY_ID)],
         [*BASE, "--password-env", " "],
         [*BASE, "--unknown", "secret-value"],
     ],
 )
 def test_parse_rejects(argv: list[str]) -> None:
-    """PAY-100: argparse errors and bad email/UUID/name are exit 2 (InvalidArgsError)."""
+    """PAY-100, C63: argparse errors, bad email/UUID/name and NUL characters are exit 2."""
     with pytest.raises(InvalidArgsError):
         parse_args(argv)
 

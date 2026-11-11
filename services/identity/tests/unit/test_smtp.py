@@ -60,7 +60,8 @@ async def test_send_passes_settings_to_aiosmtplib(monkeypatch: pytest.MonkeyPatc
 
 
 async def test_connect_errors_open_the_breaker(monkeypatch: pytest.MonkeyPatch) -> None:
-    """PAY-110: no inner retries; after BREAKER_FAILURES connect errors the breaker opens."""
+    """PAY-110, C63: no inner retries; after BREAKER_FAILURES connect errors the breaker opens,
+    and available() reports it (without consuming a half-open trial)."""
     calls = 0
 
     async def failing(msg: EmailMessage, **kw: Any) -> None:
@@ -70,6 +71,7 @@ async def test_connect_errors_open_the_breaker(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr(aiosmtplib, "send", failing)
     sender = SmtpSender(make_settings(breaker_failures=2))
+    assert sender.available()
     for _ in range(2):
         with pytest.raises(ProviderUnavailable) as exc:
             await sender.send(EmailMessage())
@@ -78,6 +80,7 @@ async def test_connect_errors_open_the_breaker(monkeypatch: pytest.MonkeyPatch) 
         await sender.send(EmailMessage())
     assert exc.value.reason == "breaker_open"
     assert calls == 2
+    assert not sender.available()
 
 
 async def test_timeouts_and_replies(monkeypatch: pytest.MonkeyPatch) -> None:

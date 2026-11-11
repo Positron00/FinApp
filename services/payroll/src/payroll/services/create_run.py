@@ -1,15 +1,16 @@
 """Create a pay run (design §4.4 "Create"; PAY-300, R33).
 
 Lock order (§4.10): the per-company advisory lock, then the settings row ``FOR SHARE`` (so the
-biweekly anchor can't change underneath), then plain reads and the inserts. The employee overlap
-check (``employee_in_overlapping_run``) arrives with F3.
+biweekly anchor can't change underneath), then plain reads and the inserts. Every candidate
+employee is checked for coverage by another non-deleted run whose days overlap the new period
+(``employee_in_overlapping_run``), so no one is paid twice for the same days (C63).
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import date
-from typing import Final
+from typing import Any, Final
 
 from pycommon.auth import Principal
 from pycommon.db import new_id
@@ -20,10 +21,10 @@ from sqlalchemy.exc import IntegrityError
 
 from payroll.api.schemas import PayRunCreate, PayRunOut
 from payroll.db.models import PayRun, Payslip
-from payroll.db.repositories import AuditRepo, EmployeeRepo, PayRunRepo, SettingsRepo
+from payroll.db.repositories import AuditRepo, EmployeeRepo, PayRunRepo, PayslipRepo, SettingsRepo
 from payroll.db.session import session_scope
-from payroll.domain import DomainError, NoEmployees, PayRunExists
-from payroll.domain.periods import Schedule, derive_period
+from payroll.domain import DomainError, EmployeeInOverlappingRun, NoEmployees, PayRunExists
+from payroll.domain.periods import Coverage, Schedule, derive_period, find_overlapping_employees
 from payroll.services.common import pay_run_view
 from payroll.services.runtime import Runtime
 
@@ -34,15 +35,17 @@ RUN_INDEX: Final = "uq_pay_runs_company_schedule_period"
 _ADVISORY: Final = text("SELECT pg_advisory_xact_lock(hashtext('payroll.create_run:' || :cid))")
 
 
-def _rejected(code: str, schedule: str, period_start: date) -> None:
-    log_event(
-        _log,
-        logging.INFO,
-        "payrun.create_rejected",
-        code=code,
-        schedule=schedule,
-        period_start=period_start.isoformat(),
-    )
+def _rejected(
+    code: str, schedule: str, period_start: date, *, employee_count: int | None = None
+) -> None:
+    fields: dict[str, Any] = {
+        "code": code,
+        "schedule": schedule,
+        "period_start": period_start.isoformat(),
+    }
+    if employee_count is not None:
+        fields["employee_count"] = employee_count
+    log_event(_log, logging.INFO, "payrun.create_rejected", **fields)
 
 
 async def create_run(rt: Runtime, principal: Principal, body: PayRunCreate) -> PayRunOut:
@@ -63,28 +66,47 @@ async def create_run(rt: Runtime, principal: Principal, body: PayRunCreate) -> P
                 employees = await EmployeeRepo.active_on_schedule(session, cid, body.schedule)
                 if not employees:
                     raise NoEmployees()
+                ids = [e.id for e in employees]
+                rows = await PayslipRepo.coverage(
+                    session, cid, ids, period.period_start, period.period_end
+                )
+                overlapping = find_overlapping_employees(
+                    ids,
+                    (Coverage(e, s, t) for e, s, t in rows),
+                    period.period_start,
+                    period.period_end,
+                )
+                if overlapping:
+                    raise EmployeeInOverlappingRun(overlapping)
                 run_id = new_id()
-                session.add(
-                    PayRun(
-                        id=run_id,
-                        company_id=cid,
-                        schedule=body.schedule,
-                        period_start=period.period_start,
-                        period_end=period.period_end,
-                        pay_date=period.pay_date,
-                        period_index=period.period_index,
-                        periods_per_year=period.periods_per_year,
-                        status="draft",
-                        employee_count=len(employees),
-                        created_by=principal.sub,
-                    )
+                run = PayRun(
+                    id=run_id,
+                    company_id=cid,
+                    schedule=body.schedule,
+                    period_start=period.period_start,
+                    period_end=period.period_end,
+                    pay_date=period.pay_date,
+                    period_index=period.period_index,
+                    periods_per_year=period.periods_per_year,
+                    status="draft",
+                    employee_count=len(employees),
+                    created_by=principal.sub,
                 )
                 try:
-                    await session.flush()
+                    # Added inside a savepoint, so a unique-index race rolls back only the
+                    # insert and the transaction can still re-read the winner.
+                    async with session.begin_nested():
+                        session.add(run)
+                        await session.flush()
                 except IntegrityError as exc:
-                    if RUN_INDEX in str(exc.orig):
-                        raise PayRunExists(None) from None
-                    raise
+                    if RUN_INDEX not in str(exc.orig):
+                        raise
+                    # The unique index waited for the other create to commit; READ COMMITTED
+                    # sees its row now, so the 409 carries the real ID (§3.7, C63).
+                    winner = await PayRunRepo.find_live(
+                        session, cid, body.schedule, period.period_start
+                    )
+                    raise PayRunExists(winner) from None
                 await session.execute(
                     insert(Payslip),
                     [
@@ -117,7 +139,12 @@ async def create_run(rt: Runtime, principal: Principal, body: PayRunCreate) -> P
                 )
                 out = await pay_run_view(session, cid, run_id)
         except DomainError as exc:
-            if isinstance(exc, (PayRunExists, NoEmployees)) or exc.code == "invalid_period_start":
+            if isinstance(exc, EmployeeInOverlappingRun):
+                _rejected(
+                    exc.error_code, body.schedule, body.period_start,
+                    employee_count=len(exc.employee_ids),
+                )  # fmt: skip
+            elif isinstance(exc, (PayRunExists, NoEmployees)) or exc.code == "invalid_period_start":
                 _rejected(exc.error_code, body.schedule, body.period_start)
             raise
         span.set_attribute("payroll.pay_run_id", str(run_id))

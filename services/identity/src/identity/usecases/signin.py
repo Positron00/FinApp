@@ -20,6 +20,7 @@ from identity.api.errors import InvalidCredentials
 from identity.api.schemas import SessionUser
 from identity.db.repositories import AuditRepo, CredentialRepo, UserRepo
 from identity.domain import audit_events
+from identity.limits import UNKNOWN_IP
 from identity.runtime import IdentityRuntime
 from identity.usecases.common import session_user
 
@@ -31,9 +32,9 @@ _log = get_logger("identity.signin")
 @dataclass(frozen=True)
 class LoginCommand:
     company_id: UUID
-    email: str
+    email: str = field(repr=False)
     password: str = field(repr=False)
-    client_ip: str | None
+    client_ip: str | None = field(repr=False)
 
 
 async def login(rt: IdentityRuntime, cmd: LoginCommand) -> SessionUser:
@@ -58,7 +59,7 @@ async def _login(rt: IdentityRuntime, cmd: LoginCommand) -> SessionUser:
     with tracer("identity").start_as_current_span(
         "identity.ratelimit.check", attributes={"identity.component": "login"}
     ) as span:
-        gate = await rt.limits.check_login(ih or "unknown", ek)
+        gate = await rt.limits.check_login(ih or UNKNOWN_IP, ek)
         span.set_attribute("identity.allowed", gate.allowed)
     if not gate.allowed:
         if gate.lock_started is not None:
@@ -90,6 +91,8 @@ async def _login(rt: IdentityRuntime, cmd: LoginCommand) -> SessionUser:
 
     user_id = row.user.id if row is not None else None
     if reason is not None:
+        # Only failed verifies count toward the per-account limit (C63).
+        await rt.limits.record_failure(gate)
         async with transaction(rt.sessions) as session:
             await AuditRepo(session).append(
                 cid=cid,

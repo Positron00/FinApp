@@ -20,7 +20,7 @@ from enum import IntEnum
 from typing import Any, Final, Literal
 
 import httpx
-from opentelemetry import metrics, trace
+from opentelemetry import trace
 
 from pycommon import Clock, SystemClock
 from pycommon.logging import get_logger, log_event
@@ -71,11 +71,10 @@ class BreakerState(IntEnum):
     open = 2
 
 
-# --- circuit_breaker_state gauge: one instrument per meter provider, fed by every breaker --------
+# --- circuit_breaker_state gauge: one instrument per meter provider, fed by every breaker -------
 
 _BREAKERS: weakref.WeakSet[CircuitBreaker] = weakref.WeakSet()
 _BREAKERS_LOCK = threading.Lock()
-_GAUGE_PROVIDERS: weakref.WeakSet[Any] = weakref.WeakSet()
 
 
 def _breaker_observations() -> Observation:
@@ -85,14 +84,10 @@ def _breaker_observations() -> Observation:
 
 
 def _ensure_breaker_gauge() -> None:
-    provider = metrics.get_meter_provider()
-    with _BREAKERS_LOCK:
-        if provider in _GAUGE_PROVIDERS:
-            return
-        _GAUGE_PROVIDERS.add(provider)
+    # Idempotent: observable_gauge keeps one instrument per meter provider and name.
     observable_gauge(
         "circuit_breaker_state",
-        unit="1",
+        unit="{state}",
         description="Circuit breaker state per target: 0 closed, 1 half-open, 2 open",
         callback=_breaker_observations,
     )

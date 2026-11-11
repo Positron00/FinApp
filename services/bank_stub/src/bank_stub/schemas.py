@@ -16,7 +16,7 @@ __all__ = [
 ]
 
 IDEMPOTENCY_KEY_PATTERN: Final = r"^[A-Za-z0-9:_-]{1,255}$"  # R6; the worker sends <payout_id>:<n>
-IDEMPOTENCY_KEY_RE: Final = re.compile(IDEMPOTENCY_KEY_PATTERN)
+IDEMPOTENCY_KEY_RE: Final = re.compile(IDEMPOTENCY_KEY_PATTERN)  # always fullmatch (C63)
 _MASKED: Final = frozenset({"routing", "account"})
 
 

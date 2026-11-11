@@ -80,7 +80,7 @@ def test_unreadable() -> None:
     for msg in (message(drop_envelope=True), message(raw=b"{"), message(raw=b"[1]")):
         with pytest.raises(InvalidMessage) as e:
             parse_envelope(msg)
-        assert not e.value.ids_readable
+        assert e.value.readable_ids() is None
     bad_attempt = envelope_dict(attempt=True)
     with pytest.raises(InvalidMessage) as e2:
         parse_envelope(message(bad_attempt))

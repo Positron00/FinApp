@@ -12,6 +12,7 @@ import { t } from "../helpers/state";
 const cookieJar = vi.hoisted(() => ({ value: undefined as string | undefined }));
 vi.mock("next/headers", () => ({
   cookies: async () => ({ get: () => (cookieJar.value ? { value: cookieJar.value } : undefined) }),
+  headers: async () => new Headers({ "x-forwarded-for": "203.0.113.7" }),
 }));
 const redirectMock = vi.hoisted(() =>
   vi.fn((url: string) => {
@@ -156,6 +157,40 @@ describe("requireSession", () => {
     });
   });
 
+  // C37, C63: a 429 from identity also counts as unavailable (fail open inside the grace).
+  it("fails open on 429 inside the grace window", async () => {
+    const cookie = await signIn();
+    meReturns(errorBody("rate_limited"), 429);
+    vi.advanceTimersByTime(MIN);
+    await expect(resolveSession(cookie)).resolves.toMatchObject({ key: sessionKeyOf(cookie) });
+    expect(t.logs.events("auth.session.recheck_deferred")).toHaveLength(1);
+  });
+
+  // C63: an identity 500 isn't "unavailable": 503 at once, with no fail-open grace.
+  it("is 503 without grace on an identity 500", async () => {
+    const cookie = await signIn();
+    meReturns(errorBody("internal_error"), 500);
+    vi.advanceTimersByTime(MIN);
+    await expect(resolveSession(cookie)).rejects.toMatchObject({
+      status: 503,
+      code: "service_unavailable",
+    });
+    expect(t.logs.events("auth.session.recheck_deferred")).toHaveLength(0);
+    expect(await t.redis.exists(sessKey(sessionKeyOf(cookie)))).toBe(1);
+  });
+
+  // PAY-600, C63: identity 401 invalid_token means our key or clock is wrong: log
+  // bff.upstream_auth_failed and answer 503, keeping the session.
+  it("is 503 and keeps the session when identity rejects our token", async () => {
+    const cookie = await signIn();
+    meReturns(errorBody("invalid_token"), 401);
+    vi.advanceTimersByTime(MIN);
+    await expect(resolveSession(cookie)).rejects.toMatchObject({ status: 503 });
+    expect(t.logs.events("bff.upstream_auth_failed")[0]).toMatchObject({ target: "identity" });
+    expect(t.logs.events("auth.session.recheck_deferred")).toHaveLength(0);
+    expect(await t.redis.exists(sessKey(sessionKeyOf(cookie)))).toBe(1);
+  });
+
   // PAY-107: the re-check is single-flighted per session within the process.
   it("shares one /me call between parallel requests", async () => {
     const cookie = await signIn();
@@ -179,6 +214,16 @@ describe("requireSession", () => {
   it("reads the cookie from next/headers", async () => {
     cookieJar.value = await signIn();
     await expect(requireSession(["admin"])).resolves.toMatchObject({ user_id: USER_ID });
+  });
+
+  // C16: a page-triggered re-check sends X-Client-IP like the route pipeline does.
+  it("sends the client IP on a page re-check", async () => {
+    cookieJar.value = await signIn();
+    meReturns(meOut);
+    vi.advanceTimersByTime(MIN);
+    await requireSession();
+    const call = seen.find((r) => r.url.endsWith("/v1/users/me"))!;
+    expect(call.headers.get("x-client-ip")).toBe("203.0.113.7");
   });
 });
 

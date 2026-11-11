@@ -14,6 +14,7 @@ import time
 from collections.abc import Callable
 from typing import Final, cast
 
+from opentelemetry.trace import Span, Status, StatusCode
 from pycommon.db import transaction
 from pycommon.http import ProviderUnavailable
 from pycommon.logging import get_logger, log_event
@@ -38,6 +39,12 @@ _log = get_logger("identity.email.relay")
 async def _sleep_or_stop(seconds: float, stop: asyncio.Event) -> None:
     with contextlib.suppress(TimeoutError):
         await asyncio.wait_for(stop.wait(), timeout=seconds)
+
+
+def _mark_failed(span: Span, exc: BaseException) -> None:
+    """Error status with the class name only (an SMTP reply text could quote the recipient)."""
+    span.set_status(Status(StatusCode.ERROR, error_label(exc)))
+    span.set_attribute("error.type", type(exc).__name__)
 
 
 class EmailRelay:
@@ -101,8 +108,17 @@ class EmailRelay:
         async with transaction(self._sf) as session:
             await OutboxRepo(session).finish(row.id, status, last_error=last_error)
 
+    async def _release_uncounted(self, row: ClaimedEmail) -> None:
+        async with transaction(self._sf) as session:
+            await OutboxRepo(session).release_uncounted(row.id, self._s.breaker_reset_s)
+
     async def _process(self, row: ClaimedEmail) -> None:
         template = cast(Template, row.template)
+        if not self._sender.available():
+            # Breaker open: issue no token (the old link and expires_at stay; C31, C63) and
+            # give the attempt back.
+            await self._release_uncounted(row)
+            return
         token = new_token()
         issued = await self._issue(row, token.digest)
         if issued is None:
@@ -134,17 +150,19 @@ class EmailRelay:
                 "identity.template": template,
                 "identity.attempt": row.attempts,
             },
-        ):
+        ) as span:
             try:
                 await self._sender.send(msg)
             except ProviderUnavailable as exc:
+                _mark_failed(span, exc)
                 if exc.reason != "breaker_open":
                     await self._failed_attempt(row, exc)
                     return
-                async with transaction(self._sf) as session:
-                    await OutboxRepo(session).release_uncounted(row.id, self._s.breaker_reset_s)
+                # The breaker opened between the check and the send (another task tripped it).
+                await self._release_uncounted(row)
                 return
             except Exception as exc:
+                _mark_failed(span, exc)
                 await self._failed_attempt(row, exc)
                 return
         await self._finish(row, "sent")

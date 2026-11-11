@@ -7,6 +7,7 @@ import json
 from typing import Any
 
 import pytest
+from payroll.db.repositories import PayRunRepo, PayslipRepo
 from payroll.domain.calc import apply_bps, salaried_gross
 
 from tests.integration.conftest import PAYROLL_ADMIN, Api, other_company
@@ -125,6 +126,36 @@ async def test_two_concurrent_creates_one_wins(api: Api, db: Any) -> None:
 
     assert sorted(await asyncio.gather(create(), create())) == [201, 409]
     assert await db.fetchval("SELECT count(*) FROM payroll.pay_runs") == 1
+
+
+async def test_unique_index_race_returns_the_real_run_id(
+    api: Api, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PAY-300, C63: when the pre-check misses a live run (a race), the unique index still
+    refuses the insert and the 409 carries the winner's pay_run_id, not null."""
+    await api.create_employee()
+    run = await api.create_run()
+    real = PayRunRepo.find_live
+    calls = 0
+
+    async def miss_once(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return None if calls == 1 else await real(*args, **kwargs)
+
+    async def no_coverage(*_a: Any, **_k: Any) -> list[Any]:
+        return []  # a racing create's rows aren't visible yet either
+
+    monkeypatch.setattr(PayRunRepo, "find_live", staticmethod(miss_once))
+    monkeypatch.setattr(PayslipRepo, "coverage", staticmethod(no_coverage))
+    r = await api.client.post(
+        "/v1/pay-runs", json={"schedule": "monthly", "period_start": run["period_start"]},
+        headers=api.payroll_admin(),
+    )  # fmt: skip
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "pay_run_exists"
+    assert r.json()["error"]["details"] == {"pay_run_id": run["id"]}
+    assert calls == 2
 
 
 async def test_calculate_amounts_totals_and_snapshot(api: Api, db: Any) -> None:
@@ -266,3 +297,29 @@ async def test_other_company_cannot_see_runs(api: Api, db: Any) -> None:
         f"/v1/pay-runs/{run['id']}/calculate", headers=api.payroll_admin(cid=other)
     )
     assert r.status_code == 404
+
+
+async def test_employee_in_overlapping_run_after_a_schedule_change(api: Api, db: Any) -> None:
+    """PAY-300, C63: an employee moved from monthly to biweekly is refused for a biweekly period
+    that shares days with their January monthly run (409 with the IDs); a deleted run no longer
+    counts, and a non-overlapping period is fine."""
+    moved = await api.create_employee()
+    stays = await api.create_employee(name="Grace Hopper", email="grace@example.com",
+                                      schedule="biweekly")  # fmt: skip
+    january = await api.create_run("monthly", "2026-01-01")
+    await db.execute(
+        "UPDATE payroll.employees SET schedule = 'biweekly' WHERE id = $1", moved["id"]
+    )
+    r = await api.client.post(
+        "/v1/pay-runs", json={"schedule": "biweekly", "period_start": "2026-01-19"},
+        headers=api.payroll_admin(),
+    )  # fmt: skip
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "employee_in_overlapping_run"
+    assert r.json()["error"]["details"] == {"employee_ids": [moved["id"]]}
+    assert stays["id"] not in json.dumps(r.json())
+    assert await db.fetchval("SELECT count(*) FROM payroll.pay_runs") == 1
+    later = await api.create_run("biweekly", "2026-02-02")  # Feb 2 to 15: after January ends
+    assert later["employee_count"] == 2
+    await db.execute("UPDATE payroll.pay_runs SET deleted_at = now() WHERE id = $1", january["id"])
+    assert (await api.create_run("biweekly", "2026-01-19"))["employee_count"] == 2

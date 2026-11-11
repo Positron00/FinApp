@@ -97,7 +97,8 @@ async def test_old_attempt_redelivered(stack: Stack, caplog_json: JsonLogCapture
         for e in caplog_json.events("payout.attempt_not_current")
         if e["logger"].startswith("payout_worker")
     ]
-    assert mine == ["instruction"]
+    # The stored rejected answer of attempt 1 is reported first (C63) and gets 409 too.
+    assert mine == ["result", "instruction"]
     keys = [
         r["idempotency_key"]
         for r in await stack.db.fetch("SELECT idempotency_key FROM bank_stub.transfers")

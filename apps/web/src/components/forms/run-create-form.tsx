@@ -45,6 +45,8 @@ export function RunCreateForm() {
   }
 
   const err = create.error instanceof ApiError ? create.error : null;
+  // No response at all (network down): a generic message rather than silence (§6.1).
+  const offline = create.error !== null && !err;
   return (
     <form className="mt-4 flex max-w-sm flex-col gap-4" onSubmit={onSubmit}>
       <p>Schedule: monthly</p>
@@ -67,6 +69,11 @@ export function RunCreateForm() {
           <p>{err.message}</p>
           {err.requestId ? <p className="text-sm">Reference: {err.requestId}</p> : null}
         </div>
+      ) : null}
+      {offline ? (
+        <p role="alert" className="text-danger">
+          The service is temporarily unavailable. Please try again.
+        </p>
       ) : null}
       <button
         type="submit"

@@ -38,3 +38,12 @@ asyncio_default_fixture_loop_scope = "function"
 timeout = 180
 testpaths = ["tests"]
 markers = ["integration: needs Docker (Testcontainers)"]
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+fail_under = 85  # C63: per-member gate (85 for services)
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "@overload"]

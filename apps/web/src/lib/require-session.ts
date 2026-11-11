@@ -1,10 +1,11 @@
 import "server-only";
 
 import { trace } from "@opentelemetry/api";
-import { cookies } from "next/headers";
+import { cookies, headers } from "next/headers";
 import { redirect } from "next/navigation";
 
 import { identityClient } from "./api/clients";
+import { clientIp } from "./client-ip";
 import { config } from "./config";
 import { BffError, bffError } from "./errors";
 import { userIdHash } from "./hmac";
@@ -37,6 +38,11 @@ type Recheck = { kind: "ok"; me: UserMe } | { kind: "deferred" };
 
 const inflight = processSingleton("recheck-inflight", () => new Map<string, Promise<Recheck>>());
 
+function upstreamCode(body: unknown): string | undefined {
+  const code = (body as { error?: { code?: unknown } } | undefined)?.error?.code;
+  return typeof code === "string" ? code : undefined;
+}
+
 function unauthenticated(): BffError {
   return bffError("unauthenticated", { clearCookie: true });
 }
@@ -49,36 +55,46 @@ async function recheck(s: Session, ip: string | null): Promise<Recheck> {
     ip,
     claims: () => ({ sub: s.user_id, roles: s.roles, cid: s.cid, sid: s.sid, name: s.name }),
   });
-  let unavailable = false;
+  // A transport failure (timeout, connect error, breaker open) arrives as a thrown
+  // service_unavailable from resilientFetch.
+  const res = await client.GET("/v1/users/me").catch((err: unknown) => {
+    if (err instanceof BffError && err.code === "service_unavailable") return undefined;
+    throw err;
+  });
   let me: UserMe | undefined;
-  try {
-    const { data, response } = await client.GET("/v1/users/me");
+  // C63: only 503, 429 and transport failures mean "identity is unavailable" (fail open
+  // inside the grace window); everything else is decided here.
+  const unavailable = !res || res.response.status === 503 || res.response.status === 429;
+  if (res && !unavailable) {
+    const { data, error, response } = res;
+    if (response.status === 401 && upstreamCode(error) === "invalid_token") {
+      // Our signing key or clock is wrong, not the user's session: keep it; 503 without grace.
+      logger().error(
+        { event: "bff.upstream_auth_failed", target: "identity", operation: "users_me" },
+        "identity rejected our token",
+      );
+      throw bffError("service_unavailable");
+    }
     if (response.status === 401 || response.status === 404) {
       await deleteSessionByKey(s.key).catch(() => undefined); // this session only (§4.3)
       throw unauthenticated();
     }
-    if (!response.ok) {
-      unavailable = response.status >= 500 || response.status === 429;
-      if (!unavailable) throw bffError("internal_error");
-    } else {
-      const parsed = UserMe.safeParse(data);
-      if (!parsed.success) {
-        logger().error(
-          {
-            event: "bff.response_invalid",
-            target: "identity",
-            operation: "users_me",
-            issues: parsed.error.issues.map((i) => i.path.join(".")),
-          },
-          "invalid identity response",
-        );
-        throw bffError("internal_error");
-      }
-      me = parsed.data;
+    if (response.status >= 500) throw bffError("service_unavailable"); // e.g. 500: no grace
+    if (!response.ok) throw bffError("internal_error"); // another 4xx: a bug on our side
+    const parsed = UserMe.safeParse(data);
+    if (!parsed.success) {
+      logger().error(
+        {
+          event: "bff.response_invalid",
+          target: "identity",
+          operation: "users_me",
+          issues: parsed.error.issues.map((i) => i.path.join(".")),
+        },
+        "invalid identity response",
+      );
+      throw bffError("internal_error");
     }
-  } catch (err) {
-    if (err instanceof BffError && err.code === "service_unavailable") unavailable = true;
-    else throw err;
+    me = parsed.data;
   }
 
   if (unavailable || !me) {
@@ -170,10 +186,18 @@ export async function resolveSession(
   });
 }
 
-/** For route handlers: reads the cookie with `cookies()`. */
+/**
+ * For server components and route handlers outside `route()`: reads the cookie with
+ * `cookies()`, and the client IP from `headers()`, so a re-check sends `X-Client-IP` as the
+ * route pipeline does (C16).
+ */
 export async function requireSession(roles?: Role[]): Promise<CheckedSession> {
-  const jar = await cookies();
-  return resolveSession(jar.get(config().SESSION_COOKIE_NAME)?.value, { roles });
+  const c = config();
+  const [jar, h] = await Promise.all([cookies(), headers()]);
+  return resolveSession(jar.get(c.SESSION_COOKIE_NAME)?.value, {
+    roles,
+    ip: clientIp(h, c.TRUSTED_PROXY_HOPS),
+  });
 }
 
 /**

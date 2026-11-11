@@ -10,7 +10,8 @@ for v in REDIS_ADMIN_PASSWORD REDIS_WEB_PASSWORD REDIS_IDENTITY_PASSWORD REDIS_P
   [ -n "$val" ] || { echo "redis-acl: missing $v" >&2; exit 1; }
 done
 h() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
-BASE='+@connection +ping +@read +@write +@keyspace +@transaction -@stream -@scripting -@pubsub -@admin -@dangerous'
+# -scan -randomkey: key patterns don't filter SCAN/RANDOMKEY results, so they'd list other users' keys (C63).
+BASE='+@connection +ping +@read +@write +@keyspace +@transaction -@stream -@scripting -@pubsub -@admin -@dangerous -scan -randomkey'
 WORKER_MAIN='~stream:payout.requested +xreadgroup +xack +xautoclaim +xpending +xinfo +xgroup|create +xgroup|delconsumer'
 WORKER_DLQ='~stream:payout.requested.dlq +xadd +xinfo'
 EXPORTER='+@connection +ping -@scripting -@dangerous +info +config|get +client|list +slowlog|get +slowlog|len +latency|latest +xinfo +xlen +type +dbsize +memory|stats'

@@ -49,7 +49,8 @@ async def test_invite_mode_then_refused_then_skipped(
     cli_env: pytest.MonkeyPatch, admin_db: Any, caplog_json: JsonLogCapture
 ) -> None:
     """PAY-100, R16: empty DB → 0 with a pending owner (all roles), an unsent invite and an
-    outbox row, audited; a second run → 3 (refused); with --if-empty → 0 (skipped), no rows."""
+    outbox row, audited, email.queued logged; a second run → 3 (refused); with --if-empty → 0
+    (skipped), no rows."""
     assert await run(*OWNER, "--name", "The Owner") == EXIT_OK
     owner = await admin_db.fetchrow("SELECT * FROM identity.users")
     assert owner["roles"] == ["admin", "approver", "payroll_admin"]
@@ -63,6 +64,8 @@ async def test_invite_mode_then_refused_then_skipped(
     assert audit["details"] == '{"mode": "invite"}'
     [done] = caplog_json.events("identity.bootstrap.completed")
     assert (done["mode"], done["user_id"]) == ("invite", str(owner["id"]))
+    [queued] = caplog_json.events("email.queued")
+    assert (queued["email_id"], queued["template"]) == (str(out["id"]), "invite")
     before = await counts(admin_db)
 
     assert await run(*OWNER) == EXIT_REFUSED

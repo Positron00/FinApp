@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import secrets
 from typing import Any
 from uuid import UUID
 
@@ -13,7 +14,7 @@ from pydantic import SecretStr
 
 COMPANY_ID = UUID("0193a000-0000-7000-8000-000000000001")
 OTHER_COMPANY_ID = UUID("0193a000-0000-7000-8000-000000000002")
-STRONG_SECRET = "s3cr3t-Value-For-Tests-0123456789"
+STRONG_SECRET = secrets.token_urlsafe(24)  # generated per run: never a committed secret (C63)
 ACTIVE_KID = "k2026a"
 VALID_ROUTING = "021000021"  # passes the ABA checksum
 OTHER_ROUTING = "011000015"

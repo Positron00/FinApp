@@ -12,7 +12,7 @@ from tests.integration.conftest import Stack, wait_for
 
 
 async def test_consume_span_is_a_child_of_the_envelope(
-    stack: Stack, otel_memory: OtelMemory
+    otel_memory: OtelMemory, stack: Stack
 ) -> None:
     """PAY-NFR-09: the consume span's parent is the envelope traceparent's span and trace; the
     children and the per-try payroll and bank client spans share the trace; no span holds an

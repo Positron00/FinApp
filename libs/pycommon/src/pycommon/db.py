@@ -32,7 +32,14 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from pycommon.errors import DbTimeout, DbUnavailable, db_error_kind
+from pycommon.errors import (
+    INVALID_TEXT_DETAILS,
+    DbTimeout,
+    DbUnavailable,
+    ValidationFailed,
+    db_error_kind,
+    is_invalid_text,
+)
 from pycommon.logging import get_logger, log_event
 from pycommon.settings import BaseServiceSettings
 
@@ -92,13 +99,19 @@ async def transaction(sf: async_sessionmaker[AsyncSession]) -> AsyncIterator[Asy
 
 @contextmanager
 def map_db_errors(operation: str = "db") -> Iterator[None]:
-    """Map driver timeouts to ``DbTimeout`` and connection failures to ``DbUnavailable``."""
+    """Map driver timeouts to ``DbTimeout`` and connection failures to ``DbUnavailable``.
+
+    The block is a DB call, so a bare ``OSError``/``TimeoutError`` in it counts as a DB error.
+    Text Postgres rejects (SQLSTATE 22021, e.g. a NUL byte) becomes 422 ``validation_error`` (C63).
+    """
     try:
         yield
-    except DbTimeout, DbUnavailable:
+    except DbTimeout, DbUnavailable, ValidationFailed:
         raise
     except Exception as exc:
-        kind = db_error_kind(exc)
+        if is_invalid_text(exc):
+            raise ValidationFailed(details=[dict(d) for d in INVALID_TEXT_DETAILS]) from exc
+        kind = db_error_kind(exc, in_db_call=True)
         if kind == "timeout":
             log_event(_log, logging.WARNING, "db.timeout", operation=operation)
             raise DbTimeout() from exc

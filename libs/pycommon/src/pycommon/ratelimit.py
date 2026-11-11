@@ -97,7 +97,7 @@ class RateLimiter:
                 count_raw, _ = await pipe.execute()
             count = int(count_raw)
         except (redis.exceptions.RedisError, OSError) as exc:
-            self._backend_error(limit, exc)
+            self.record_error(exc, fail_mode=limit.fail_mode)
             if limit.fail_mode is FailMode.open:
                 return Decision(allowed=True, remaining=limit.limit, retry_after_s=0, degraded=True)
             raise ServiceUnavailable() from None
@@ -106,12 +106,29 @@ class RateLimiter:
                 allowed=True, remaining=limit.limit - count, retry_after_s=0, degraded=False
             )
         window_end = (now_s // limit.window_s + 1) * limit.window_s
-        self._limited.add(1, {"scope": limit.scope})
+        self.record_denied(limit.scope)
         return Decision(
             allowed=False, remaining=0, retry_after_s=max(1, window_end - now_s), degraded=False
         )
 
-    def _backend_error(self, limit: Limit, exc: BaseException) -> None:
+    @property
+    def component(self) -> str:
+        return self._component
+
+    def record_denied(self, scope: str) -> None:
+        """Count one denied request: ``rate_limited_total{scope}`` +1.
+
+        For denials a service decides itself (e.g. identity's lockout), so it needs no counter
+        of its own (C63).
+        """
+        self._limited.add(1, {"scope": scope})
+
+    def record_error(
+        self, exc: BaseException | None = None, *, fail_mode: FailMode | str = FailMode.open
+    ) -> None:
+        """Count one Redis failure (``rate_limiter_errors_total{component}`` +1) and log
+        ``ratelimit.backend_error`` at most once per 10 s. The caller decides open or closed (C63).
+        """
         self._errors.add(1, {"component": self._component})
         now = self._clock.monotonic()
         if now - self._last_logged >= LOG_EVERY_S:
@@ -121,8 +138,8 @@ class RateLimiter:
                 logging.WARNING,
                 "ratelimit.backend_error",
                 component=self._component,
-                fail_mode=str(limit.fail_mode),
-                error_type=type(exc).__name__,
+                fail_mode=str(fail_mode),
+                error_type=type(exc).__name__ if exc is not None else None,
             )
 
     async def check(self, limit: Limit, subject: str) -> None:

@@ -61,11 +61,11 @@ class InvalidMessage(WorkerError):
         self.company_id = company_id
         self.traceparent = traceparent
 
-    @property
-    def ids_readable(self) -> bool:
-        return (
-            self.payout_id is not None and self.attempt is not None and self.company_id is not None
-        )
+    def readable_ids(self) -> tuple[UUID, int, UUID] | None:
+        """``(payout_id, attempt, company_id)`` when all three were readable, else None."""
+        if self.payout_id is None or self.attempt is None or self.company_id is None:
+            return None
+        return self.payout_id, self.attempt, self.company_id
 
 
 class AttemptNotCurrent(WorkerError):

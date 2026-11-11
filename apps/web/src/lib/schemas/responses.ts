@@ -4,7 +4,7 @@ import { Cents, DateTime, IsoDate, PayType, RoleEnum, Schedule, Uuid } from "./c
 
 /**
  * Response schemas (web LLD §2.4). They mirror the service Out models field for field (C5):
- * same names, nullability and enums; `tests/schemas/types.test.ts` fails when they drift from
+ * same names, nullability and enums; the `expectTypeOf` checks in `tests/schemas/schemas.test.ts` fail when they drift from
  * `@payrun/api-client`. Default mode strips unknown keys; `Employee`, `Payout` and `Attempt` are
  * strict, so an unexpected key (a full bank number, say) fails parsing (PAY-202, PAY-NFR-08).
  */

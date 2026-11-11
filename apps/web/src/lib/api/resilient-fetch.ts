@@ -110,7 +110,10 @@ export function resilientFetch(target: "identity" | "payroll", opts: ResilientOp
           fail("timeout", attempt);
           throw unavailable(); // a read timeout isn't retried
         }
-        if (name === "AbortError" && req.signal.aborted) throw err; // the caller went away
+        if (name === "AbortError" && req.signal.aborted) {
+          breaker.release(); // the caller went away: no verdict, but free a half-open probe
+          throw err;
+        }
         breaker.onFailure();
         metricsApi.upstreamRequest(target, "connect_error");
         if (isGet && attempt < maxAttempts && (await backoff(attempt, undefined))) continue;

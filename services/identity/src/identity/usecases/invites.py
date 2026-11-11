@@ -19,6 +19,7 @@ from identity.domain import audit_events
 from identity.domain.passwords import PasswordTooWeakError, check_password_policy
 from identity.domain.roles import normalise_roles
 from identity.domain.tokens import digest_of
+from identity.limits import UNKNOWN_IP
 from identity.runtime import IdentityRuntime
 from identity.usecases.common import session_user, user_out
 
@@ -34,6 +35,7 @@ class InviteCommand:
     email: str = field(repr=False)
     name: str = field(repr=False)
     roles: list[str]
+    client_ip: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -41,7 +43,7 @@ class AcceptCommand:
     company_id: UUID
     token: str = field(repr=False)
     password: str = field(repr=False)
-    client_ip: str | None
+    client_ip: str | None = field(repr=False)
 
 
 def _is_email_taken(exc: sqlalchemy.exc.IntegrityError) -> bool:
@@ -52,6 +54,7 @@ async def invite_user(rt: IdentityRuntime, cmd: InviteCommand) -> UserOut:
     """One transaction: pending user, invite (no token yet), outbox row, audit (§6.6)."""
     cid = cmd.company_id
     roles = normalise_roles(cmd.roles)
+    ih = rt.ip_hash(cmd.client_ip)
     with tracer("identity").start_as_current_span("identity.invite.create") as span:
         try:
             async with transaction(rt.sessions) as session:
@@ -78,6 +81,7 @@ async def invite_user(rt: IdentityRuntime, cmd: InviteCommand) -> UserOut:
                     event=audit_events.USER_INVITED,
                     actor_user_id=cmd.actor_user_id,
                     target_user_id=user.id,
+                    ip_hash=ih,
                     details={"roles": roles, "invite_id": str(invite_id)},
                 )
         except sqlalchemy.exc.IntegrityError as exc:
@@ -115,7 +119,7 @@ async def accept_invite(rt: IdentityRuntime, cmd: AcceptCommand) -> SessionUser:
     """Token before password policy; the state change is one conditional transaction (§6.6)."""
     cid = cmd.company_id
     ih = rt.ip_hash(cmd.client_ip)
-    retry = await rt.limits.check_accept(ih or "unknown")
+    retry = await rt.limits.check_accept(ih or UNKNOWN_IP)
     if retry is not None:
         raise RateLimited(retry_after_s=retry)
     with tracer("identity").start_as_current_span("identity.invite.accept") as span:
@@ -140,8 +144,8 @@ async def accept_invite(rt: IdentityRuntime, cmd: AcceptCommand) -> SessionUser:
             raise PasswordTooWeak() from None
         password_hash = await rt.hasher.hash(cmd.password)
         async with transaction(rt.sessions) as session:
-            user_id = await InviteRepo(session).mark_accepted(found.invite_id)
-            user = await UserRepo(session).activate_pending(user_id) if user_id else None
+            user_id = await InviteRepo(session).mark_accepted(cid, found.invite_id)
+            user = await UserRepo(session).activate_pending(cid, user_id) if user_id else None
             if user is None:
                 # A concurrent accept won, or the invite expired meanwhile: roll back.
                 raise _invalid("not_pending")

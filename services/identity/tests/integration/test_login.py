@@ -94,7 +94,7 @@ async def test_rehash_after_parameter_change(harness: HarnessFactory, admin_db: 
     assert ",t=2," in new
 
 
-async def test_timing_class_unknown_email_vs_wrong_password(harness: HarnessFactory) -> None:
+async def test_login_timing(harness: HarnessFactory) -> None:
     """PAY-104, C45 (test_login_timing): with production argon2 parameters and raised limits,
     the median latency of 30 unknown-email and 30 wrong-password logins differs by <= 20%."""
     async with harness(**PRODUCTION_ARGON2, **RAISED) as h:

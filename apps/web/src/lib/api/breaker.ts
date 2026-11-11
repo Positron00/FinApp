@@ -37,6 +37,14 @@ export class Breaker {
     return "probe";
   }
 
+  /**
+   * Ends an attempt that produced no verdict (the caller aborted it): frees the half-open probe
+   * slot without changing the state, so the next request can probe.
+   */
+  release(): void {
+    this.probing = false;
+  }
+
   onSuccess(): void {
     this.failures = 0;
     this.probing = false;

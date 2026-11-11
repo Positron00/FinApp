@@ -7,7 +7,7 @@ Options:
    - Keys `PAYROLL_FIELD_KEYS` (JSON `{kid: base64 32-byte key}`) and `PAYROLL_FIELD_ACTIVE_KID`. The kid is stored as a prefix of each ciphertext, so old values stay decryptable after rotation.
    - Both routing and account numbers are encrypted.
    - The plaintext `account_last4` is stored separately for display.
-   - Full numbers are decrypted only for `/v1/internal/payouts/{id}/instruction`.
+   - Full numbers are decrypted in two places only: at approval and retry, to copy them into the attempt's encrypted bank snapshot (re-encrypted with the active key), and for `/v1/internal/payouts/{id}/instruction`, which reads that snapshot. No user-facing API decrypts them.
 2. **pgcrypto in the database.** The key would travel in SQL statements and could end up in logs.
 3. **Plaintext, masked in the API.** Simple, but a dump exposes everything.
 4. **Tokenize at the processor** (store only a bank token). The right long-term answer with a real provider, but bank-stub would need a vault.

@@ -91,10 +91,10 @@ class UserRepo:
         stmt = insert(User).values(**values).returning(User)
         return (await self._s.execute(stmt)).scalar_one()
 
-    async def activate_pending(self, user_id: UUID) -> User | None:
+    async def activate_pending(self, cid: UUID, user_id: UUID) -> User | None:
         stmt = (
             update(User)
-            .where(User.id == user_id, User.status == "pending")
+            .where(User.company_id == cid, User.id == user_id, User.status == "pending")
             .values(status="active", activated_at=func.now(), updated_at=func.now())
             .returning(User)
         )
@@ -172,11 +172,12 @@ class InviteRepo:
             return None
         return InviteForAccept(row[0], row[1], row[2], bool(row[3]), row[4])
 
-    async def mark_accepted(self, invite_id: UUID) -> UUID | None:
+    async def mark_accepted(self, cid: UUID, invite_id: UUID) -> UUID | None:
         """Single use: only a pending, unexpired invite moves to ``accepted`` (§6.6)."""
         stmt = (
             update(Invite)
             .where(
+                Invite.company_id == cid,
                 Invite.id == invite_id,
                 Invite.status == "pending",
                 Invite.expires_at > func.now(),

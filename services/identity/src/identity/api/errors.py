@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from pycommon.errors import AppError, BadRequest, Conflict, NotFound, Unauthorized, ValidationFailed
+from pycommon.errors import BadRequest, Conflict, NotFound, Unauthorized, ValidationFailed
 
 __all__ = [
     "CannotModifySelf",
-    "IdentityError",
     "InvalidCredentials",
     "InviteInvalid",
     "InviteNotFound",
@@ -17,8 +16,6 @@ __all__ = [
     "UserEmailTaken",
     "UserNotFound",
 ]
-
-IdentityError = AppError
 
 
 class InvalidCredentials(Unauthorized):

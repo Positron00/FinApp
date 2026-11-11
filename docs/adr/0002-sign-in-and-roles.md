@@ -8,7 +8,7 @@ Context:
 Options:
 1. **Invite-only.** An admin invites by email; the invitee sets a password through a one-time link (hashed token, 72 h). This reuses the verification-token machinery, and the first admin (owner) is seeded. There's no public sign-up endpoint.
 2. **Self sign-up plus email verification** (pattern A default). A signed-up user would have no company or roles until someone assigns them, so it adds a pending-membership flow for no 0.1.0 value, plus a public abuse surface.
-Roles: `admin` (users, company settings, audit), `payroll_admin` (employees, preparing runs), `approver` (approve, retry payouts). Roles are additive, and the seeded owner holds all three.
+Roles: `admin` (users, company settings, audit), `payroll_admin` (employees, preparing runs), `approver` (approve runs, retry failed payouts, and resolve blocked `needs_operator` payouts with `redrive` or `mark_rejected`; PAY-502, spec R8). Roles are additive, and the seeded owner holds all three.
 Email change: deferred to after 0.1 (out of scope).
 Recommendation: option 1, with the three roles above.
 Decision: the recommendation above, accepted by the user on 2026-11-10 (plan sign-off).

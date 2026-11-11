@@ -14,7 +14,7 @@ from payout_worker.classify import (
 from payout_worker.models import NoAnswer, NotFound, Rejected, Settled
 from pycommon.http import ProviderTimeout, ProviderUnavailable
 
-from tests.helpers import BANK_REF, bank_response, transfer_json
+from tests.helpers import BANK_REF, NOT_FOUND_BODY, bank_response, transfer_json
 
 
 def test_201_settled_and_200_replay_settled() -> None:
@@ -102,10 +102,27 @@ def test_missing_response_without_error() -> None:
 
 
 def test_lookup() -> None:
-    """PAY-410: GET 404 → NotFound; 200 settled/rejected as for POST; 500 no answer."""
-    assert classify_lookup_response(bank_response(404, {"error": {}})) == NotFound()
+    """PAY-410: GET 404 transfer_not_found → NotFound; 200 settled/rejected as for POST; 500 no
+    answer."""
+    assert classify_lookup_response(bank_response(404, NOT_FOUND_BODY)) == NotFound()
     assert isinstance(classify_lookup_response(bank_response(200)), Settled)
     assert isinstance(
         classify_lookup_response(bank_response(200, transfer_json("rejected"))), Rejected
     )
     assert classify_lookup_response(bank_response(500, {})) == NoAnswer("http_5xx", 500)
+
+
+@pytest.mark.parametrize(
+    "resp",
+    [
+        bank_response(404, {"error": {}}),
+        bank_response(404, {"error": {"code": "not_found"}}),
+        bank_response(404, {"detail": "Not Found"}),
+        bank_response(404, ["transfer_not_found"]),
+        bank_response(404, raw=b"<html>404</html>"),
+    ],
+)
+def test_lookup_other_404_is_no_answer(resp: BankCallResult) -> None:
+    """C63, PAY-410: only the bank's transfer_not_found is NotFound; a misrouted 404 (wrong base
+    URL, a proxy page) is no answer, so it never becomes poison key_window_expired."""
+    assert classify_lookup_response(resp) == NoAnswer("http_404", 404)

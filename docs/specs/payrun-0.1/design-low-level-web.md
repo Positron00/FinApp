@@ -5,17 +5,17 @@ Source: [architecture plan](../../plan/architecture-plan.md) v1.2 (accepted 2026
 Scope: `apps/web`, the only public entry point. It serves the pages and the BFF (`/api/*`), holds browser sessions in Redis (`web:*`), mints internal JWTs and calls identity and payroll through the clients generated into `packages/api-client`. Business rules stay in the services; the BFF does sessions, authorization at the edge, validation, request shaping and error mapping.
 
 **Stack decisions for this area:**
-- **Next.js 16 (App Router), strict TypeScript.** The request interceptor is `src/proxy.ts`. Next 16's proxy runs on the Node.js runtime, but it stays a cookie-presence check plus the CSP nonce and is **not** a security boundary (`architecture.md` §9; CVE-2025-29927). Every route handler and every page calls `requireSession()` itself (PAY-601). No reason was found to stay on 15.
+- **Next.js 16 (App Router), strict TypeScript.** The request interceptor is `src/proxy.ts`. Next 16's proxy runs on the Node.js runtime, but it stays a cookie-presence check for pages plus the CSP nonce and is **not** a security boundary. It never gates `/api/*` (C63) (`architecture.md` §9; CVE-2025-29927). Every route handler and every page calls `requireSession()` itself (PAY-601). No reason was found to stay on 15.
 - Tailwind with shadcn/ui (Radix primitives); TanStack Query v5 in the browser; Zod at every boundary.
 - **Service clients:** `openapi-typescript` types plus `openapi-fetch`, from `packages/api-client` (`@payrun/api-client`, exports `IdentityPaths` and `PayrollPaths`).
-- **Server libraries:** `ioredis` for Redis, `jose` for EdDSA, `pino` for logs, `@vercel/otel` for traces.
+- **Server libraries:** `ioredis` for Redis, `jose` for EdDSA, `pino` for logs (bridged to the OTel logs SDK, C62), `@vercel/otel` for traces, metrics and logs.
 - **Pages render dynamically.** The root layout reads the nonce header, so there's no static export (ADR 0009).
 - **Server components don't call services for page data.** Each page's server component only gates (session and role), then renders client components. Those components fetch through `/api/*` with TanStack Query, so every data path goes through the same route wrapper, error mapping and metrics.
 - **`next.config.ts`:**
-  - `serverExternalPackages: ["pino", "pino-opentelemetry-transport", "ioredis"]`;
+  - `serverExternalPackages: ["pino", "ioredis"]` (C62: no `pino-opentelemetry-transport`);
   - `poweredByHeader: false`;
   - `output: "standalone"`;
-  - `headers()` sets the static security headers (§5.6).
+  - `headers()` sets the static security headers (§5.6); HSTS depends on the runtime `ENV`, so `proxy.ts` sets it (C62).
 
 ## 1. Modules
 
@@ -39,7 +39,7 @@ All paths are under `apps/web/`. Everything is new.
 | `src/app/(app)/pay-runs/page.tsx`, `pay-runs/new/page.tsx`, `pay-runs/[id]/page.tsx` | Run list; create (payroll_admin); run detail with the `payslips` and `payouts` tabs (`?tab=`) |
 | `src/app/(app)/audit/page.tsx` | Auth audit and payroll audit tabs (admin) |
 
-Every `page.tsx` under `(app)` calls `requireSessionForPage(roles?)` itself. The layout's check isn't enough, because layouts aren't re-rendered on client navigation.
+Every `page.tsx` under `(app)` calls `requireSessionForPage(path, roles?)` itself (tested by `tests/app/page-gates.test.tsx`). The layout's check isn't enough, because layouts aren't re-rendered on client navigation.
 
 ### 1.2 BFF route handlers (`src/app/api/`)
 
@@ -85,14 +85,14 @@ Every module here starts with `import "server-only"`, except the ones marked *sh
 | Module | Responsibility |
 |---|---|
 | `lib/config.ts` | Parses `process.env` with Zod into a frozen `Config` (§8) and runs the web startup checks. Loaded lazily, so `next build` runs without secrets |
-| `lib/redis.ts` | The `ioredis` singleton built from `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME` (`web`) and `REDIS_PASSWORD` (C12): `commandTimeout = REDIS_SOCKET_TIMEOUT_MS`, `enableOfflineQueue: false`, `maxRetriesPerRequest: 1`, `lazyConnect`. With these settings a Redis outage fails fast instead of queueing |
+| `lib/redis.ts` | The `ioredis` singleton built from `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME` (`web`) and `REDIS_PASSWORD` (C12): `commandTimeout = REDIS_SOCKET_TIMEOUT_MS`, `connectTimeout = REDIS_SOCKET_TIMEOUT_MS`, `enableOfflineQueue: false`, `maxRetriesPerRequest: 1`, `enableReadyCheck: false` (the `web` ACL denies `INFO`, which the ready check runs; C62), connecting at server start (`lazyConnect: false`; `lib/otel.ts` calls `redis()`). With these settings a Redis outage fails fast instead of queueing. The client lives on `globalThis` (`lib/process-singleton.ts`), because Next bundles instrumentation, route handlers and pages separately (C62) |
 | `lib/session.ts` | The session store: `createSession`, `loadSession`, `touchSession`, `markRolesChecked`, `deleteSession`, `revokeUserSessions`, plus the cookie helpers (§4) |
-| `lib/require-session.ts` | `requireSession(roles?)` for route handlers and `requireSessionForPage(roles?)` for pages (§4.3) |
+| `lib/require-session.ts` | `resolveSession(cookie, {roles, ip})` (used by `route()`), `requireSession(roles?)` (reads `cookies()` and `headers()`) and `requireSessionForPage(path, roles?)` for pages (§4.3) |
 | `lib/internal-jwt.ts` | `internalToken()`: EdDSA minting (§3.4.1) |
 | `lib/api/resilient-fetch.ts` | `resilientFetch(target, opts)`: timeouts, GET retries, breaker, metrics, `X-Request-ID` (§3.4.2) |
 | `lib/api/breaker.ts` | A per-process circuit breaker per target |
-| `lib/api/identity.ts` | `identityClient(ctx)`: an `openapi-fetch` client over `IdentityPaths`, with a middleware that adds `Authorization: Bearer <jwt aud=identity>`, `X-Request-ID`, and `X-Client-IP` when the client IP is known. When `clientIp()` returns `null` the header is **omitted**, and identity puts the request in its shared `unknown` per-IP bucket (R18, C16) |
-| `lib/api/payroll.ts` | `payrollClient(ctx)`: the same over `PayrollPaths` (`aud=payroll`) |
+| `lib/api/clients.ts` | `identityClient(ctx)` and `payrollClient(ctx)`: `openapi-fetch` clients over `IdentityPaths` / `PayrollPaths`, with a middleware that adds `Authorization: Bearer <jwt aud=identity\|payroll>` and `X-Request-ID`; the identity client also adds `X-Client-IP` when the client IP is known. When `clientIp()` returns `null` the header is **omitted**, and identity puts the request in its shared `unknown` per-IP bucket (R18, C16). `slowPayrollFetch(ctx)` is the calculate/approve fetch (§3.4.2) |
+| `lib/api/call.ts` | `callService(target, route, call, schema)`: maps a non-2xx through the catalogue (§3.3) and parses a 2xx with its §2.4 schema |
 | `lib/route.ts` | The `route()` wrapper: the request pipeline (§3.1); `methodNotAllowed(allowed)` (§1.2) |
 | `lib/rate-limit.ts` | Sliding-window limiter on Redis (§5.1) |
 | `lib/client-ip.ts` | `clientIp(headers, hops)` from `X-Forwarded-For` and `TRUSTED_PROXY_HOPS`; `null` when unknown (§5.2) |
@@ -102,7 +102,10 @@ Every module here starts with `import "server-only"`, except the ones marked *sh
 | `lib/logger.ts` | The pino root logger: trace mixin, redactor (§7.1) |
 | `lib/metrics.ts` | OTel meter `web`: instruments (§7.2) |
 | `lib/csp.ts` | `buildCsp(nonce, env)` and `newNonce()` (§5.5) |
-| `lib/request-context.ts` | `AsyncLocalStorage<{requestId, logger}>` so the clients and the logger see the request ID |
+| `lib/request-context.ts` | `AsyncLocalStorage<{requestId}>` so the clients and the logger see the request ID |
+| `lib/process-singleton.ts` | Process-wide singletons on `globalThis` (the Redis client, breakers, the re-check single-flight map, the request context; C62) |
+| `lib/redact.ts` (*shared*) | The deep key redactor used by the logger (§7.1) |
+| `lib/otel.ts` | `startNode()`: config check, `registerOTel` (§7.4) |
 | `lib/schemas/*.ts` (*shared*) | Zod request and response schemas (§2.3, §2.4) |
 | `lib/money.ts` (*shared*) | Converts between strings and cents, percent and basis points, hours and hundredths, using integer string arithmetic with no `parseFloat` (ADR 0006); `formatCents()` |
 | `lib/aba.ts` (*shared*) | ABA routing checksum, for instant form feedback (payroll is authoritative) |
@@ -139,7 +142,7 @@ Every module here starts with `import "server-only"`, except the ones marked *sh
 
 - `<k>` = `HMAC-SHA256(SESSION_SECRET, <session id>)` as 64 hex chars. The cookie holds the raw ID (256 random bits, base64url, 43 chars). Redis holds only the HMAC, so a Redis dump or `MONITOR` output yields no usable cookie (R23, PAY-106).
 - **The JWT `sid` claim** is the first 32 hex chars of `<k>`. It's stable per session, can't be turned back into the cookie, and lets service logs be correlated with a session.
-- **ACL.** The ACL user `web` is defined by the platform design and provisioned in the deploy bootstrap; its password is the `.env`/secret value `REDIS_WEB_PASSWORD`, which the web container receives as `REDIS_PASSWORD` (C12). Its key pattern is `~web:*`, with no stream, scripting, pub/sub or admin commands. The web uses only these commands: `GET SET DEL EXISTS INCR EXPIRE PEXPIRE PTTL HSET HGET HGETALL SADD SREM SMEMBERS MULTI EXEC PING`. So web can't touch `stream:*`, `identity:*` or `payroll:*`, and can't `XADD` (PAY-607).
+- **ACL.** The ACL user `web` is defined by the platform design and provisioned in the deploy bootstrap; its password is the `.env`/secret value `REDIS_WEB_PASSWORD`, which the web container receives as `REDIS_PASSWORD` (C12). Its key pattern is `~web:*`, with no stream, scripting, pub/sub or admin commands. The web uses only these commands: `GET SET DEL EXISTS INCR EXPIRE PEXPIRE PTTL HSET HGET HGETALL SADD SREM SMEMBERS MULTI EXEC PING`. The ACL denies `INFO`, so the ioredis ready check is off (`enableReadyCheck: false`; C62). So web can't touch `stream:*`, `identity:*` or `payroll:*`, and can't `XADD` (PAY-607).
 
 ### 2.2 Session types (`lib/session.ts`)
 
@@ -258,7 +261,7 @@ export function route<B, Q, P>(def: RouteDef<B, Q, P>):
 
 **Steps.** Each one may throw a `BffError`, which step 10 turns into a response.
 
-1. **Context.** Read `x-request-id` from the request; `proxy.ts` set it. Otherwise generate a UUIDv7. Set `AsyncLocalStorage`. Read `traceId` from the active span.
+1. **Context.** Read `x-request-id` from the request (`proxy.ts` set it, and accepts an incoming one matching `^[0-9a-f-]{36}$`). Otherwise generate a UUIDv7. Set `AsyncLocalStorage`. Read `traceId` from the active span.
 2. **IP rate limit** (`scope=ip`, `BFF_RATE_LIMIT_IP` per minute). This applies to every route except `/api/livez`, `/api/readyz` and `/api/telemetry`, which has its own limit (§7.5).
    - If Redis fails and `publicLimiter === "fail_closed"`: 503 `service_unavailable`.
    - Otherwise the limit fails open: count `rate_limiter_errors_total{component="web"}` and log `ratelimit.backend_error`.
@@ -267,7 +270,7 @@ export function route<B, Q, P>(def: RouteDef<B, Q, P>):
    - `auth: {roles}` → `requireSession(roles)` (§4.3).
    - `"optional"` → load the session if the cookie is present; never throw 401.
    - `"public"` → skip.
-5. **Session rate limit** (`scope=sess`, `BFF_RATE_LIMIT_SESSION` per minute), when there's a session. It fails open.
+5. **Session rate limit** (`scope=session`, `BFF_RATE_LIMIT_SESSION` per minute), when there's a session. It fails open. `/api/telemetry` never spends it: the telemetry limit is its own (C63).
 6. **Params, query and headers:** Zod. A failure gives 422 `validation_error` with `details: [{field, issue}]` and no input values (C14). A malformed `[id]` also gives 422. A route that requires `Idempotency-Key` returns 400 `idempotency_key_required` when it is missing (C34).
 7. **Body:** `readJson(req, def.body, def.bodyLimit)` (§5.3): 413 `payload_too_large`, 400 `invalid_json`, or 422 `validation_error`.
 8. **Clients.** Build `identity` and `payroll` with a token provider bound to the session: `sub=user_id`, the session's `name`, roles, `cid` and `sid` (C10). Public routes use `sub=service:web` with no `name` or `sid` (R9).
@@ -283,10 +286,10 @@ export function route<B, Q, P>(def: RouteDef<B, Q, P>):
 Conventions for the table:
 - **"Origin ✓"** means step 3 applies.
 - **JWT:** `U` = a user token (`sub=<user_id>`, the session's `name`, roles, `cid` and `sid`). `S` = a service token (`sub=service:web`, `roles=[]`, `cid=COMPANY_ID`, no `name`, no `sid`; R9).
-- **Timeouts:** every call uses connect 1 s and read 3 s, except calculate and approve, which read for 10 s (§3.4.2).
+- **Timeouts:** every call has a 3 s per-attempt timeout (connect and read together), except calculate and approve, which get 10 s (§3.4.2).
 - **Pass-through responses** are the parsed §2.4 schema. **Lists** take `cursor` and `limit` (§2.3 `ListQuery`, plus the filters shown), pass them to the service unchanged, and return `Page<T>` (C8).
 - **Error mapping:** every route also maps these:
-  - 401 `unauthenticated` (no or ended session);
+  - 401 `unauthenticated` (no or ended session). The route handler answers it, with every standard header: `proxy.ts` doesn't gate `/api/*` (C63);
   - 403 `forbidden_role` (BFF or service);
   - 400 `invalid_json`, 400 `bad_request` (service), 403 `bad_origin`, 404 `not_found` (service), 405 `method_not_allowed`, 413 `payload_too_large`, 422 `validation_error`, 429 `rate_limited`;
   - 503 `service_unavailable` (upstream down, timeout, breaker open or Redis down), and 503 `db_timeout` / `db_unavailable` forwarded as 503 `service_unavailable`;
@@ -303,7 +306,7 @@ Conventions for the table:
 | POST `/api/auth/accept` | public; **fails closed** | ✓ | `AcceptBody` | identity `POST /v1/invites/accept` (S; `X-Client-IP` when known) → 200 `SessionUser` | 200 `{user: Me}` (`toMe(SessionUser)`) + `Set-Cookie` (new session) | 400 `invite_invalid`; 422 `password_too_weak`; 429 `rate_limited` | PAY-103, 106 |
 | POST `/api/auth/reset/request` | public; **fails closed** | ✓ | `ResetRequestBody` | identity `POST /v1/auth/password-reset/request` (S; `X-Client-IP` when known) → 202 | 202 `{}`, always (no account enumeration) | 429 `rate_limited` | PAY-105 |
 | POST `/api/auth/reset/confirm` | public; **fails closed** | ✓ | `ResetConfirmBody` | identity `POST /v1/auth/password-reset/confirm` (S; `X-Client-IP` when known) → 200 `ResetConfirmResult`; then **at once** `revokeUserSessions(user_id, "password_reset")`, deleting every session in `web:user-sess:<user_id>` (R19) | 204; the current cookie is cleared | 400 `reset_invalid`; 422 `password_too_weak`; 429 `rate_limited` | PAY-105 |
-| GET `/api/auth/me` | any role | — | none | identity `GET /v1/users/me` (U) → 200 `UserMe`. This is also a forced re-check: the §4.3 rules apply, and `roles_checked_at`, `roles` and `name` are updated | 200 `Me` (`toMe(UserMe)`) | — (identity's 404 `user_not_found` ends the session: 401) | PAY-106, 107 |
+| GET `/api/auth/me` | any role | — | none | identity `GET /v1/users/me` (U) → 200 `UserMe`. This is also a forced re-check: the §4.3 rules apply, and `roles_checked_at`, `roles` and `name` are updated | 200 `Me` (`toMe(UserMe)`). While the re-check is deferred (identity unavailable inside the C37 grace) there's no fresh profile, and the session holds no email, so this route answers **503 `service_unavailable`** (C62) | — (identity's 404 `user_not_found` ends the session: 401) | PAY-106, 107 |
 
 #### Users and invites (admin)
 
@@ -353,7 +356,7 @@ Conventions for the table:
 |---|---|---|---|---|---|---|---|
 | GET `/api/audit/auth` | admin | — | `ListQuery` | identity `GET /v1/audit-log?cursor&limit` (U) | 200 `Page<AuthAuditEvent>` (newest first) | — | PAY-109 |
 | GET `/api/audit/payroll` | admin | — | `ListQuery` | payroll `GET /v1/audit-events?cursor&limit` (U) | 200 `Page<PayrollAuditEvent>` (newest first) | — | plan §8 |
-| POST `/api/telemetry` | optional; own limit `BFF_TELEMETRY_RATE_LIMIT_IP`, failing open | ✓ | `TelemetryBody`, limit 8 KB | none | 204 | 429 `rate_limited` | §7.5 |
+| POST `/api/telemetry` | optional; own limit `BFF_TELEMETRY_RATE_LIMIT_IP`, failing open; never the session limit (C63) | ✓ | `TelemetryBody`, limit 8 KB | none | 204 | 429 `rate_limited` | §7.5 |
 | GET `/api/livez` | public, no limit | — | none | none | 200 `{status:"ok"}` | — | PAY-605 (web) |
 | GET `/api/readyz` | public, no limit | — | none | Redis `PING` | 200 `{status:"ok"}`, or 503 `service_unavailable` | — | PAY-605 (web) |
 | any method, unknown `/api/*` path | public, IP limit | — | none | none | — | 404 `not_found` | PAY-602 |
@@ -426,6 +429,8 @@ Every error response is `{error: {code, message, request_id, details?}}` (PAY-60
 | `payout_not_blocked` | 409 | "This payout isn't blocked any more. Refresh the page." | payroll (PAY-502) |
 | `resolve_too_early` | 409 | "This payout was blocked moments ago. Wait {Retry-After} seconds, check the bank again, then mark it rejected." (`Retry-After` forwarded) | payroll (PAY-502, C48) |
 | `pay_run_not_found`, `payslip_not_found`, `payout_not_found` | 404 | "That pay run / payslip / payout wasn't found." | payroll (R3, PAY-602) |
+| `unsupported_media_type` | 415 | "That request format isn't supported." | services (pycommon generic 415; C63) |
+| `conflict` | 409 | "That change conflicts with the current state. Reload and try again." | services (pycommon and payroll generic 409; C63) |
 | `request_failed` | as upstream (4xx) | "The request couldn't be completed." | BFF fallback |
 
 `mapUpstreamError(target, res | err, routeName)` is a pure function with one Vitest case per row.
@@ -463,15 +468,14 @@ export async function internalToken(aud: Aud, p:
 
 #### 3.4.2 Timeouts, retries and breaker (`lib/api/resilient-fetch.ts`, `lib/api/breaker.ts`)
 
-`openapi-fetch` clients are created per request with `createClient<IdentityPaths>({ baseUrl: IDENTITY_BASE_URL, fetch: resilientFetch("identity", opts) })`; payroll is the same. A middleware (`client.use`) adds `Authorization` and `X-Request-ID`, and adds `X-Client-IP` only when `ctx.ip` isn't null (C16).
+`openapi-fetch` clients are created per request (`lib/api/clients.ts`) with `createIdentityClient({ baseUrl: IDENTITY_BASE_URL, fetch: resilientFetch("identity", opts) })`; payroll is the same. Calculate and approve pass `fetch: slowPayrollFetch(ctx)` per call. A middleware (`client.use`) adds `Authorization` and `X-Request-ID`, and adds `X-Client-IP` only when `ctx.ip` isn't null (C16).
 
 | Policy | Value | Source |
 |---|---|---|
-| Connect timeout | `UPSTREAM_CONNECT_TIMEOUT_MS` = 1000. An `undici` `Agent({ connect: { timeout } })` is passed as `dispatcher`, with one agent per target (keep-alive) | plan §4 |
-| Read timeout, per attempt | `UPSTREAM_READ_TIMEOUT_MS` = 3000. `UPSTREAM_SLOW_READ_TIMEOUT_MS` = 10000 for `calculate` and `approve`. Implemented as `AbortSignal.any([req.signal, AbortSignal.timeout(ms)])` | plan §4 |
+| Timeout, per attempt | `UPSTREAM_READ_TIMEOUT_MS` = 3000; `UPSTREAM_SLOW_READ_TIMEOUT_MS` = 10000 for `calculate` and `approve`. **One timer bounds connect and read together**: there's no separate connect timeout and no `UPSTREAM_CONNECT_TIMEOUT_MS` key, because an `undici` 8 dispatcher needs Node ≥ 24 (C62). It's an explicit `setTimeout` plus an `AbortController`, not `AbortSignal.any([... AbortSignal.timeout(ms)])`: the latter's source signals hold their dependents weakly, so a pending attempt could be garbage-collected (NOTES.md). The timeout aborts with a `TimeoutError` | plan §4 |
 | Retries | **GET only**, at most `UPSTREAM_GET_RETRIES` = 2 (so 3 attempts). Retried on HTTP **429, 502, 503 and 504**, and on connection failures where nothing was sent (`ECONNREFUSED`, `ECONNRESET` before the request was written, connect timeout). A read timeout isn't retried. POST, PUT, PATCH and DELETE are never retried | plan §4 |
 | Backoff | Full jitter: `random(0, min(1000, 100 × 2^n))` ms. A `Retry-After` ≤ 1 s is honoured; a longer one isn't retried, and 429 `rate_limited` goes back with that header. No retry starts after `UPSTREAM_GET_DEADLINE_MS` (5000) from the first attempt | `architecture.md` §4 |
-| Breaker | One per target (`identity`, `payroll`) per process: **closed** → **open** after `BREAKER_FAILURES` (5) consecutive failures. Failures are connect errors, timeouts, 502, 503 and 504; 4xx and 500 don't count. **open** → **half-open** after `BREAKER_RESET_S` (30). In half-open, one probe request runs and the rest fail fast; a success closes the breaker and a failure re-opens it. While it's open, calls fail immediately with 503 `service_unavailable`, with no network call | plan §4, §2.2 |
+| Breaker | One per target (`identity`, `payroll`) per process: **closed** → **open** after `BREAKER_FAILURES` (5) consecutive failures. Failures are connect errors, timeouts, 502, 503 and 504; 4xx and 500 don't count. **open** → **half-open** after `BREAKER_RESET_S` (30). In half-open, one probe request runs and the rest fail fast; a success closes the breaker and a failure re-opens it. A probe the caller aborts gives no verdict: `breaker.release()` frees the probe slot, so the breaker can't stick in half-open (C63). While it's open, calls fail immediately with 503 `service_unavailable`, with no network call | plan §4, §2.2 |
 | Fallback | 503 `service_unavailable` with the mapped message. **Never a cached or stale response**: the BFF caches no service data | plan §4 |
 
 Each attempt:
@@ -503,15 +507,18 @@ Each attempt:
 ### 4.3 `requireSession(roles?)`
 
 ```ts
-export async function requireSession(roles?: Role[]): Promise<Session>        // route handlers: throws BffError
-export async function requireSessionForPage(roles?: Role[]): Promise<Session | "forbidden">
+export async function resolveSession(cookie: string | undefined, o?: { roles?: Role[]; ip?: string | null }): Promise<CheckedSession>
+  // the algorithm; route() calls it with the request's cookie and client IP. Throws BffError
+export async function requireSession(roles?: Role[]): Promise<CheckedSession>
+  // reads cookies() and headers() (client IP per §5.2, so a re-check sends X-Client-IP; C16)
+export async function requireSessionForPage(path: string, roles?: Role[]): Promise<CheckedSession | "forbidden">
   // pages: redirect("/login?next=<path>") on 401; returns "forbidden" (the page renders <Forbidden/>) on 403;
   // throws on 503 (error.tsx shows "temporarily unavailable")
 ```
 
 Algorithm (PAY-106, PAY-107, PAY-601, PAY-603):
 
-1. Read the cookie `SESSION_COOKIE_NAME` with `await cookies()`. If it's missing → 401 `unauthenticated`.
+1. Read the cookie `SESSION_COOKIE_NAME` (`req.cookies` in `route()`, `await cookies()` elsewhere). If it's missing → 401 `unauthenticated`.
 2. `k = HMAC(SESSION_SECRET, cookie)`. Then `HGETALL web:sess:<k>`.
    - **Redis error or timeout** (`REDIS_SOCKET_TIMEOUT_MS` = 500) → 503 `service_unavailable`. Log `session.backend_error` (error) and increment `bff_session_backend_errors_total`. Never fall back to "no session", and never fall back to "allow".
    - **Empty** → 401 `unauthenticated`, and the response clears the cookie.
@@ -522,8 +529,11 @@ Algorithm (PAY-106, PAY-107, PAY-601, PAY-603):
    - **200, and `id === session.user_id`, `company_id === session.cid`, `status === "active"` and `roles_version === session.roles_version`** → `HSET roles_checked_at now roles <JSON roles> name <name>`, writing `roles` and `name` from the response (C10).
    - **200 with a different `roles_version`, or a status other than `active`** → `revokeUserSessions(user_id, "roles_version_mismatch" | "inactive")`, log `auth.session.revoked`, then **401 `unauthenticated`**. The user signs in again and gets a new session with the new roles. If those roles no longer include the one an action needs, that action then returns 403 `forbidden_role`. So a demotion or deactivation always ends the session with 401 (PAY-107), and 403 can follow only after the user signs in again with fewer roles.
    - **200 with a different `id` or `company_id`** (should never happen) → log `bff.response_invalid`, revoke this session, then 401.
-   - **401 or 404 from identity** (user gone, token rejected) → revoke this session, then 401.
-   - **identity unavailable** (503, timeout or breaker open):
+   - **401 `invalid_token` from identity** (our signing key, kid or clock is wrong; the user can't fix it) → log `bff.upstream_auth_failed` (error) and answer **503 `service_unavailable`**, keeping the session and skipping the grace (C63).
+   - **Any other 401, or 404, from identity** (user gone) → delete this session, then 401.
+   - **identity 500 or another 5xx** that isn't 503 → 503 `service_unavailable` at once, with no fail-open grace (C63).
+   - **Another 4xx** → 500 `internal_error` (a bug on our side).
+   - **identity unavailable**: only a 503, a 429, a timeout, a connect error or an open breaker (C63):
      - If `now − roles_checked_at < SESSION_RECHECK_GRACE_S × 1000` (300 s), **fail open**: keep the cached roles, don't update `roles_checked_at`, and log `auth.session.recheck_deferred` (warning). This keeps signed-in journeys working while identity is down (plan §12.1, "other journeys still work for signed-in users"). It's safe because no role change or reset can happen while identity is down.
      - **Past the grace** → 503 `service_unavailable` (C37, PAY-107). A change made just before identity went down then takes effect at most `SESSION_RECHECK_GRACE_S` later. While identity is reachable, a demotion or deactivation at time T gives 401 on any request after T + 60 s (PAY-107).
 6. **Touch** (§4.2). A Redis error here is ignored and logged once, at warning.
@@ -600,10 +610,14 @@ export async function limit(scope: "ip" | "session" | "telemetry", subject: stri
 export function clientIp(h: Headers, hops: number): string | null     // null = unknown
 ```
 
-- Split `X-Forwarded-For` on commas and trim each entry. With `n` entries, return entry `n − 1 − hops`; the right-most entry has index `n − 1`.
-- If `n − 1 − hops < 0`, or the header is missing, return `null`. Unknown IPs share one limiter bucket (§5.1), the identity client **omits `X-Client-IP`** (C16), and it's logged at most once per minute as `security.client_ip_unknown` (warning).
+- **How Next 16 fills the header** (the R36 spike, `apps/web/NOTES.md`; C62): the standalone server sets `X-Forwarded-For` to the socket peer **only when the request has none**, and never appends. `NextRequest` has no `ip`, and a route handler can't reach the socket.
+- Split `X-Forwarded-For` on commas and trim each entry; `n` is the number of entries. Each of the `hops` trusted proxies appends the address it saw, so:
+  - `hops ≥ 1`: the client is entry **`n − hops`** (0-based); with one ingress that's the right-most entry;
+  - `hops = 0` (dev, no proxy): the right-most entry (`n − 1`). That's the peer when the client sent no header, which is the normal case for browsers, Playwright and k6. A client that sends its own header picks its limiter bucket, which is acceptable in dev only.
+- If the index is negative, or the header is missing, return `null`. Unknown IPs share one limiter bucket (§5.1), the identity client **omits `X-Client-IP`** (C16), and it's logged at most once per minute as `security.client_ip_unknown` (warning).
 - The left-most value is never trusted on its own (`architecture.md` §9).
-- **The dev value is 0 (no proxy).** This relies on the Next.js standalone server appending the socket peer address to `X-Forwarded-For`. Task S7 runs a short spike to confirm this on Next 16 (R36). If the peer address isn't available, local dev uses the `X-Forwarded-For` set by the Next server, and the outcome is recorded in the spec README. `TRUSTED_PROXY_HOPS = 1` in uat and prod (one ingress).
+- **uat and prod refuse `TRUSTED_PROXY_HOPS < 1`** at startup (`config.invalid`, exit 2; §8), because `hops = 0` would trust a client-supplied value. `TRUSTED_PROXY_HOPS = 1` there (one ingress).
+- An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is unwrapped to IPv4.
 - An entry that isn't a valid IPv4 or IPv6 address is treated as unknown (`null`).
 
 ### 5.3 Body limits (`lib/body.ts`, PAY-604)
@@ -638,18 +652,13 @@ export const config = {
 ```
 
 1. `requestId` = the incoming `x-request-id` if it matches `^[0-9a-f-]{36}$`; otherwise a new UUIDv7.
-2. `nonce = base64(crypto.getRandomValues(new Uint8Array(16)))`. `csp = buildCsp(nonce, ENV)`.
-3. **Open paths** pass without a cookie:
-   - pages: `/login`, `/accept`, `/reset`;
-   - `/api/auth/login`, `/api/auth/logout`, `/api/auth/accept`, `/api/auth/reset/request`, `/api/auth/reset/confirm`;
-   - `/api/telemetry`, `/api/livez`, `/api/readyz`.
-4. **Cookie gate.** If the cookie `SESSION_COOKIE_NAME` is absent:
-   - for `/api/*`, return 401 JSON `{error:{code:"unauthenticated", …, request_id}}`;
-   - for pages, redirect 307 to `/login?next=<pathname+search>`, keeping the path only and dropping any fragment.
+2. `nonce = base64(crypto.getRandomValues(new Uint8Array(16)))`. `csp = buildCsp(nonce, ENV, PUBLIC_BASE_URL)`. The proxy reads `ENV`, `SESSION_COOKIE_NAME` and `PUBLIC_BASE_URL` from `process.env` at run time and imports neither `lib/config.ts` nor Redis.
+3. **`/api/*` is never gated here** (C63). Each route handler runs `requireSession` and answers 401 `unauthenticated` itself, with `x-request-id`, `x-trace-id` and `Cache-Control: no-store` (PAY-604), and an unknown `/api/*` path gets 404 `not_found` from the fallback route.
+4. **Cookie gate for pages.** Open pages are `/login`, `/accept` and `/reset`. For any other page, if the cookie `SESSION_COOKIE_NAME` is absent, redirect 307 to `/login?next=<pathname+search>`, keeping the path only and dropping any fragment.
 
    Presence only: there's **no Redis lookup and no role check here** (PAY-601).
-5. Otherwise `NextResponse.next({ request: { headers } })`, with the request headers `x-nonce`, `x-request-id` and `Content-Security-Policy: csp`. Next.js reads the CSP from the request to put the nonce on its own scripts.
-6. **Response headers:** `Content-Security-Policy: csp` and `x-request-id`.
+5. Otherwise `NextResponse.next({ request: { headers } })`, with the request headers `x-nonce`, `x-request-id`, `x-pathname` (path plus search, so the `(app)` layout can build `next`) and `Content-Security-Policy: csp`. Next.js reads the CSP from the request to put the nonce on its own scripts.
+6. **Response headers:** `Content-Security-Policy: csp`, `x-request-id`, and in prod `Strict-Transport-Security` (§5.6).
 
 `buildCsp(nonce, env)` returns:
 
@@ -673,7 +682,7 @@ The app has no inline scripts of its own and no third-party origins. If one is e
 | `X-Frame-Options` | `DENY` | all |
 | `X-Content-Type-Options` | `nosniff` | all |
 | `Referrer-Policy` | `same-origin` | all |
-| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` | prod only (`ENV=prod`) |
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` | prod only (`ENV=prod`). Set by `proxy.ts`, not `headers()`: `ENV` is a run-time value and the build has none (C62) |
 | `Permissions-Policy` | `camera=(), microphone=(), geolocation=(), payment=()` | all |
 | `Cross-Origin-Opener-Policy` | `same-origin` | all |
 
@@ -709,7 +718,7 @@ The route wrapper adds `Cache-Control: no-store` to every `/api/*` response. Pag
 
 | Page | Purpose | Data (BFF) | Actions | Roles | Req |
 |---|---|---|---|---|---|
-| `/login` | Sign in | — | Submit `POST /api/auth/login`, then go to `next` (only a same-origin path that starts with `/` and not `//`), else `/dashboard`. 401 → "Email or password is incorrect."; 429 → countdown from `Retry-After`; 503 → "try again". A "Forgot password?" link goes to `/reset` | public | PAY-104 |
+| `/login` | Sign in | — | Submit `POST /api/auth/login`, then go to `next` when it's safe, else `/dashboard`. `safeNext()` refuses control characters and backslashes outright (the URL parser strips tab, CR and LF and reads `\\` as `/`, so `/\t/evil` would become `//evil`), resolves `new URL(next, location.origin)`, requires the same origin, and returns `pathname + search` (C63). 401 → "Email or password is incorrect."; 429 → countdown from `Retry-After`; 503 → "try again". A "Forgot password?" link goes to `/reset` | public | PAY-104 |
 | `/accept` | Accept an invite | — | On mount, read `location.hash` (`#token=…`), keep it in component state, and call `history.replaceState(null, "", "/accept")`, so the token leaves the address bar and history. The token is never put in a query string, log or telemetry. Fields: password and confirm (≥ 12). Submit `POST /api/auth/accept`, then `/dashboard`. 400 `invite_invalid` → its message, with no form | public | PAY-103, NFR-07 |
 | `/reset` | Request or confirm a reset | — | **No `#token`:** an email form → `POST /api/auth/reset/request` → always "If an account exists for that email, we've sent a reset link." **With `#token`:** read and strip it as on `/accept`; new password and confirm → `POST /api/auth/reset/confirm` → `/login` with the notice "Password changed. Sign in with your new password." | public | PAY-105 |
 | `/dashboard` | The landing page after sign-in | `GET /api/auth/me`; `GET /api/pay-runs?status=processing&limit=10`; `GET /api/pay-runs?status=partially_failed&limit=10`; `GET /api/pay-runs?limit=10`; `GET /api/employees?status=active&limit=50` (shows the exact count when `next_cursor` is null, else "50+") | Cards: runs in `processing` (link; "{counts.blocked} blocked" when non-zero), runs `partially_failed` (link, "needs attention"), the latest runs. Quick actions: "New pay run" and "Add employee" (payroll_admin) | any | PAY-303, 413 |
@@ -741,7 +750,7 @@ The route wrapper adds `Cache-Control: no-store` to every `/api/*` response. Pag
 | Delete | `draft` or `calculated` | payroll_admin | Confirm dialog, then `DELETE`, then `/pay-runs` |
 | Approve | `calculated` | approver | `approve-button.tsx` (§3.2). The confirm dialog shows the funding total and the employee count. If `require_dual_approval` is true and `calculated_by === Me.id`, a hint above the button says "You calculated this run. With dual approval on, another approver must approve it." The button stays enabled, because payroll also applies the bank-change rule, which the UI can't see. On 403 `approver_must_differ`, an inline `role="alert"` shows the dual-approval message (§3.3); 409 `employee_bank_details_missing` shows the approve message |
 
-**Tabs** (shadcn Tabs; `?tab=payslips|payouts`; the default is `payslips` before approval and `payouts` after):
+**Tabs** (`RunTabs` in `run-detail.tsx`, the WAI-ARIA tabs pattern without Radix: a roving `tabIndex`, ArrowLeft/ArrowRight/Home/End with automatic activation, one `role="tabpanel"` per tab with the inactive one `hidden` and unmounted; the default is `payslips` before approval and `payouts` after):
 - **Payslips** (`payslips-tab.tsx`). `GET …/payslips?cursor&limit=50` with a cursor pager (C8). One row per payslip: employee, pay type, hours, gross, tax, retirement, net (amounts "—" while `pending`). Clicking a row opens `payslip-dialog.tsx` (`GET …/payslips/[payslipId]`). The table footer shows the totals from the run summary, never sums computed in the browser.
 - **Hours editor** (`hours-editor.tsx`; payroll_admin, `draft`/`calculated` only). It loads **every** payslip by following `next_cursor` (`limit=100`) until it is null (C8), and lists the `hourly` ones with an input each (prefilled from `hours_hundredths`). Save sends one `HoursBody` with the changed rows (max 500 per request; more are sent in sequential requests of 500).
 - **Payouts** (`payouts-tab.tsx`, PAY-501). `GET …/payouts?cursor&limit=50` with a cursor pager and a status filter (all, requested, paid, failed). One row per payout: employee, amount (`amount_cents`), bank `••••<account_last4>` of the current attempt, badge, failure reason, attempt number, and a "History" disclosure (`attempt-history.tsx`) listing every attempt with its status, reason, bank reference, `••••account_last4`, `requested_at` and `final_at`. Rows link to their payslip by `payslip_id`.
@@ -798,10 +807,10 @@ Failure reasons display as: `account_closed` → "Account closed", `insufficient
 
 ### 7.1 Logs (`lib/logger.ts`, pino)
 
-- **Output:** JSON lines to stdout, and to OTLP through `pino-opentelemetry-transport` to Loki. Level `LOG_LEVEL`, read case-insensitively (the docs write it in uppercase; C24) and lower-cased for pino.
+- **Output:** JSON lines to stdout. When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, a second pino stream re-emits each (already redacted) line through the OTel logs API (`logs.getLogger("web").emit`, in the active context), and the `BatchLogRecordProcessor` that `lib/otel.ts` registers exports it to the Collector and Loki. There's no `pino-opentelemetry-transport` (C62). Level `LOG_LEVEL`, read case-insensitively (the docs write it in uppercase; C24) and lower-cased for pino.
 - **Base fields:** `service: "web"`, `env`, `version` (`APP_VERSION`).
 - **Added per line:**
-  - `ts` (ISO, `pino.stdTimeFunctions.isoTime`), `level` (label), `logger`, `event`, `msg`;
+  - `ts` (ISO), `level` (label), `event`, `msg`, and `route` (the route template, a child binding in `route()`);
   - `trace_id` and `span_id` from `trace.getActiveSpan()` (a mixin);
   - `request_id` from the AsyncLocalStorage (the same mixin).
 
@@ -810,6 +819,8 @@ Failure reasons display as: `account_closed` → "Account closed", `insufficient
   - the shared deny-list: `password`, `token`, `authorization`, `cookie`, `account`, `routing`, `api_key`;
   - web additions: `set-cookie`, `secret`, `private_key`, `session`, `sid`, `idempotency`, `email`, `name`, `note`, `cents`, `salary`, `rate`.
 
+  - **Exact allow-list:** `user_id_hash`, `ip_hash`, `note_len` and `message_len` contain a denied word but hold a derived value, so they stay readable. These are exact names, not suffixes: `password_hash` or `token_hash` are still masked (C63).
+
   The custom formatter is used because pino's path-based `redact` can't match keys at any depth. The `email` and `name` additions keep personal data and amounts out of logs, which carry IDs and counts only (plan §11). `account` also masks `account_last4`, which is acceptable.
 - **User-entered text** (client error messages) is logged as its length outside dev.
 - **User IDs** in logs are `user_id_hash` = the first 16 hex chars of `HMAC(SESSION_SECRET, user_id)`. Raw user IDs appear only on spans (a bounded need for debugging).
@@ -817,11 +828,11 @@ Failure reasons display as: `account_closed` → "Account closed", `insufficient
 | Event | Level | Fields | When | Req |
 |---|---|---|---|---|
 | `http.request` | info (debug for `/api/livez`, `/api/readyz`) | `method`, `route` (template), `status`, `duration_ms`, `user_id_hash?`, `code?` | Every BFF request, once | PAY-604, NFR-09 |
-| `bff.upstream_error` | warning | `target`, `operation` (operationId), `status?`, `code?`, `error_kind` (timeout, connect, breaker_open, http), `attempts` | Final failure of an upstream call | PAY-602 |
-| `bff.upstream_retry` | warning | `target`, `operation`, `attempt`, `status?`, `delay_ms` | Before each GET retry | plan §4 |
-| `bff.upstream_auth_failed` | error | `target`, `operation` | Upstream 401 `invalid_token` | PAY-600 |
+| `bff.upstream_error` | warning | `target`, `operation` (`"<METHOD> <path>"` with UUIDs replaced by `{id}`), `status?`, `code?`, `error_kind` (timeout, connect, breaker_open, http), `attempts` | Final failure of an upstream call | PAY-602 |
+| `bff.upstream_retry` | warning | `target`, `operation`, `attempt`, `delay_ms` | Before each GET retry | plan §4 |
+| `bff.upstream_auth_failed` | error | `target`, `operation` (the BFF route template, or `users_me` for the re-check) | Upstream 401 `invalid_token` (a route call, or the §4.3 re-check) | PAY-600 |
 | `bff.unmapped_error` | warning | `target`, `status`, `code` | An upstream code not in the catalog | PAY-602 |
-| `bff.response_invalid` | error | `target`, `operation`, `issues` (paths only) | A response fails its Zod schema | PAY-202, NFR-08 |
+| `bff.response_invalid` | error | `target`, `operation` (the BFF route template, or `users_me`), `issues` (paths only) | A response fails its Zod schema | PAY-202, NFR-08 |
 | `external.breaker.opened` / `external.breaker.closed` | warning / info | `target` | Breaker transition | plan §12.1 |
 | `auth.session.created` | info | `user_id_hash`, `via` (login, accept) | §4.1 | PAY-106 |
 | `auth.session.revoked` | info | `user_id_hash`, `reason`, `count` | §4.4 | PAY-107 |
@@ -833,10 +844,11 @@ Failure reasons display as: `account_closed` → "Account closed", `insufficient
 | `security.bad_origin` | warning | `route`, `origin_host` | 403 `bad_origin` | PAY-604 |
 | `security.payload_too_large` | warning | `route`, `bytes` | 413 | PAY-604 |
 | `security.client_ip_unknown` | warning | `xff_entries` (count) | At most once per minute | PAY-603 |
-| `web.vitals` | info | `name`, `value`, `rating`, `route` | Telemetry | §7.5 |
-| `web.client_error` | warning | `route`, `message` (dev) or `message_len` (uat, prod) | Telemetry | §7.5, NFR-07 |
+| `web.vitals` | info | `vital` (the metric name), `value`, `rating`, `page` (the page template). Not `name`/`route`: `name` is a denied key and `route` is the BFF route binding | Telemetry | §7.5 |
+| `web.client_error` | warning | `page`, `message` (dev) or `message_len` (uat, prod) | Telemetry | §7.5, NFR-07 |
 | `web.server_error` | error | `route`, `digest`, `exc` | `onRequestError` | PAY-602 |
 | `bff.payout_resolve` | info | `action`, `note_len`, `status` | §3.2 resolve route, after payroll answers (never the note text) | PAY-502 |
+| `bff.unhandled_error` | error | `exc` (the stack) | A non-`BffError` thrown in a route (answered 500 `internal_error`) | PAY-602 |
 | `config.invalid` | error | `setting` (name only, never the value) | Startup check fails (the process then exits 2; C29) | PAY-605 |
 
 ### 7.2 Metrics (`lib/metrics.ts`, meter `web`)
@@ -869,32 +881,20 @@ Failure reasons display as: `account_closed` → "Account closed", `insufficient
   - returned on every BFF response and in `error.request_id`.
 - **`x-trace-id`:** the active span's trace ID (32 hex), set in `route()` step 10 on every BFF response, error responses included (PAY-604). The web sends every span (`parentbased_always_on`; C23). In prod the Collector's `tail_sampling` keeps all errors, traces slower than 300 ms and 10% of the rest (R27), so the ID is always present but a fast, successful trace may not be stored. The test stack keeps every trace, which the e2e trace test relies on.
 
-### 7.4 Tracing (`src/instrumentation.ts`)
+### 7.4 Tracing (`src/instrumentation.ts`, `lib/otel.ts`)
 
-```ts
-import { registerOTel } from "@vercel/otel";
-export async function register() {
-  if (process.env.NEXT_RUNTIME !== "nodejs") return;
-  const { loadConfig } = await import("./lib/config");
-  const cfg = loadConfig();                                   // a failed check: logs config.invalid and exits 2 (C29)
-  const { IORedisInstrumentation } = await import("@opentelemetry/instrumentation-ioredis");
-  const { PeriodicExportingMetricReader } = await import("@opentelemetry/sdk-metrics");
-  const { OTLPMetricExporter } = await import("@opentelemetry/exporter-metrics-otlp-http");
-  registerOTel({
-    serviceName: "web",
-    attributes: { "service.version": cfg.APP_VERSION, "deployment.environment.name": cfg.ENV },
-    instrumentations: ["fetch", new IORedisInstrumentation({ dbStatementSerializer: (cmd) => cmd })], // command name only, never args
-    instrumentationConfig: { fetch: { propagateContextUrls: [originRegex(cfg.IDENTITY_BASE_URL), originRegex(cfg.PAYROLL_BASE_URL)] } },
-    metricReader: new PeriodicExportingMetricReader({ exporter: new OTLPMetricExporter(), exportIntervalMillis: 15000 }),
-  });
-}
-export { onRequestError } from "./lib/on-request-error";
-```
+`register()` runs on the Node.js runtime only, and not during `next build` (`NEXT_PHASE !== "phase-production-build"`, which has no secrets). It imports `lib/otel.ts`, whose `startNode()`:
+1. runs `loadConfig()` (a failed check logs `config.invalid` and exits 2; C29);
+2. calls `registerOTel({ serviceName: "web", attributes: { "service.version", "deployment.environment.name" }, instrumentations: ["fetch", new IORedisInstrumentation({ dbStatementSerializer: (cmd) => cmd })], instrumentationConfig: { fetch: { propagateContextUrls: [originRegex(IDENTITY_BASE_URL), originRegex(PAYROLL_BASE_URL)] } }, metricReaders, logRecordProcessors })`. With `OTEL_EXPORTER_OTLP_ENDPOINT` set, `metricReaders` is one `PeriodicExportingMetricReader` (OTLP HTTP, 15 s) and `logRecordProcessors` one `BatchLogRecordProcessor` (OTLP HTTP); otherwise both are empty;
+3. connects Redis (`redis()`), so the first request doesn't race the connection.
+
+`onRequestError` (from `lib/on-request-error.ts`) logs `web.server_error`. OTel packages are SDK 2.12 / 0.223, matching the `@vercel/otel` 2.x peer ranges (C62). `tests/lib/otel.test.ts` checks the wiring.
 
 - **`propagateContextUrls`** is built from `IDENTITY_BASE_URL` and `PAYROLL_BASE_URL` themselves (`originRegex` escapes the origin and anchors it as `^<origin>/`). So the test override that routes payroll through `toxiproxy:18001` still propagates `traceparent`. A missing host would silently break the J4 trace (PAY-NFR-09); `trace.spec.ts` catches that.
 - **Endpoint:** `OTEL_EXPORTER_OTLP_ENDPOINT` → the Collector on port 4318 (HTTP/protobuf). Sampler: `OTEL_TRACES_SAMPLER=parentbased_always_on` in every environment; there is no `OTEL_TRACES_SAMPLER_ARG` (C23). Prod sampling is the Collector's job (R27).
-- **If the pinned `@vercel/otel` has no `metricReader` option,** `lib/metrics.ts` creates its own `MeterProvider` with the same reader and sets it globally.
-- **Manual spans:** `bff.session.require` (attribute `session.recheck: boolean`) and `bff.session.recheck`.- **Span hygiene:**
+- **Instruments are created lazily** against the current global meter provider (`lib/metrics.ts`): the metrics API has no proxy meter, so instruments made before `register()` would stay no-ops.
+- **Manual spans:** `BFF <METHOD> <route template>` around each `route()` call (attributes `http.route`, `http.request.method`, `http.response.status_code`), and `bff.session.require` (attribute `session.recheck: boolean`).
+- **Span hygiene:**
   - span attributes carry route templates, never raw query strings;
   - `url.full` on fetch spans to services contains only IDs (no tokens, which are never in URLs: PAY-103);
   - the ioredis serializer drops arguments, so no session key or IP hash appears in spans;
@@ -904,8 +904,8 @@ export { onRequestError } from "./lib/on-request-error";
 
 - **Browser side** (`web-vitals.tsx`): `useReportWebVitals((m) => send({type: "vital", name: m.name, value: m.value, rating: m.rating, route}))`. Errors from `window.onerror` and `unhandledrejection` → `send({type: "error", message: String(e.message).slice(0, 500), route})`.
 - **Transport:** `send` uses `navigator.sendBeacon("/api/telemetry", new Blob([json], {type: "application/json"}))`, falling back to `fetch(…, {keepalive: true})`.
-- **`route`** is the Next route template (from `useSelectedLayoutSegments` mapped to `/pay-runs/[id]`), never the real path with IDs, and never the fragment.
-- **Server side:** auth `optional`; Origin check; 8 KB body; `BFF_TELEMETRY_RATE_LIMIT_IP` (60/min per IP), failing open. It logs `web.vitals` or `web.client_error` and returns 204. No metrics are derived from it in 0.1.0.
+- **`route`** is a page template: `routeTemplate(location.pathname)` replaces UUIDs with `[id]` (so `/pay-runs/[id]`), never the real path with IDs, the query or the fragment. The BFF accepts only `TelemetryRoute = /^\/[a-z0-9\-/[\]]*$/` (≤ 100 characters), so no free text reaches the logs through it (PAY-NFR-07, C63); the browser sends `/[other]` for anything else.
+- **Server side:** auth `optional`; Origin check; 8 KB body; `BFF_TELEMETRY_RATE_LIMIT_IP` (60/min per IP), failing open, and never the per-session limit (C63). It logs `web.vitals` or `web.client_error` and returns 204. No metrics are derived from it in 0.1.0.
 
 ## 8. Configuration
 
@@ -917,7 +917,8 @@ All keys are read once by `lib/config.ts` (Zod).
   - `PUBLIC_BASE_URL` isn't `https`;
   - `SESSION_COOKIE_NAME` isn't `__Host-sid`;
   - `SESSION_SECRET` is shorter than 32 bytes;
-  - `INTERNAL_JWT_PRIVATE_KEY` doesn't import as Ed25519 PKCS8.
+  - `INTERNAL_JWT_PRIVATE_KEY` doesn't import as Ed25519 PKCS8;
+  - `TRUSTED_PROXY_HOPS < 1`: with no proxy hop the BFF would trust a client-supplied `X-Forwarded-For` (§5.2; C62).
 - **Secrets** come from `.env` (`scripts/dev-env.sh`) in dev and CI, and from External Secrets in uat and prod.
 
 | Key | Type | Default dev / uat / prod | Notes | Req |
@@ -935,7 +936,7 @@ All keys are read once by `lib/config.ts` (Zod).
 | `REDIS_PORT` | int | 6379 (test override: 16379) | C1, C12 | PAY-607 |
 | `REDIS_USERNAME` | string | `web` | The ACL user (§2.1) | PAY-607 |
 | `REDIS_PASSWORD` | secret | `.env` / External Secrets: the value of `REDIS_WEB_PASSWORD` | Passed to ioredis as `password` | PAY-607 |
-| `REDIS_SOCKET_TIMEOUT_MS` | int | 500 | ioredis `commandTimeout` and `connectTimeout` | PAY-603 |
+| `REDIS_SOCKET_TIMEOUT_MS` | int | 500 | ioredis `commandTimeout` and `connectTimeout`; `enableReadyCheck: false` (C62) | PAY-603 |
 | `SESSION_SECRET` | secret (≥ 32 bytes) | `.env` / External Secrets | HMAC for session keys, limiter subjects, `user_id_hash` | PAY-106 |
 | `SESSION_COOKIE_NAME` | string | `sid` / `__Host-sid` / `__Host-sid` | | PAY-106 |
 | `SESSION_IDLE_TTL_S` | int | 43200 | | PAY-106 |
@@ -947,9 +948,8 @@ All keys are read once by `lib/config.ts` (Zod).
 | `BFF_RATE_LIMIT_IP` | int per min | 300 (test env 1000000) | | PAY-603 |
 | `BFF_TELEMETRY_RATE_LIMIT_IP` | int per min | 60 | R24 | §7.5 |
 | `BFF_BODY_LIMIT_BYTES` | int | 65536 | R24 | PAY-604 |
-| `TRUSTED_PROXY_HOPS` | int ≥ 0 | 0 / 1 / 1 | §5.2; the dev value is confirmed by the S7 spike (R36) | PAY-603 |
-| `UPSTREAM_CONNECT_TIMEOUT_MS` | int | 1000 | `UPSTREAM_*` keys hold the plan §4 values (R24) | plan §4 |
-| `UPSTREAM_READ_TIMEOUT_MS` | int | 3000 | Same | plan §4 |
+| `TRUSTED_PROXY_HOPS` | int ≥ 0 | 0 / 1 / 1 | §5.2 (the R36 spike result, C62). uat and prod refuse values below 1 | PAY-603 |
+| `UPSTREAM_READ_TIMEOUT_MS` | int | 3000 | `UPSTREAM_*` keys hold the plan §4 values (R24). One timer per attempt covers connect and read; there's no connect-timeout key (C62) | plan §4 |
 | `UPSTREAM_SLOW_READ_TIMEOUT_MS` | int | 10000 | Calculate and approve | plan §4, NFR-05 |
 | `UPSTREAM_GET_RETRIES` | int | 2 | | plan §4 |
 | `UPSTREAM_GET_DEADLINE_MS` | int | 5000 | No retry is started after this | plan §4 |
@@ -978,15 +978,16 @@ The web gates are ESLint, Prettier, `tsc --noEmit` and Vitest coverage ≥ 80% l
 - **Redis:** a small fake implementing the `RedisLike` port (`get/set/hset/hgetall/sadd/smembers/del/incr/expire/pexpire/multi`), with a fault switch.
 - **Clock:** fake timers (`vi.useFakeTimers()`).
 - **Route handlers** are tested as functions: import `{ POST }` from the route file and call it with a `NextRequest` built by `tests/helpers/request.ts` (cookie, Origin, body, params Promise). `next/headers` `cookies()` is mocked from the request.
-- **Integration files** (`*.int.test.ts`) use Testcontainers `redis:7-alpine` and run in the same CI job (`vitest --project integration`).
+- **Integration files** (`*.int.test.ts`) use Testcontainers `redis:7-alpine` and run in the same CI job (`vitest --project integration`). **Deferred (C63):** S7 ships none; `vitest.config.ts` already excludes the pattern. `rate-limit.int.test.ts` (PAY-603, two instances sharing counts, production values) lands with F5, and `session.int.test.ts` (PAY-106 TTLs, the `web` ACL `NOPERM` checks for PAY-607) with S8, when the stack's Redis exists. Until then the unit tests run against the in-memory `FakeRedis`.
+- **S7 file layout.** Several rows below are combined in fewer files: `tests/lib/security.test.ts` (client IP, rate limit, Origin, body, CSP), `tests/lib/observability.test.ts` (logger, redaction, metrics, `originRegex`), `tests/lib/otel.test.ts` (the `registerOTel` wiring), `tests/lib/shared.test.ts` (money, payout badge), `tests/api/infra.routes.test.ts` (health, fallback, standard headers, pipeline limits, telemetry), `tests/app/page-gates.test.tsx` (every `(app)` page and the layout call `requireSessionForPage`; PAY-601) and `tests/components/forms.test.tsx` (login, run create, list, telemetry client).
 
 | Test file | Covers | Req |
 |---|---|---|
 | `tests/lib/session.test.ts` | Create from a `SessionUser` (fields including `name` and `cid = company_id`, `HMAC` key, index `SADD`, TTL = idle); rotation deletes the old session at sign-in; touch only after 60 s; `PEXPIRE` = `min(idle, abs remaining)`; absolute expiry → null and deleted; sign-out `DEL` + `SREM`; `revokeUserSessions` deletes all and the index; a corrupt record → deleted | PAY-106 |
-| `tests/lib/require-session.test.ts` | No cookie → 401; unknown → 401 and cookie cleared; Redis error → 503 (never allow); re-check skipped < 60 s and called at ≥ 60 s (fake timers); `roles_version` mismatch → all sessions revoked + 401; status inactive → 401; identity 404 → 401; same version → `roles_checked_at`, `roles` and `name` updated (C10); identity down within `SESSION_RECHECK_GRACE_S` → allowed + `recheck_deferred`; at 300 s past the last check → 503 (C37); single-flight (5 parallel calls → 1 `/me`); roles mismatch → 403 with the session kept | PAY-106, 107, 601, 603 |
+| `tests/lib/require-session.test.ts` | No cookie → 401; unknown → 401 and cookie cleared; Redis error → 503 (never allow); re-check skipped < 60 s and called at ≥ 60 s (fake timers); `roles_version` mismatch → all sessions revoked + 401; status inactive → 401; identity 404 → 401; same version → `roles_checked_at`, `roles` and `name` updated (C10); identity down (503 or 429) within `SESSION_RECHECK_GRACE_S` → allowed + `recheck_deferred`; at 300 s past the last check → 503 (C37); identity 500 → 503 with no grace; identity 401 `invalid_token` → 503 + `bff.upstream_auth_failed`, session kept (C63); a page re-check sends `X-Client-IP`; single-flight (5 parallel calls → 1 `/me`); roles mismatch → 403 with the session kept | PAY-106, 107, 601, 603 |
 | `tests/lib/internal-jwt.test.ts` | Header `alg=EdDSA`, `kid`; claims `iss=web`, `aud` per target, `sub`, `roles`, `cid`, `sid` and `name` (user tokens only; R9, C10), `exp − iat = 60`, unique `jti`; verifies with the public key via `jose.jwtVerify`; public flow `sub=service:web`, `roles=[]`, `cid=COMPANY_ID`, and no `name` or `sid` claim; a missing key throws only on first use (build-safe) | PAY-600 |
-| `tests/lib/api/resilient-fetch.test.ts` | Connect and read timeouts → 503; 10 s for calculate and approve; GET retried twice on 429/502/503/504 and connect errors, not on 500/4xx/read timeout; POST, PUT, PATCH and DELETE never retried; `Retry-After` ≤ 1 s honoured, > 1 s not retried; deadline 5 s; `X-Request-ID` and `Authorization` sent; metrics outcome labels | plan §4 |
-| `tests/lib/api/breaker.test.ts` | Opens after 5 consecutive failures; fails fast with no fetch while open; half-open after 30 s lets one probe through; success closes, failure re-opens; 4xx and 500 don't count; `circuit_breaker_state` values | plan §4 |
+| `tests/lib/api/resilient-fetch.test.ts` | Per-attempt timeout → 503; 10 s for calculate and approve; GET retried twice on 429/502/503/504 and connect errors, not on 500/4xx/read timeout; POST, PUT, PATCH and DELETE never retried; `Retry-After` ≤ 1 s honoured, > 1 s not retried; deadline 5 s; `X-Request-ID` and `Authorization` sent; metrics outcome labels | plan §4 |
+| `tests/lib/api/breaker.test.ts` | Opens after 5 consecutive failures; fails fast with no fetch while open; half-open after 30 s lets one probe through; success closes, failure re-opens; an aborted probe frees the slot (`release()`, C63); 4xx and 500 don't count; `circuit_breaker_state` values | plan §4 |
 | `tests/lib/errors.test.ts` | One case per §3.3 row, including the C15 additions (`employee_not_in_run`, `idempotency_key_required`, `company_settings_not_found`, `payslip_not_found`, `not_found`, `method_not_allowed`, `bad_request`, `payout_not_blocked`, `anchor_locked`): status, code and message; context-specific `approver_must_differ` and `employee_bank_details_missing` messages; unknown 4xx → `request_failed`; unknown 5xx → 500; `invalid_token` → 500 + `bff.upstream_auth_failed`; `validation_error` details re-parsed to `[{field, issue}]` with extra keys (for example `input`) stripped (C14); `details.employee_ids` forwarded only for `not_hourly`, `employee_not_in_run`, `employee_in_overlapping_run` and `hours_missing`; no upstream message leaks | PAY-602 |
 | `tests/lib/rate-limit.test.ts` | Sliding-window estimate across a window boundary; deny at limit + 1 with `Retry-After`; subjects are hashed (no raw IP in keys); fail-closed vs fail-open per route mode; `rate_limiter_errors_total` | PAY-603 |
 | `tests/lib/rate-limit.int.test.ts` | Real Redis: **two limiter instances share counts**; **production values** 120/min per session and 300/min per IP limit (the 121st and 301st requests are 429) | PAY-603 |
@@ -994,7 +995,7 @@ The web gates are ESLint, Prettier, `tsc --noEmit` and Vitest coverage ≥ 80% l
 | `tests/lib/client-ip.test.ts` | hops 0/1/2 with 1–4 XFF entries; too few entries → `null`; invalid IP → `null`; never the left-most value when hops < n−1; with `null`, the identity client sends **no** `X-Client-IP` header (C16) and the limiter uses the shared `unknown` subject | PAY-603 |
 | `tests/lib/origin.test.ts` | Same origin passes; other scheme, host or port, `null`, or missing → 403 `bad_origin`; GET not checked | PAY-604 |
 | `tests/lib/body.test.ts` | Content-Length > 64 KB → 413 without reading; a chunked body over the limit → 413; bad JSON → 400; wrong content type → 422; schema errors → 422 with `[{field, issue}]` and no values | PAY-604, 602 |
-| `tests/lib/csp.test.ts`, `tests/proxy.test.ts` | CSP string per env (nonce, `strict-dynamic`, `unsafe-eval` dev only); unique nonce per request; `x-nonce` and CSP on the request headers; open paths pass without a cookie; `/api/*` without a cookie → 401 JSON; page → 307 `/login?next=`; with a cookie → passes **with no Redis access** (the redis module is not imported by `proxy.ts`) | PAY-604, 106, 601 |
+| `tests/lib/csp.test.ts`, `tests/proxy.test.ts` | CSP string per env (nonce, `strict-dynamic`, `unsafe-eval` dev only); unique nonce per request; `x-nonce` and CSP on the request headers; open pages and every `/api/*` path pass without a cookie (the route handler answers 401; C63); page → 307 `/login?next=`; with a cookie → passes **with no Redis access** (the redis module is not imported by `proxy.ts`) | PAY-604, 106, 601 |
 | `tests/lib/logger.test.ts` | Inside a span: JSON line with `trace_id`, `span_id`, `request_id`, `event`; deep redaction of every deny-list key (nested, mixed case); a token, cookie and JWT set during a full route call never appear in captured output | PAY-NFR-07, NFR-09 |
 | `tests/lib/metrics.test.ts` | `InMemoryMetricReader`: `bff_request_duration_seconds{route,status}` recorded once per request with the template route; failure paths increment `rate_limited_total{scope}`, `rate_limiter_errors_total{component="web"}`, `bff_upstream_requests_total{outcome}`; the exported Prometheus name is exact | PAY-NFR-04, 05, 10 |
 | `tests/lib/config.test.ts` | Startup checks: each refused setting in uat/prod logs `config.invalid` with its name only (not the value) and exits **2** (C29); a missing key exits 2 in every env; dev defaults accepted in dev; the C12 Redis keys are required and `REDIS_URL` isn't read; `LOG_LEVEL` accepts `INFO` and `info` (C24) | PAY-605 |
@@ -1014,7 +1015,7 @@ The web gates are ESLint, Prettier, `tsc --noEmit` and Vitest coverage ≥ 80% l
 | `tests/components/approve-button.test.tsx` | A new UUID per click, the same key within one click's mutation; disabled while pending; the dual-approval message in `role="alert"`; network error → refetch run → success state if `processing` | PAY-400, 401 |
 | `tests/components/retry-button.test.tsx`, `payouts-tab.test.tsx` | Retry only on failed rows for approvers; Resolve only on Blocked rows for approvers; retry messages; amount and `••••account_last4` columns; attempt history rows; cursor pager follows `next_cursor` and disables Next on null | PAY-500, 501, 502 |
 | `tests/components/resolve-dialog.test.tsx` | The bank-check warning is shown before the choices; no default choice; submit disabled until a choice and a 1–500 character note exist and while pending; sends `ResolveBody`; 409 `payout_not_blocked` in `role="alert"` and a payouts refetch; success invalidates the run and payouts; focus management | PAY-502, NFR-14 |
-| `tests/components/accept-form.test.tsx`, `reset-forms.test.tsx`, `login-form.test.tsx` | Token read from the fragment and stripped with `replaceState`; never sent in a URL; 12-character rule; mapped errors; `next` open-redirect guard | PAY-103–105 |
+| `tests/components/accept-form.test.tsx`, `reset-forms.test.tsx`, `login-form.test.tsx` | Token read from the fragment and stripped with `replaceState`; never sent in a URL; 12-character rule; mapped errors; `next` open-redirect guard, including `/\t/evil`, `/\n/evil` and backslashes (C63) | PAY-103–105 |
 | `tests/components/employee-form.test.tsx`, `hours-editor.test.tsx`, `settings-form.test.tsx`, `users-page.test.tsx`, `role-gate.test.tsx` | Field validation and inline 422 details; ABA checksum; bank fields never prefilled; reactivating an employee without bank details requires new ones; the hours editor follows `next_cursor` across 3 pages before showing rows, then refetches the run after save (C7, C8); `anchor_locked` on the anchor field; the users page shows Deactivate but **no Reactivate** (C25) and uses `pending_invite_id` for Resend; role-gated controls hidden | PAY-200–203, 301, 108, 601 |
 
 ### 9.2 Playwright (`apps/web/e2e/`)
@@ -1115,6 +1116,7 @@ Nightly runs the suite three times in a row (plan §12). No `waitForTimeout`: ev
 
 ## Change log
 
+- 2026-11-11: folded C62 (S7 follow-ups) and the web part of C63 into the body: §1 module list, §2.1 ACL, §3.1–§3.4.2 (no connect-timeout key, `release()`, `unsupported_media_type`/`conflict`, `/api/auth/me` 503 while deferred, telemetry outside the session budget), §4.3 (signatures; re-check outcomes per C63), §5.2 (the R36 result and formula), §5.5 (`/api/*` not gated), §5.6 (HSTS in `proxy.ts`), §6.2 (`safeNext`), §6.3 (tabs), §7.1 (OTel logs bridge, exact allow-list, real field names), §7.4, §7.5, §8, §9.1 (int-test deferral and file layout).
 - 2026-11-10: incorporated README R-table and C-table decisions (R3, R4, R8, R9, R17, R18, R19, R21, R22, R23, R24, R27, R33, R34, R36, R37; C4, C5, C6, C7, C8, C9, C10, C11, C12, C14, C15, C16, C23, C24, C25, C26, C27, C28, C29, C31, C33, C34, C35, C37, C44, C45).
 
 Resolved after the change log entry:

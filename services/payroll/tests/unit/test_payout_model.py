@@ -25,6 +25,7 @@ from hypothesis.stateful import (
 )
 from payroll.domain.state import (
     FINAL_ATTEMPT,
+    FINAL_RUN,
     AttemptStatus,
     PayoutStatus,
     ResultKind,
@@ -76,6 +77,9 @@ class PayoutModel(RuleBasedStateMachine):
         self.bank: dict[tuple[int, int], str] = {}  # key → "settled" | "rejected"
         self.stream: list[Message] = []
         self.next_event = 0
+        self.first_final_seen = False  # pay_runs.first_final_at IS NOT NULL
+        self.settlement_observations = 0  # payroll_payout_settlement_seconds observations
+        self.ever_final = False  # independent record: the run was final at some point
 
     # --- harness mirroring the services layer ----------------------------------------------
 
@@ -98,7 +102,18 @@ class PayoutModel(RuleBasedStateMachine):
         p.status = payout_status_for_attempt(d.new_status)
         if d.new_status in FINAL_ATTEMPT:
             p.final_seen.setdefault(attempt, d.new_status)
-        self.run_status = run_status_from_payouts(x.status for x in self.payouts.values())
+        self._recompute_run_status()
+
+    def _recompute_run_status(self) -> None:
+        """services/run_status.py: the run row changes only when the status changes; the first
+        entry into a final status sets first_final_at and observes the histogram once."""
+        new = run_status_from_payouts(x.status for x in self.payouts.values())
+        if new is self.run_status:
+            return
+        self.run_status = new
+        if new in FINAL_RUN and not self.first_final_seen:
+            self.first_final_seen = True
+            self.settlement_observations += 1
 
     # --- rules -------------------------------------------------------------------------------
 
@@ -113,7 +128,7 @@ class PayoutModel(RuleBasedStateMachine):
                     pid, amount, 1, PayoutStatus.REQUESTED, {1: AttemptStatus.REQUESTED}
                 )
                 self._publish(pid, 1)
-        self.run_status = run_status_from_payouts(p.status for p in self.payouts.values())
+        self._recompute_run_status()  # approve: processing, or paid at once (all no_transfer)
 
     @precondition(lambda self: bool(self.stream))
     @rule(target=consumers, index=st.integers(min_value=0, max_value=50))
@@ -237,10 +252,27 @@ class PayoutModel(RuleBasedStateMachine):
 
     @invariant()
     def run_status_matches_the_rule(self) -> None:
-        """PAY-406 (5): the stored run status equals run_status_from_payouts."""
-        if self.payouts:
-            expected = run_status_from_payouts(p.status for p in self.payouts.values())
-            assert self.run_status is expected
+        """PAY-406 (5): the stored run status, which the harness changes only on an applied
+        result (as services/run_status.py does), equals the plan's rule written out here
+        independently of run_status_from_payouts."""
+        if not self.payouts:
+            return
+        statuses = [p.status for p in self.payouts.values()]
+        if PayoutStatus.REQUESTED in statuses:
+            expected = RunStatus.PROCESSING
+        elif set(statuses) == {PayoutStatus.PAID}:
+            expected = RunStatus.PAID
+        else:
+            expected = RunStatus.PARTIALLY_FAILED
+        assert self.run_status is expected
+
+    @invariant()
+    def settlement_is_observed_once(self) -> None:
+        """PAY-406: the settlement histogram is observed exactly once once the run has been
+        final, and never before (checked after every step, so no final visit is missed)."""
+        if self.payouts and self.run_status is not RunStatus.PROCESSING:
+            self.ever_final = True
+        assert self.settlement_observations == (1 if self.ever_final else 0)
 
     @invariant()
     def final_attempts_never_change(self) -> None:

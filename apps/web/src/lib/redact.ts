@@ -26,15 +26,19 @@ const DENY = [
   "rate",
 ];
 
-/** Keys that carry a derived, non-sensitive value (a length or a hash) stay readable. */
-const ALLOW_SUFFIXES = ["_len", "_hash"];
+/**
+ * The exact keys that carry a derived, non-sensitive value (a length or an HMAC) and so stay
+ * readable although they contain a denied word. Exact names, not suffixes: `password_hash` or
+ * `token_hash` must still be masked (web LLD §7.1, C63).
+ */
+const ALLOW = new Set(["user_id_hash", "ip_hash", "note_len", "message_len"]);
 
 export const REDACTED = "[REDACTED]";
 const MAX_DEPTH = 6;
 
 export function isDeniedKey(key: string): boolean {
   const k = key.toLowerCase();
-  if (ALLOW_SUFFIXES.some((s) => k.endsWith(s))) return false;
+  if (ALLOW.has(k)) return false;
   return DENY.some((d) => k.includes(d));
 }
 

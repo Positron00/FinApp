@@ -12,7 +12,7 @@ from typing import Protocol
 
 import aiosmtplib
 from pycommon import Clock
-from pycommon.http import Guard, ProviderPolicy
+from pycommon.http import BreakerState, Guard, ProviderPolicy
 
 from identity.settings import IdentitySettings
 
@@ -20,6 +20,10 @@ __all__ = ["EmailSender", "SmtpSender", "error_label", "is_transient"]
 
 
 class EmailSender(Protocol):
+    def available(self) -> bool:
+        """False while the breaker is open, so the relay doesn't issue a token it can't send."""
+        ...
+
     async def send(self, msg: EmailMessage) -> None: ...
 
 
@@ -67,6 +71,10 @@ class SmtpSender:
             use_tls=False,
             timeout=s.identity_smtp_timeout_s,
         )
+
+    def available(self) -> bool:
+        # peek_state doesn't consume the half-open trial: the send itself takes it.
+        return self.guard.breaker.peek_state() is not BreakerState.open
 
     async def send(self, msg: EmailMessage) -> None:
         await self.guard.call("send", lambda: self._send_once(msg), retryable=is_transient)

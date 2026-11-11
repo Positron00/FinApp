@@ -24,6 +24,7 @@ from opentelemetry.trace import Link, Span, SpanKind, Status, StatusCode
 from pycommon import Clock, SystemClock
 from pycommon.logging import get_logger, log_event, redact
 from pycommon.otel import context_from_traceparent, tracer
+from pydantic import ValidationError
 
 from payout_worker.classify import (
     BankCallResult,
@@ -71,7 +72,7 @@ __all__ = [
 _log: Final = get_logger("payout_worker.handler")
 SPAN_NAME: Final = "payout.requested process"
 MAX_ERROR_CHARS: Final = 500
-_IDEM_SAFE: Final = re.compile(r"^[A-Za-z0-9._:-]{1,190}$")
+_IDEM_SAFE: Final = re.compile(r"[A-Za-z0-9._:-]{1,190}")  # always fullmatch (C63)
 
 ErrorKind = Literal["invalid", "payroll", "internal", "bank"]
 
@@ -222,11 +223,7 @@ class PayoutHandler:
                     d.payout_id, d.attempt, d.company_id, request_id=str(env.event_id)
                 )
             except AttemptNotCurrent:
-                await self._repo.finish(env, "attempt_not_current")
-                log_event(
-                    _log, logging.INFO, "payout.attempt_not_current", source="instruction", **lf
-                )
-                return Ack("attempt_not_current")
+                return await self._attempt_not_current(env, lf)
             except PayoutNotFound as exc:
                 return _dead("invalid", exc, "payout_not_found")
         fetched_at = self._clock.monotonic()
@@ -270,12 +267,15 @@ class PayoutHandler:
         # step 6; never start the POST later than HANDLER_DEADLINE_S after the fetch (C48)
         if self._clock.monotonic() - fetched_at > self._s.handler_deadline_s:
             return _retry("internal", WorkerInternalError, "handler_deadline")
-        body = TransferRequest(
-            amount_cents=ins.amount_cents,
-            currency=ins.currency,
-            routing=ins.routing.get_secret_value(),
-            account=ins.account.get_secret_value(),
-        )
+        try:
+            body = TransferRequest(
+                amount_cents=ins.amount_cents,
+                currency=ins.currency,
+                routing=ins.routing.get_secret_value(),
+                account=ins.account.get_secret_value(),
+            )
+        except ValidationError:  # never chained: its text would hold the digits (PAY-NFR-07)
+            raise PayrollRejected("malformed_response") from None
         created = await self._bank_call("create", key, body, delivery, lf)
         if isinstance(created, NotFound):  # pragma: no cover  (a POST is never NotFound)
             return NoAnswer("http_404", 404)
@@ -313,6 +313,26 @@ class PayoutHandler:
         with _child("payout.finish"):  # step 8.1; the consumer XACKs after we return
             await self._repo.finish(env, outcome, reason, bank_reference)
         return Ack(outcome)
+
+    async def _attempt_not_current(self, env: Envelope, lf: dict[str, Any]) -> HandleResult:
+        """Step 3, 409 ``attempt_not_current``: no bank call. A definite bank answer already
+        recorded for this attempt is reported first (key ``<event_id>:<outcome>``), since payroll
+        still applies ``settled``/``rejected`` to a ``needs_operator`` attempt (R7, C63)."""
+        d = env.data
+        stored = await self._repo.definite_answer(d.payout_id, d.attempt)
+        if stored is not None:
+            outcome: Outcome = "settled" if stored.outcome == "settled" else "rejected"
+            await self._report(env, outcome, stored.reason, stored.bank_reference, lf)
+        await self._repo.finish(env, "attempt_not_current")
+        log_event(
+            _log,
+            logging.INFO,
+            "payout.attempt_not_current",
+            source="instruction",
+            reported=stored.outcome if stored is not None else None,
+            **lf,
+        )
+        return Ack("attempt_not_current")
 
     # --- bank ----------------------------------------------------------------------------------
 
@@ -456,12 +476,14 @@ class PayoutHandler:
     async def _invalid_result(
         self, msg: StreamMessage, exc: InvalidMessage, lf: dict[str, Any]
     ) -> HandleResult:
-        if exc.payout_id is not None and exc.company_id is not None and exc.attempt is not None:
+        ids = exc.readable_ids()
+        if ids is not None:
+            payout_id, attempt, company_id = ids
             event_id = self._poison_event_id(msg, exc)
             try:
                 with _child("payout.report_result", {"payrun.outcome": "poison"}):
                     await self._post_poison(
-                        exc.payout_id, exc.company_id, exc.attempt, "schema_invalid", event_id
+                        payout_id, company_id, attempt, "schema_invalid", event_id
                     )
             except (PayrollUnavailable, PayrollRejected) as err:
                 return _retry("payroll", err, err.code)
@@ -476,7 +498,7 @@ class PayoutHandler:
             return str(exc.event_id)
         raw = msg.field("event_id")
         text = raw.decode(errors="replace") if raw is not None else ""
-        return text if _IDEM_SAFE.match(text) else msg.id
+        return text if _IDEM_SAFE.fullmatch(text) else msg.id
 
     # --- spans ---------------------------------------------------------------------------------
 

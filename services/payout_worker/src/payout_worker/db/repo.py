@@ -10,13 +10,14 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Final, Protocol
+from typing import Any, Final, Protocol
 from uuid import UUID
 
 from pycommon.db import new_id
 from pycommon.errors import db_error_kind
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import Text, case, delete, func, literal, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -24,9 +25,42 @@ from payout_worker.db.models import disbursements, processed_events
 from payout_worker.errors import WorkerInternalError
 from payout_worker.models import Envelope
 
-__all__ = ["PURGE_BATCH", "DisbursementRepo", "DisbursementRepoPort", "purge_processed_events"]
+__all__ = [
+    "DEFINITE",
+    "PURGE_BATCH",
+    "DisbursementRepo",
+    "DisbursementRepoPort",
+    "StoredAnswer",
+    "purge_processed_events",
+]
 
 PURGE_BATCH: Final = 1000
+DEFINITE: Final = ("settled", "rejected")
+
+
+@dataclass(frozen=True)
+class StoredAnswer:
+    """A definite bank answer recorded for an attempt (``settled`` or ``rejected``)."""
+
+    outcome: str
+    reason: str | None
+    bank_reference: str | None
+
+
+def _answer_values(outcome: str, reason: str | None) -> dict[str, Any]:
+    """``outcome``/``reason`` values that never overwrite a stored definite bank answer.
+
+    The bank's answer for one key never changes, so once ``settled`` or ``rejected`` is
+    recorded for an attempt it is kept: a later ``indeterminate``, ``poison`` or
+    ``attempt_not_current`` doesn't replace it (C63; it is reported on ``attempt_not_current``).
+    """
+    if outcome in DEFINITE:
+        return {"outcome": outcome, "reason": reason}
+    stored = disbursements.c.outcome.in_(DEFINITE)
+    return {
+        "outcome": case((stored, disbursements.c.outcome), else_=literal(outcome)),
+        "reason": case((stored, disbursements.c.reason), else_=literal(reason, Text)),
+    }
 
 
 class DisbursementRepoPort(Protocol):
@@ -50,6 +84,8 @@ class DisbursementRepoPort(Protocol):
         reason: str | None = None,
         bank_reference: str | None = None,
     ) -> None: ...
+
+    async def definite_answer(self, payout_id: UUID, attempt: int) -> StoredAnswer | None: ...
 
 
 class DisbursementRepo:
@@ -91,10 +127,14 @@ class DisbursementRepo:
         )
         stmt = stmt.on_conflict_do_update(
             constraint="disbursements_payout_attempt_uq",
-            set_={
+            set_={  # a definite bank answer is kept (C63); anything else is cleared
                 "status": "submitting",
-                "outcome": None,
-                "reason": None,
+                "outcome": case(
+                    (disbursements.c.outcome.in_(DEFINITE), disbursements.c.outcome), else_=None
+                ),
+                "reason": case(
+                    (disbursements.c.outcome.in_(DEFINITE), disbursements.c.reason), else_=None
+                ),
                 "last_event_id": stmt.excluded.last_event_id,
                 "deliveries": disbursements.c.deliveries + 1,
                 "updated_at": func.now(),
@@ -116,12 +156,31 @@ class DisbursementRepo:
                 update(disbursements)
                 .where(disbursements.c.payout_id == payout_id, disbursements.c.attempt == attempt)
                 .values(
-                    outcome=outcome,
-                    reason=reason,
+                    **_answer_values(outcome, reason),
                     bank_reference=func.coalesce(bank_reference, disbursements.c.bank_reference),
                     updated_at=func.now(),
                 )
             )
+
+    async def definite_answer(self, payout_id: UUID, attempt: int) -> StoredAnswer | None:
+        """The attempt's recorded ``settled``/``rejected`` answer, if any (C63)."""
+        async with self._tx() as s:
+            row = (
+                await s.execute(
+                    select(
+                        disbursements.c.outcome,
+                        disbursements.c.reason,
+                        disbursements.c.bank_reference,
+                    ).where(
+                        disbursements.c.payout_id == payout_id,
+                        disbursements.c.attempt == attempt,
+                        disbursements.c.outcome.in_(DEFINITE),
+                    )
+                )
+            ).first()
+        if row is None:
+            return None
+        return StoredAnswer(row.outcome, row.reason, row.bank_reference)
 
     async def finish(
         self,
@@ -140,8 +199,7 @@ class DisbursementRepo:
                 )
                 .values(
                     status="done",
-                    outcome=outcome,
-                    reason=reason,
+                    **_answer_values(outcome, reason),
                     bank_reference=func.coalesce(bank_reference, disbursements.c.bank_reference),
                     updated_at=func.now(),
                 )

@@ -190,3 +190,23 @@ async def test_caller_key_format_is_shared() -> None:
     await dep(_request(limiter), _principal("web", "u-1"))
     digest = hashlib.sha256(b"web:u-1").hexdigest()[:32]
     assert fake.log[0][0] == ("incr", f"payroll:rl:caller:{digest}:10")
+
+
+async def test_record_denied_and_record_error_for_service_decisions(
+    otel_memory: OtelMemory, caplog_json: JsonLogCapture, fake_clock: FakeClock
+) -> None:
+    """C63: services count their own denials and Redis errors through the limiter's counters."""
+    limiter = _limiter(FakeRedis(), fake_clock, component="login")
+    assert limiter.component == "login"
+    limiter.record_denied("login_locked")
+    limiter.record_denied("login_locked")
+    limiter.record_error(redis.exceptions.TimeoutError("slow"), fail_mode=FailMode.closed)
+    limiter.record_error()  # within 10 s: counted, not logged again
+    assert otel_memory.metric_points("rate_limited") == [({"scope": "login_locked"}, 2)]
+    assert otel_memory.metric_points("rate_limiter_errors") == [({"component": "login"}, 2)]
+    (event,) = caplog_json.events("ratelimit.backend_error")
+    assert (event["component"], event["fail_mode"], event["error_type"]) == (
+        "login",
+        "closed",
+        "TimeoutError",
+    )

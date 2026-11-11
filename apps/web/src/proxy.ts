@@ -5,22 +5,13 @@ import { REQUEST_ID_RE, uuidv7 } from "./lib/ids";
 
 /**
  * The request interceptor (web LLD §5.5, ADR 0009). It is NOT a security boundary
- * (architecture.md §9, CVE-2025-29927): it only checks that the session cookie is present, sets
- * the CSP nonce and the request ID. Every route handler and page calls requireSession() itself
+ * (architecture.md §9, CVE-2025-29927): for pages it only checks that the session cookie is
+ * present (redirecting to /login otherwise); it sets the CSP nonce and the request ID. Every route handler and page calls requireSession() itself
  * (PAY-601). No Redis and no config module here: it reads the few settings it needs directly.
  */
 
+/** Pages that open without a session cookie. `/api/*` is never gated here (C63). */
 const OPEN_PAGES = new Set(["/login", "/accept", "/reset"]);
-const OPEN_API = new Set([
-  "/api/auth/login",
-  "/api/auth/logout",
-  "/api/auth/accept",
-  "/api/auth/reset/request",
-  "/api/auth/reset/confirm",
-  "/api/telemetry",
-  "/api/livez",
-  "/api/readyz",
-]);
 
 export function proxy(req: NextRequest): NextResponse {
   const env = process.env.ENV ?? "dev";
@@ -32,27 +23,15 @@ export function proxy(req: NextRequest): NextResponse {
   const nonce = newNonce();
   const csp = buildCsp(nonce, env, publicBaseUrl);
   const { pathname, search } = req.nextUrl;
-  const open = OPEN_PAGES.has(pathname) || OPEN_API.has(pathname);
+  // `/api/*` always passes: each route handler runs requireSession and answers 401 itself,
+  // with x-request-id, x-trace-id and Cache-Control (PAY-604), and unknown paths get 404 (C63).
+  const gated = !pathname.startsWith("/api/") && !OPEN_PAGES.has(pathname);
 
   let res: NextResponse;
-  if (!open && !req.cookies.has(cookieName)) {
-    if (pathname.startsWith("/api/")) {
-      res = NextResponse.json(
-        {
-          error: {
-            code: "unauthenticated",
-            message: "Your session has ended. Please sign in again.",
-            request_id: requestId,
-          },
-        },
-        { status: 401 },
-      );
-      res.headers.set("Cache-Control", "no-store");
-    } else {
-      const login = new URL("/login", req.nextUrl.origin);
-      login.searchParams.set("next", `${pathname}${search}`);
-      res = NextResponse.redirect(login, 307);
-    }
+  if (gated && !req.cookies.has(cookieName)) {
+    const login = new URL("/login", req.nextUrl.origin);
+    login.searchParams.set("next", `${pathname}${search}`);
+    res = NextResponse.redirect(login, 307);
   } else {
     const headers = new Headers(req.headers);
     headers.set("x-nonce", nonce);

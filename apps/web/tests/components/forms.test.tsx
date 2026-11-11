@@ -43,6 +43,16 @@ describe("LoginForm", () => {
     expect(safeNext(undefined)).toBe("/dashboard");
   });
 
+  // PAY-104, C63: the URL parser strips tab/CR/LF and reads "\" as "/", so these would
+  // otherwise become protocol-relative off-site redirects.
+  it("refuses control characters and backslashes", () => {
+    const o = "http://127.0.0.1:4100";
+    expect(safeNext("/\t/evil.example", o)).toBe("/dashboard");
+    expect(safeNext("/\n/evil.example", o)).toBe("/dashboard");
+    expect(safeNext("/%5Cevil", o)).toBe("/%5Cevil"); // stays a same-origin path
+    expect(safeNext("/pay-runs?tab=payouts#x", o)).toBe("/pay-runs?tab=payouts");
+  });
+
   async function fill() {
     await userEvent.type(screen.getByLabelText("Email"), "owner@payrun.example.com");
     await userEvent.type(screen.getByLabelText("Password"), "correct horse");
@@ -133,6 +143,14 @@ describe("RunCreateForm", () => {
     renderWithClient(<RunCreateForm />);
     await userEvent.click(screen.getByRole("button", { name: "Create pay run" }));
     expect((await screen.findByRole("alert")).textContent).toContain("A pay run already exists");
+  });
+
+  // PAY-602 (§6.1): no response at all still shows a message.
+  it("shows a message on a network error", async () => {
+    stubApi(() => new TypeError("Failed to fetch"));
+    renderWithClient(<RunCreateForm />);
+    await userEvent.click(screen.getByRole("button", { name: "Create pay run" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("temporarily unavailable");
   });
 });
 
@@ -246,6 +264,7 @@ describe("shell and shared UI", () => {
   // §7.5, PAY-NFR-07: telemetry uses route templates and sendBeacon, falling back to fetch.
   it("sends telemetry with route templates", async () => {
     expect(routeTemplate("/pay-runs/0193a000-0000-7000-8000-0000000000b1")).toBe("/pay-runs/[id]");
+    expect(routeTemplate("/Weird Path")).toBe("/[other]");
     const beacon = vi.fn(() => false);
     Object.defineProperty(navigator, "sendBeacon", { configurable: true, value: beacon });
     const calls = stubApi(() => ({ status: 204 }));

@@ -38,10 +38,24 @@ build-backend = "hatchling.build"
 packages = ["src/pycommon"]
 
 [tool.pytest.ini_options]
-# pytest-socket auto-registers as "socket"; the gate passes "-p pytest_socket" explicitly, which
-# would register it a second time, so the entry-point copy is disabled here.
+# pytest-socket auto-loads from its entry point, so the unit gate passes only
+# "--disable-socket --allow-unix-socket", never "-p pytest_socket" (C58).
+addopts = "--strict-markers"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 timeout = 60
 testpaths = ["tests"]
 markers = ["integration: needs Docker (Testcontainers)"]
+
+# Read when the gate runs from this directory (coverage uses the nearest pyproject.toml).
+# PAY-NFR-12: pycommon ≥ 90% line coverage, branch coverage on (C63: fail_under per member).
+[tool.coverage.run]
+branch = true
+parallel = true
+source = ["pycommon"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "@overload"]

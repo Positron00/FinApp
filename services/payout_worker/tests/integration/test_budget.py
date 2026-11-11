@@ -44,7 +44,7 @@ async def test_bank_unreachable_becomes_indeterminate(stack: Stack) -> None:
 
 
 async def test_payroll_unreachable_dead_letters_at_budget(
-    stack: Stack, otel_memory: OtelMemory
+    otel_memory: OtelMemory, stack: Stack
 ) -> None:
     """PAY-408, C21: payroll unreachable → pending until delivery 3, then one DLQ entry with the
     eight fields, the entry ACKed, queue_messages_total{dlq} 0 → 1."""

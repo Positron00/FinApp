@@ -7,4 +7,4 @@ Options:
 2. Sealed Secrets: encrypted secrets committed to the repo. Workable, but committing even encrypted secrets to a public repo is avoidable.
 Recommendation: option 1. The startup checks refuse dev defaults and `dev-`/`test-` key ids in uat and prod.
 Decision: the recommendation above, accepted by the user on 2026-11-10 (plan sign-off).
-Consequences: the prod overlay has `ExternalSecret` custom resources, so kubeconform needs CRD schemas. Real secret-store setup is the user's.
+Consequences: the uat and prod overlays have `ExternalSecret` custom resources (spec R29), so kubeconform needs CRD schemas. Real secret-store setup is the user's.

@@ -47,6 +47,15 @@ export const IdParam = z.strictObject({ id: Uuid });
 export const RunPayslipParam = z.strictObject({ id: Uuid, payslipId: Uuid });
 export const RunPayoutParam = z.strictObject({ id: Uuid, payoutId: Uuid });
 
+/**
+ * §7.5: `route` is a page template such as "/pay-runs/[id]" (IDs replaced in the browser),
+ * never free text, so nothing user-entered reaches the logs through it (PAY-NFR-07, C63).
+ */
+export const TelemetryRoute = z
+  .string()
+  .max(100)
+  .regex(/^\/[a-z0-9\-/[\]]*$/);
+
 /** §7.5. */
 export const TelemetryBody = z.discriminatedUnion("type", [
   z.strictObject({
@@ -54,12 +63,12 @@ export const TelemetryBody = z.discriminatedUnion("type", [
     name: z.enum(["CLS", "FCP", "INP", "LCP", "TTFB"]),
     value: z.number().min(0),
     rating: z.enum(["good", "needs-improvement", "poor"]),
-    route: z.string().max(100),
+    route: TelemetryRoute,
   }),
   z.strictObject({
     type: z.literal("error"),
     message: z.string().max(500),
-    route: z.string().max(100),
+    route: TelemetryRoute,
   }),
 ]);
 export type TelemetryBody = z.infer<typeof TelemetryBody>;

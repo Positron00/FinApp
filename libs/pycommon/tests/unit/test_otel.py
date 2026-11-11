@@ -254,7 +254,7 @@ def test_observable_gauge_reports_at_collection_and_skips_failures(
             raise RuntimeError("db down")
         return {frozenset({("status", "pending")}): state["value"]}
 
-    observable_gauge("queue_depth", unit="1", description="d", callback=callback)
+    observable_gauge("queue_depth", unit="{entry}", description="d", callback=callback)
     assert otel_memory.metric_points("queue_depth") == [({"status": "pending"}, 3.0)]
     state["value"] = 5.0
     assert otel_memory.metric_points("queue_depth") == [({"status": "pending"}, 5.0)]
@@ -266,6 +266,22 @@ def test_observable_gauge_reports_at_collection_and_skips_failures(
         "RuntimeError",
         "warning",
     )
+
+
+def test_gauges_refuse_unit_one(otel_memory: OtelMemory) -> None:
+    """C63: a gauge with unit "1" would be exported as <name>_ratio, so it is refused."""
+    with pytest.raises(ValueError, match="_ratio"):
+        observable_gauge("x_gauge", unit="1", description="d", callback=dict)
+
+
+def test_pycommon_gauges_have_no_ratio_unit(otel_memory: OtelMemory) -> None:
+    """C63: circuit_breaker_state uses a curly-brace unit, so Prometheus keeps its name."""
+    from pycommon.http import CircuitBreaker  # noqa: PLC0415
+
+    breaker = CircuitBreaker("unit-check", failures=5, reset_s=30)
+    assert otel_memory.metric_points("circuit_breaker_state") == [({"target": "unit-check"}, 0)]
+    assert breaker.state == 0
+    assert otel_memory.metric_unit("circuit_breaker_state") == "{state}"
 
 
 def test_traceparent_round_trip(otel_memory: OtelMemory) -> None:
@@ -345,3 +361,44 @@ def test_default_providers_use_otlp_and_cumulative_temporality(
         tp.shutdown()
         mp.shutdown(timeout_millis=100)
         lp.shutdown()
+
+
+_MODULE_COUNTER = otel.meter("isolation-test").create_counter("isolation_hits", unit="1")
+
+
+@pytest.mark.parametrize("hits", [2, 3])
+def test_otel_memory_isolates_tests_without_resetting_globals(
+    otel_memory: OtelMemory, hits: int
+) -> None:
+    """C61, C63: an instrument created at import time reports to the same session provider in
+    every test, and each test sees only its own measurements."""
+    from opentelemetry import metrics  # noqa: PLC0415
+
+    assert metrics.get_meter_provider() is otel_memory.meter_provider
+    for _ in range(hits):
+        _MODULE_COUNTER.add(1, {"k": "v"})
+    assert otel_memory.metric_points("isolation_hits") == [({"k": "v"}, hits)]
+    _MODULE_COUNTER.add(1, {"k": "v"})
+    assert otel_memory.metric_points("isolation_hits") == [({"k": "v"}, hits + 1)]
+
+
+def test_reregistered_gauge_uses_the_latest_callback(otel_memory: OtelMemory) -> None:
+    """C63: a second app instance re-registering a gauge replaces the callback, not ignored."""
+    first = observable_gauge("rereg_gauge", unit="{entry}", description="d", callback=dict)
+    second = observable_gauge(
+        "rereg_gauge", unit="{entry}", description="d", callback=lambda: {frozenset(): 7.0}
+    )
+    assert first is second
+    assert otel_memory.metric_points("rereg_gauge") == [({}, 7.0)]
+
+
+def test_otel_memory_adds_histogram_deltas(otel_memory: OtelMemory) -> None:
+    """C63: histogram points accumulate across reads within one test."""
+    h = histogram("iso_duration_seconds", unit="s", description="d", buckets=SECONDS_BUCKETS)
+    h.record(0.2)
+    ((_, first),) = otel_memory.metric_points("iso_duration_seconds")
+    assert first.count == 1
+    h.record(3.0)
+    ((_, second),) = otel_memory.metric_points("iso_duration_seconds")
+    assert (second.count, second.sum, second.min, second.max) == (2, 3.2, 0.2, 3.0)
+    assert sum(second.bucket_counts) == 2

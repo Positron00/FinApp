@@ -227,6 +227,31 @@ class PayRunRepo:
 
 class PayslipRepo:
     @staticmethod
+    async def coverage(
+        session: AsyncSession,
+        company_id: UUID,
+        employee_ids: Sequence[UUID],
+        new_start: Any,
+        new_end: Any,
+    ) -> list[tuple[UUID, Any, Any]]:
+        """``(employee_id, period_start, period_end)`` of non-deleted runs overlapping the range
+        (design §4.4 "Create" step 5; PAY-300)."""
+        if not employee_ids:
+            return []
+        stmt = (
+            select(Payslip.employee_id, PayRun.period_start, PayRun.period_end)
+            .join(PayRun, PayRun.id == Payslip.pay_run_id)
+            .where(
+                PayRun.company_id == company_id,
+                PayRun.deleted_at.is_(None),
+                Payslip.employee_id.in_(list(employee_ids)),
+                PayRun.period_start <= new_end,
+                PayRun.period_end >= new_start,
+            )
+        )
+        return [(e, s, t) for e, s, t in (await session.execute(stmt)).all()]
+
+    @staticmethod
     async def for_run(session: AsyncSession, company_id: UUID, run_id: UUID) -> list[Payslip]:
         stmt = (
             select(Payslip)

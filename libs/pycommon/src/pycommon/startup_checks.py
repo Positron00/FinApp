@@ -216,16 +216,30 @@ COMMON_CHECKS: Final[tuple[StartupCheck, ...]] = (
 )
 
 
-def run_startup_checks(settings: BaseServiceSettings, extra: Sequence[StartupCheck] = ()) -> None:
-    """Run the common checks plus ``extra``; in uat/prod a failure exits 2 (C29)."""
+def run_startup_checks(
+    settings: BaseServiceSettings,
+    extra: Sequence[StartupCheck] = (),
+    *,
+    fatal: Sequence[StartupCheck] = (),
+) -> None:
+    """Run the common checks plus ``extra``; in uat/prod a failure exits 2 (C29).
+
+    ``fatal`` checks exit 2 in **every** env, dev included: they guard settings without which
+    the service can't work at all (e.g. a missing JWT keyset; C63).
+    """
     failures: list[CheckFailure] = []
     for check in (*COMMON_CHECKS, *extra):
         failures.extend(check(settings))
-    if not failures:
+    fatal_failures: list[CheckFailure] = []
+    for check in fatal:
+        fatal_failures.extend(check(settings))
+    if not failures and not fatal_failures:
         return
     strict = settings.env is not Env.dev
     level = logging.ERROR if strict else logging.WARNING
     for f in failures:
         log_event(_log, level, "startup.check_failed", setting=f.setting, reason=f.reason)
-    if strict:
+    for f in fatal_failures:
+        log_event(_log, logging.ERROR, "startup.check_failed", setting=f.setting, reason=f.reason)
+    if strict or fatal_failures:
         raise SystemExit(2)

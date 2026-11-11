@@ -37,3 +37,7 @@ timeout = 120
 testpaths = ["tests"]
 addopts = "--strict-markers"
 markers = ["integration: needs Docker (Testcontainers)", "smoke: PR fault smoke tests"]
+
+[tool.coverage.report]
+# Services gate at 85% (C63); pycommon at 90%.
+fail_under = 85

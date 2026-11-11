@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import os
@@ -29,8 +30,15 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from opentelemetry import _logs, metrics, trace
 from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter, SimpleLogRecordProcessor
+from opentelemetry.sdk.metrics import Counter as SdkCounter
+from opentelemetry.sdk.metrics import Histogram as SdkHistogram
 from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+from opentelemetry.sdk.metrics import UpDownCounter as SdkUpDownCounter
+from opentelemetry.sdk.metrics.export import (
+    AggregationTemporality,
+    HistogramDataPoint,
+    InMemoryMetricReader,
+)
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -53,6 +61,7 @@ __all__ = [
     "TokenFactory",
     "find_repo_root",
     "reset_otel_globals",
+    "session_otel",
 ]
 
 FAKE_EPOCH: Final = datetime(2026, 11, 10, 12, 0, 0, tzinfo=UTC)
@@ -125,7 +134,10 @@ def fake_clock() -> FakeClock:
 
 
 def reset_otel_globals() -> None:
-    """Allow ``set_*_provider`` again (OTel only allows it once per process)."""
+    """Allow ``set_*_provider`` again (OTel only allows it once per process).
+
+    Only :func:`session_otel` calls this, once; tests must not reset the globals (C61).
+    """
     trace._TRACER_PROVIDER_SET_ONCE._done = False
     trace._TRACER_PROVIDER = None
     metrics_internal: Any = __import__("opentelemetry.metrics._internal", fromlist=["_"])
@@ -136,6 +148,76 @@ def reset_otel_globals() -> None:
     logs_internal._LOGGER_PROVIDER = None
 
 
+_DELTA_TYPES: Final = (SdkCounter, SdkUpDownCounter, SdkHistogram)
+
+
+@dataclass
+class _SessionOtel:
+    """One in-memory provider set per test process (C61/C63: no global resets between tests)."""
+
+    span_exporter: InMemorySpanExporter
+    metric_reader: InMemoryMetricReader
+    log_exporter: InMemoryLogRecordExporter
+    tracer_provider: TracerProvider
+    meter_provider: MeterProvider
+    logger_provider: LoggerProvider
+
+
+_SESSION_OTEL: _SessionOtel | None = None
+
+
+def session_otel() -> _SessionOtel:
+    """Create (once) and install the process-wide in-memory providers as the OTel globals.
+
+    Synchronous counters and histograms use delta temporality, so each test sees only its own
+    measurements (``OtelMemory`` adds the deltas up again); observable instruments stay
+    cumulative because their callbacks report absolute values.
+    """
+    global _SESSION_OTEL  # noqa: PLW0603  (process-wide by design)
+    if _SESSION_OTEL is not None:
+        return _SESSION_OTEL
+    resource = Resource.create({"service.name": "pycommon-test"})
+    spans = InMemorySpanExporter()
+    reader = InMemoryMetricReader(
+        preferred_temporality=dict.fromkeys(_DELTA_TYPES, AggregationTemporality.DELTA)
+    )
+    logs = InMemoryLogRecordExporter()  # type: ignore[no-untyped-call]
+    tp = TracerProvider(resource=resource, sampler=ParentBased(ALWAYS_ON))
+    tp.add_span_processor(SimpleSpanProcessor(spans))
+    mp = MeterProvider(resource=resource, metric_readers=[reader])
+    lp = LoggerProvider(resource=resource)
+    lp.add_log_record_processor(SimpleLogRecordProcessor(logs))
+    reset_otel_globals()
+    trace.set_tracer_provider(tp)
+    metrics.set_meter_provider(mp)
+    _logs.set_logger_provider(lp)
+    _SESSION_OTEL = _SessionOtel(spans, reader, logs, tp, mp, lp)
+    return _SESSION_OTEL
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Install the session providers before any test, so no suite binds to a stale provider."""
+    session_otel()
+
+
+def _merge(old: Any, new: Any, *, delta: bool) -> Any:
+    if not delta or old is None:
+        return new
+    if isinstance(new, HistogramDataPoint):
+        return dataclasses.replace(
+            new,
+            start_time_unix_nano=old.start_time_unix_nano,
+            count=old.count + new.count,
+            sum=old.sum + new.sum,
+            bucket_counts=[
+                a + b for a, b in zip(old.bucket_counts, new.bucket_counts, strict=True)
+            ],
+            min=min(old.min, new.min),
+            max=max(old.max, new.max),
+        )
+    return dataclasses.replace(new, value=old.value + new.value)
+
+
 @dataclass
 class OtelMemory:
     span_exporter: InMemorySpanExporter
@@ -144,6 +226,44 @@ class OtelMemory:
     tracer_provider: TracerProvider
     meter_provider: MeterProvider
     logger_provider: LoggerProvider
+    _points: dict[tuple[str, frozenset[tuple[str, Any]]], Any] = field(
+        default_factory=dict, repr=False
+    )
+    _units: dict[str, str] = field(default_factory=dict, repr=False)
+    _delta: set[str] = field(default_factory=set, repr=False)
+
+    def _collect(self) -> None:
+        """Fold one collection into this test's points.
+
+        Delta series (counters, histograms) are added up; every other series (gauges, observable
+        counters) is replaced by what this collection reports, so a series that stops being
+        observed disappears.
+        """
+        data = self.metric_reader.get_metrics_data()
+        for k in [k for k in self._points if k[0] not in self._delta]:
+            del self._points[k]
+        if data is None:
+            return
+        for rm in data.resource_metrics:
+            for sm in rm.scope_metrics:
+                for m in sm.metrics:
+                    self._units[m.name] = m.unit or ""
+                    temporality = getattr(m.data, "aggregation_temporality", None)
+                    delta = temporality is AggregationTemporality.DELTA
+                    if delta:
+                        self._delta.add(m.name)
+                    for p in m.data.data_points:
+                        key = (m.name, frozenset((p.attributes or {}).items()))
+                        self._points[key] = _merge(self._points.get(key), p, delta=delta)
+
+    def reset(self) -> None:
+        """Forget everything recorded so far (called at the start of each test)."""
+        self.span_exporter.clear()
+        self.log_exporter.clear()
+        self.metric_reader.get_metrics_data()  # discard pending deltas
+        self._points.clear()
+        self._units.clear()
+        self._delta.clear()
 
     def spans(self) -> list[ReadableSpan]:
         return list(self.span_exporter.get_finished_spans())
@@ -152,28 +272,24 @@ class OtelMemory:
         return [s.name for s in self.spans()]
 
     def metric_points(self, name: str) -> list[tuple[dict[str, Any], Any]]:
-        """``(attributes, value)`` per data point; histograms give the point itself."""
-        data = self.metric_reader.get_metrics_data()
+        """``(attributes, value)`` per data point; histograms give the point itself.
+
+        Counters and histograms count from the start of the current test.
+        """
+        self._collect()
         out: list[tuple[dict[str, Any], Any]] = []
-        if data is None:
-            return out
-        for rm in data.resource_metrics:
-            for sm in rm.scope_metrics:
-                for m in sm.metrics:
-                    if m.name != name:
-                        continue
-                    for p in m.data.data_points:
-                        value = getattr(p, "value", p)
-                        out.append((dict(p.attributes or {}), value))
+        for (metric, _), p in self._points.items():
+            if metric == name:
+                out.append((dict(p.attributes or {}), getattr(p, "value", p)))
         return out
 
     def metric_names(self) -> set[str]:
-        data = self.metric_reader.get_metrics_data()
-        if data is None:
-            return set()
-        return {
-            m.name for rm in data.resource_metrics for sm in rm.scope_metrics for m in sm.metrics
-        }
+        self._collect()
+        return {metric for metric, _ in self._points}
+
+    def metric_unit(self, name: str) -> str | None:
+        self._collect()
+        return self._units.get(name)
 
     def log_records(self) -> list[Any]:
         return list(self.log_exporter.get_finished_logs())
@@ -181,24 +297,23 @@ class OtelMemory:
 
 @pytest.fixture
 def otel_memory(monkeypatch: pytest.MonkeyPatch) -> Iterator[OtelMemory]:
-    """In-memory span exporter, ``InMemoryMetricReader`` and log exporter, set as the globals.
+    """The process-wide in-memory providers, cleared for this test (C61, C63).
 
     ``pycommon.otel.setup`` (and so ``create_app(instrument=True)``) uses these providers while
-    the fixture is active.
+    the fixture is active. Globals are never reset: instruments created by earlier tests or at
+    import time keep reporting to the same provider, so suites can share one process.
     """
-    reset_otel_globals()
-    resource = Resource.create({"service.name": "pycommon-test"})
-    spans = InMemorySpanExporter()
-    reader = InMemoryMetricReader()
-    logs = InMemoryLogRecordExporter()  # type: ignore[no-untyped-call]
-    tp = TracerProvider(resource=resource, sampler=ParentBased(ALWAYS_ON))
-    tp.add_span_processor(SimpleSpanProcessor(spans))
-    mp = MeterProvider(resource=resource, metric_readers=[reader])
-    lp = LoggerProvider(resource=resource)
-    lp.add_log_record_processor(SimpleLogRecordProcessor(logs))
-    trace.set_tracer_provider(tp)
-    metrics.set_meter_provider(mp)
-    _logs.set_logger_provider(lp)
+    so = session_otel()
+    _otel.clear_gauge_callbacks()
+    mem = OtelMemory(
+        so.span_exporter,
+        so.metric_reader,
+        so.log_exporter,
+        so.tracer_provider,
+        so.meter_provider,
+        so.logger_provider,
+    )
+    mem.reset()
     original = _otel._build_providers
 
     def build(
@@ -206,16 +321,13 @@ def otel_memory(monkeypatch: pytest.MonkeyPatch) -> Iterator[OtelMemory]:
     ) -> tuple[TracerProvider, MeterProvider, LoggerProvider, bool]:
         if span_exporter is not None or metric_reader is not None:
             return original(res, span_exporter=span_exporter, metric_reader=metric_reader)
-        return tp, mp, lp, False
+        return so.tracer_provider, so.meter_provider, so.logger_provider, False
 
     monkeypatch.setattr(_otel, "_build_providers", build)
     try:
-        yield OtelMemory(spans, reader, logs, tp, mp, lp)
+        yield mem
     finally:
-        tp.shutdown()
-        mp.shutdown()
-        lp.shutdown()
-        reset_otel_globals()
+        _otel.clear_gauge_callbacks()
 
 
 # --- logs --------------------------------------------------------------------------------------

@@ -19,7 +19,8 @@ Options:
 **Double-payment guard (in option 1):**
 - (a) **One bank key per attempt.** The bank call carries `Idempotency-Key = <payout_id>:<attempt>`. The processor (bank-stub: a persistent `transfers` table with `UNIQUE(idempotency_key)`, written with INSERT … ON CONFLICT) returns the original transfer for a repeated key, across restarts, replicas and concurrent POSTs.
 - (b) **The current attempt is checked on every delivery.** The instruction endpoint returns 200 only if attempt n is the payout's current attempt and is `requested` or `indeterminate`; otherwise 409 `attempt_not_current`, and the worker ACKs without calling the bank. The worker uses the instruction's amount, never the event's; a mismatch is poison and goes to the DLQ. The `disbursements(payout_id, attempt)` unique row records each try.
-- (c) **Results apply only to the current attempt.** payroll applies a result with a conditional update on `payout_attempts(payout_id, attempt)`, only while the attempt is current and `requested`/`indeterminate`.
+- (c) **Results apply only to the current attempt.** payroll applies a result with a conditional update on `payout_attempts(payout_id, attempt)`, only while the attempt is current and `requested`/`indeterminate`, or `needs_operator` for a **definite** answer.
+  - **A late definite answer wins (spec R7, C42):** for a `needs_operator` attempt, a `settled` or `rejected` result applies, because the bank's answer is the truth; an `indeterminate` or `poison` report returns 200 and changes nothing. Dropping a late settlement would let an operator's `mark_rejected` plus a retry pay the employee twice.
   - A stale attempt gets 409 `attempt_not_current`.
   - A current attempt that's already final gets 200 with its stored outcome, and nothing changes.
   - The result Idempotency-Key is `<event_id>:<outcome>`, so a stored `indeterminate` response never masks a later `settled` on the same event.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Generate or complete the git-ignored .env for dev and CI (PAY-NFR-12; platform LLD §3.15).
 #
-# Usage: scripts/dev-env.sh [--env-file PATH] [--k8s-dev]
+# Usage: scripts/dev-env.sh [--env-file PATH] [--k8s-dev [--k8s-dev-file PATH]]
 #
 # - Idempotent: existing values are kept; only missing keys are appended. Derived keys (ports,
 #   public-key sets, APP_VERSION) are recomputed on every run.
@@ -11,14 +11,27 @@ set -euo pipefail
 
 ENV_FILE=".env"
 K8S_DEV=0
+K8S_DEV_FILE="deploy/k8s/overlays/dev/secrets.env"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --env-file) ENV_FILE="$2"; shift 2 ;;
     --k8s-dev) K8S_DEV=1; shift ;;
+    --k8s-dev-file) K8S_DEV_FILE="$2"; shift 2 ;;
     -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
     *) echo "dev-env.sh: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+# Paths: --env-file is taken relative to the caller's directory; everything else (the default
+# .env, deploy/k8s/...) relative to the repository root, wherever the script is run from.
+if [[ "$ENV_FILE" != /* ]] && [[ "$ENV_FILE" != ".env" ]]; then
+  ENV_FILE="$PWD/$ENV_FILE"
+fi
+if [[ "$K8S_DEV_FILE" != /* ]] && [[ "$K8S_DEV_FILE" != deploy/k8s/overlays/dev/secrets.env ]]; then
+  K8S_DEV_FILE="$PWD/$K8S_DEV_FILE"
+fi
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
 
 # --- OpenSSL 3 is needed for Ed25519 (macOS /usr/bin/openssl is LibreSSL) -------------------
 find_openssl() {
@@ -168,10 +181,25 @@ worker_entry="\"${worker_kid}\": {\"iss\": \"payout-worker\", \"pem\": \"$(json_
 put_derived IDENTITY_INTERNAL_JWT_PUBLIC_KEYS "{${web_entry}}" json
 put_derived PAYROLL_INTERNAL_JWT_PUBLIC_KEYS "{${web_entry}, ${worker_entry}}" json
 
+# The dev overlay's secretGenerator reads an env file literally (no quote or escape handling), so
+# each value is written unquoted on one line: JSON as-is, PEMs with literal \n escapes (which
+# normalise_pem and the web's loader turn back into newlines). Ports and Compose keys stay out.
+K8S_SKIP_RE='^(APP_PORT_BASE|COMPOSE_PROJECT_NAME|WEB_PORT|GRAFANA_PORT|MAILPIT_PORT|IDENTITY_PORT|PAYROLL_PORT|PAYOUT_WORKER_PORT|BANK_STUB_PORT|TEMPO_PORT|LOKI_PORT|PROMETHEUS_PORT|ALERTMANAGER_PORT|TOXIPROXY_PORT|ALERT_SINK_PORT)$'
 if [[ "$K8S_DEV" == 1 ]]; then
-  mkdir -p deploy/k8s/overlays/dev
-  grep -vE '^(APP_PORT_BASE|.*_PORT|COMPOSE_PROJECT_NAME)=' "$ENV_FILE" > deploy/k8s/overlays/dev/secrets.env
-  chmod 600 deploy/k8s/overlays/dev/secrets.env
+  k8s_env="$K8S_DEV_FILE"
+  mkdir -p "$(dirname "$k8s_env")"
+  : > "$k8s_env"
+  chmod 600 "$k8s_env"
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    key="${line%%=*}"
+    [[ "$key" =~ $K8S_SKIP_RE ]] && continue
+    value="${line#*=}"
+    if [[ "$value" == \"*\" || "$value" == \'*\' ]]; then
+      value="${value:1:${#value}-2}"
+    fi
+    printf '%s=%s\n' "$key" "$value" >> "$k8s_env"
+  done < "$ENV_FILE"
 fi
 
 if [[ ${#ADDED[@]} -gt 0 ]]; then

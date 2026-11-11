@@ -19,8 +19,9 @@ async def _times(r: aioredis.Redis, entry_id: bytes | str) -> int:
 async def test_delivery_counts(
     migrated: Any, redis_acl: RedisAcl, admin_db: Any, redis_admin: aioredis.Redis
 ) -> None:
-    """PAY-408: ">" is delivery 1; a pending-first (history) read does NOT increment the
-    counter on Redis 7 (so the worker's count is conservative by one there); XAUTOCLAIM does."""
+    """PAY-408: ">" is delivery 1; a pending-first (history) read increments the counter on
+    Redis 7 (as Redis documents), and so does XAUTOCLAIM. Pinned (C63): the worker's delivery
+    number after a restart is the count XPENDING reports after the history read."""
     r = create_redis(worker_settings(migrated, redis_acl))
     try:
         await r.xgroup_create(STREAM, GROUP, id="0", mkstream=True)
@@ -28,9 +29,8 @@ async def test_delivery_counts(
         await r.xreadgroup(GROUP, "c1", {STREAM: ">"}, count=1)
         assert await _times(r, entry_id) == 1
         await r.xreadgroup(GROUP, "c1", {STREAM: "0"}, count=1)
-        history = await _times(r, entry_id)
-        assert history in {1, 2}
+        assert await _times(r, entry_id) == 2
         await r.xautoclaim(STREAM, GROUP, "c2", min_idle_time=0, start_id="0-0", count=1)
-        assert await _times(r, entry_id) == history + 1
+        assert await _times(r, entry_id) == 3
     finally:
         await r.aclose()

@@ -42,6 +42,8 @@ export const CATALOG: Record<string, readonly [number, Msg]> = {
   bad_request: [400, "The request couldn't be processed."],
   not_found: [404, "That page or item wasn't found."],
   method_not_allowed: [405, "That action isn't supported here."],
+  unsupported_media_type: [415, "That request format isn't supported."],
+  conflict: [409, "That change conflicts with the current state. Reload and try again."],
   idempotency_key_required: [
     400,
     "This action was sent without its safety key. Reload the page and try again.",

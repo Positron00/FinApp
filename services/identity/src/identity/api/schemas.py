@@ -9,7 +9,16 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints, field_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    EmailStr,
+    Field,
+    StringConstraints,
+    field_validator,
+)
+from pydantic_core import PydanticCustomError
 
 from identity.domain.roles import Role
 
@@ -25,17 +34,27 @@ __all__ = [
     "SessionUser",
     "Token",
     "UserOut",
+    "reject_nul",
 ]
 
 # Dev and seed accounts use the RFC 2606 domain payrun.example.com (C59), which email-validator
 # accepts, so no special-use override is needed.
 
-Email = Annotated[EmailStr, StringConstraints(max_length=254)]
+
+def reject_nul(v: object) -> object:
+    """Free text never holds NUL (Postgres can't store it; C63): 422 ``invalid_character``."""
+    if isinstance(v, str) and "\x00" in v:
+        raise PydanticCustomError("invalid_character", "must not contain NUL characters")
+    return v
+
+
+NoNul = BeforeValidator(reject_nul)
+Email = Annotated[EmailStr, StringConstraints(max_length=254), NoNul]
 # The policy (>= 12) is checked in the domain, so it maps to 422 password_too_weak.
 Password = Annotated[str, StringConstraints(min_length=1, max_length=256)]
 # The format is checked in the domain, so it maps to 400 invite_invalid / reset_invalid.
 Token = Annotated[str, StringConstraints(min_length=1, max_length=128)]
-Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200), NoNul]
 RoleList = Annotated[list[Role], Field(min_length=1, max_length=3)]
 
 

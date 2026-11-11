@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from payroll.settings import STARTUP_CHECKS, Settings
 from pycommon.settings import load_settings
-from pycommon.startup_checks import run_startup_checks
+from pycommon.startup_checks import CheckFailure, run_startup_checks
 from pycommon.testing import JsonLogCapture, TokenFactory
 from pydantic import SecretStr
 
@@ -164,3 +164,18 @@ def test_missing_keyset_is_left_to_pycommon(token_factory: TokenFactory) -> None
     from payroll.settings import check_jwt_issuers  # noqa: PLC0415
 
     assert list(check_jwt_issuers(make_settings())) == []
+
+
+def test_jwt_keyset_with_an_unexpected_issuer_fails() -> None:
+    """PAY-600, design §6.2 item 3: every kid's issuer is web or payout-worker. pycommon's
+    Keyset already refuses unknown issuers at parse time; this check is the payroll backstop."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from payroll.settings import check_jwt_issuers  # noqa: PLC0415
+
+    entries = {k: SimpleNamespace(iss=k) for k in ("web", "payout-worker", "identity")}
+    keyset = SimpleNamespace(kids=list(entries), get=entries.get)
+    base = SimpleNamespace(internal_jwt_public_keys=keyset)
+    assert list(check_jwt_issuers(base)) == [  # type: ignore[arg-type]
+        CheckFailure("INTERNAL_JWT_PUBLIC_KEYS", "issuer_unexpected")
+    ]

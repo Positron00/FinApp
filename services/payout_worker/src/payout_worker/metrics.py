@@ -56,13 +56,13 @@ class Metrics:
         out._gauges = [
             observable_gauge(
                 "queue_consumer_lag",
-                unit="1",
+                unit="{entry}",  # an annotation unit: Prometheus would add _ratio to "1" (C63)
                 description="Entries not yet delivered to the group (XINFO GROUPS lag)",
                 callback=out._lag_observation,
             ),
             observable_gauge(
                 "queue_dlq_messages",
-                unit="1",
+                unit="{entry}",
                 description="Length of the dead-letter stream",
                 callback=out._dlq_observation,
             ),

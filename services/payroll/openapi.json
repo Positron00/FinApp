@@ -1101,6 +1101,7 @@
         "additionalProperties": false,
         "properties": {
           "attempt": {
+            "maximum": 32767.0,
             "minimum": 1.0,
             "title": "Attempt",
             "type": "integer"

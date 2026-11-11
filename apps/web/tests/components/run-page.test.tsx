@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
-import { act, cleanup, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useState } from "react";
 
-import { announcement, RunDetail, who } from "@/components/runs/run-detail";
+import { announcement, RunDetail, RunTabs, who } from "@/components/runs/run-detail";
 
 import { attempt, payout, payRun, payslip, RUN_ID } from "../helpers/fixtures";
 import { USER_ID } from "../helpers/request";
@@ -23,6 +24,32 @@ afterEach(() => {
 function page<T>(items: T[]) {
   return { items, next_cursor: null };
 }
+
+describe("RunTabs", () => {
+  // PAY-NFR-14: the WAI-ARIA tabs pattern: roving tabIndex, arrow keys, Home and End.
+  it("moves selection and focus with the arrow keys", async () => {
+    function Harness() {
+      const [active, setActive] = useState<"payslips" | "payouts">("payslips");
+      return <RunTabs active={active} onSelect={setActive} />;
+    }
+    render(<Harness />);
+    const [slips, outs] = screen.getAllByRole("tab");
+    expect(slips!.getAttribute("tabindex")).toBe("0");
+    expect(outs!.getAttribute("tabindex")).toBe("-1");
+    slips!.focus();
+    await userEvent.keyboard("{ArrowRight}");
+    expect(outs!.getAttribute("aria-selected")).toBe("true");
+    expect(document.activeElement).toBe(outs);
+    expect(slips!.getAttribute("tabindex")).toBe("-1");
+    await userEvent.keyboard("{ArrowRight}");
+    expect(document.activeElement).toBe(slips);
+    await userEvent.keyboard("{End}");
+    expect(document.activeElement).toBe(outs);
+    await userEvent.keyboard("{Home}");
+    expect(document.activeElement).toBe(slips);
+    expect(slips!.getAttribute("aria-controls")).toBe("panel-payslips");
+  });
+});
 
 describe("RunDetail", () => {
   // PAY-413: polls the run every 2 s while processing and stops at paid.

@@ -76,6 +76,7 @@ truncated by `scripts/stack.sh reset` (plan §6).
 
 ```python
 IDEMPOTENCY_KEY_PATTERN = r"^[A-Za-z0-9:_-]{1,255}$"   # R6; the worker sends "<payout_id>:<attempt>"
+IDEMPOTENCY_KEY_RE = re.compile(IDEMPOTENCY_KEY_PATTERN)  # always .fullmatch(): "$" alone accepts a trailing "\n" (C63)
 
 class TransferRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -150,7 +151,7 @@ every other status here is "no answer" to it (ADR 0003 e).
 
 Headers: `X-Api-Key` (required). Path `key` must match `IDEMPOTENCY_KEY_PATTERN` (the `:` in the worker's key is a valid path character).
 1. `require_api_key` → 401 `invalid_api_key`.
-2. Invalid key format → 422 `validation_error` with `details=[{"field": "key", "issue": "pattern"}]` (R3, C14).
+2. Invalid key format (`IDEMPOTENCY_KEY_RE.fullmatch`, so `…%0A` is refused too) → 422 `validation_error` with `details=[{"field": "path.key", "issue": "pattern"}]` (R3, C14; the field path follows C56).
 3. Sleep `BANK_STUB_LATENCY_MS`.
 4. `get_by_key(key)` → 200 `TransferResponse`, or 404 `transfer_not_found`.
 
@@ -165,7 +166,7 @@ class InvalidApiKey(AppError):                  # pycommon.errors.AppError
 
 async def require_api_key(x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
                           settings: Settings = Depends(get_settings)) -> None:
-    if x_api_key is None or not hmac.compare_digest(
+    if x_api_key is None or not compare_digest(          # from hmac import compare_digest
             x_api_key.encode(), settings.bank_stub_api_key.get_secret_value().encode()):
         raise InvalidApiKey("API key missing or invalid.")
 ```
@@ -183,7 +184,7 @@ def decide_outcome(key: str, account: str, failure_rate: float) -> Outcome:
     if account.endswith("0000"):
         return ("rejected", "account_closed")
     bucket = int.from_bytes(hashlib.sha256(key.encode("utf-8")).digest(), "big") % 10_000
-    if bucket < round(failure_rate * 10_000):
+    if bucket < Decimal(repr(failure_rate)) * 10_000:   # exact PAY-412 comparison (C63)
         return ("rejected", "insufficient_funds_at_bank")
     return ("settled", None)
 
@@ -193,7 +194,7 @@ def bank_reference_for(key: str) -> str:
 
 - The account rule is checked first. `account_last4 == "0000"` ⇔ `account.endswith("0000")`.
 - The failure check is integer arithmetic on the key only. The same key always gives the same outcome, whatever the replica, restart or body, so a retry with a new attempt (new key) can get a different outcome.
-- The threshold is `round(BANK_STUB_FAILURE_RATE × 10000)`: 0.05 gives 500, so buckets 0–499 are rejected. Rate 0 never rejects; rate 1 always does.
+- The threshold is the exact PAY-412 comparison `bucket < BANK_STUB_FAILURE_RATE × 10000`, in decimal arithmetic on the configured value (no rounding, no binary-float error; C63): 0.05 gives 500, so buckets 0–499 are rejected; 0.00025 gives 2.5, so buckets 0–2 are. Rate 0 never rejects; rate 1 always does.
 - The reference format is `BSR-` plus 16 uppercase hex characters (20 in all, ≤ 64 per C26), derived from the key (deterministic; stored anyway).
 - `transfer_id` is a fresh UUIDv7 (`pycommon.db.new_id()`) per inserted row.
 
@@ -289,7 +290,12 @@ bank-stub exports every span (`parentbased_always_on`, C23); in uat the Collecto
 
 ## 6. Tests
 
-Unit tests have no I/O. Integration tests use pycommon's fixtures (`pg_bootstrapped`,
+Unit tests have no I/O. Route tests use `tests/helpers.py::stubbed()`: the real app (routes,
+middleware, error handlers) with a **stub lifespan** and a `Runtime` over an in-memory repository
+and a recording sleep, so no pycommon lifecycle runs (no logging reconfiguration, engine,
+startup checks or loop-lag ticker; C63). Assertions that a value is never echoed exclude random
+or time fields (`request_id`, `ts`): the C61 flake was `"-5"` matching a request ID and `"1.5"`
+matching a timestamp. Integration tests use pycommon's fixtures (`pg_bootstrapped`,
 `alembic_upgrade`): a session-scoped Testcontainers `postgres:16-alpine`. The fixture runs
 `deploy/compose/init/*.sql`, migrates as `bank_stub_migrator`, connects as `bank_stub_app` through
 the C1 keys, and truncates `bank_stub.transfers` after each test. The app is driven through
@@ -297,9 +303,9 @@ the C1 keys, and truncates `bank_stub.transfers` after each test. The app is dri
 
 | Test file | Covers | Requirement |
 |---|---|---|
-| `tests/unit/test_outcome.py` | Account ending `0000` → `account_closed` (even at rate 0); the same key always gives the same outcome; rate 0 never rejects, rate 1 always does; boundary: a key with bucket 499 is rejected at 0.05 and a key with bucket 500 isn't; over 10,000 random keys at 0.05 the rejected share is 5% ± 1%; reference format `^BSR-[0-9A-F]{16}$` (≤ 64) | PAY-412 |
+| `tests/unit/test_outcome.py` | Account ending `0000` → `account_closed` (even at rate 0); the same key always gives the same outcome; rate 0 never rejects, rate 1 always does; boundary: a key with bucket 499 is rejected at 0.05 and a key with bucket 500 isn't; no rounding (bucket 2 rejected at 0.00025, bucket 1 at 0.00015; C63); over 10,000 random keys at 0.05 the rejected share is 5% ± 1%; reference format `^BSR-[0-9A-F]{16}$` (≤ 64) | PAY-412 |
 | `tests/unit/test_schemas.py` | `TransferRequest` bounds and patterns, `extra="forbid"`; `repr` masks routing and account; key pattern accepts `<uuid>:<n>`; `TransferResponse` serialises exactly `{transfer_id, status, reason, bank_reference}` (R6) | PAY-412, NFR-07 |
-| `tests/unit/test_api_key.py` | Missing → 401; wrong → 401; correct → passes; uses `hmac.compare_digest` | PAY-412 |
+| `tests/unit/test_routes.py` (API key) | Missing → 401; wrong → 401; correct → passes; uses `compare_digest` (patched as the module-local name `bank_stub.api.auth.compare_digest`, never the stdlib function) | PAY-412 |
 | `tests/unit/test_latency.py` | The handler awaits `sleep(BANK_STUB_LATENCY_MS / 1000)` (patched sleep) on POST and GET | PAY-412 |
 | `tests/unit/test_settings.py` | Settings load from the C1 keys (`DB_HOST` … `DB_SCHEMA`); `DATABASE_URL` is ignored; `LOG_LEVEL=info` is accepted as `INFO` (C24); rate and latency out of bounds → `settings.invalid` and exit 2 | PAY-605 |
 | `tests/unit/test_startup_checks.py` | `ENV=prod` → `startup.check_failed` (`setting=ENV`) and exit 2; with `ENV=uat`, a missing or dev-default `BANK_STUB_API_KEY` or `DB_PASSWORD`, and debug or docs on, each exit 2; the log names the setting, never the value; with `ENV=dev` failures only warn (C29) | PAY-605 |
@@ -340,5 +346,6 @@ is owned by the worker's resilience suite: `tests/resilience/test_bank_restart.p
 ## Change log
 
 - 2026-11-10: incorporated README R-table and C-table decisions (R3, R6, R13, R27; C1, C2, C14, C23, C24, C28, C29, C34, C44).
+- 2026-11-10 (Step 5, C63): exact PAY-412 failure threshold (no `round`); keys checked with `fullmatch`; GET key error field `path.key` (C56); module-local `compare_digest`; unit route tests on a stub lifespan; the C61 unit flake traced to value-echo assertions matching `request_id`/`ts` and fixed.
 
 Resolved after the change log entry: C46 (`PAYOUT_PAYROLL_*` keys), C47 (`COMPANY_ID` for every service, `PAYOUT_CONSUMER_GC_IDLE_S`, startup reason `not_deployable`). Nothing is open.

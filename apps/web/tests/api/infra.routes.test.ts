@@ -217,4 +217,23 @@ describe("POST /api/telemetry", () => {
     expect((await send()).status).toBe(204);
     expect((await send()).status).toBe(429);
   });
+
+  // PAY-603, C63: with a session cookie, beacons don't spend the per-session budget.
+  it("doesn't spend the session budget", async () => {
+    applyEnv({ ...TEST_ENV, BFF_RATE_LIMIT_SESSION: "1", BFF_TELEMETRY_RATE_LIMIT_IP: "60" });
+    await resetConfig();
+    const cookie = await signIn();
+    for (let i = 0; i < 3; i++) {
+      const res = await telemetry(
+        makeReq("/api/telemetry", {
+          method: "POST",
+          cookie,
+          body: { type: "error", message: "m", route: "/" },
+        }),
+        params(),
+      );
+      expect([res.status, t.logs.events("ratelimit.limited")]).toEqual([204, []]);
+    }
+    expect(t.logs.events("ratelimit.limited")).toHaveLength(0);
+  });
 });

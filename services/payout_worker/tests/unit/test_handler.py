@@ -10,6 +10,7 @@ from datetime import timedelta
 from typing import Any
 
 import pytest
+from payout_worker.db.repo import StoredAnswer
 from payout_worker.errors import (
     AttemptNotCurrent,
     PayoutNotFound,
@@ -18,10 +19,12 @@ from payout_worker.errors import (
     WorkerInternalError,
 )
 from payout_worker.handler import Ack, DeadLetter, PayoutHandler, Retry
-from payout_worker.models import ResultResponse
+from payout_worker.models import Instruction, ResultResponse
 from pycommon.testing import FakeClock, JsonLogCapture
+from pydantic import SecretStr
 
 from tests.helpers import (
+    ACCOUNT,
     BANK_REF,
     COMPANY_ID,
     EVENT_ID,
@@ -109,6 +112,61 @@ async def test_attempt_not_current_no_bank_call(h: H, caplog_json: JsonLogCaptur
     assert h.repo.last("finish") == ("attempt_not_current", None, None)
     assert h.bank.create_calls == []
     assert caplog_json.events("payout.attempt_not_current")[0]["source"] == "instruction"
+    assert h.payroll.result_calls == []  # no stored definite answer → nothing reported
+
+
+@pytest.mark.parametrize(
+    ("stored", "posted"),
+    [
+        (StoredAnswer("settled", None, BANK_REF), ("settled", None, BANK_REF)),
+        (StoredAnswer("rejected", "account_closed", None), ("rejected", "account_closed", None)),
+    ],
+)
+async def test_attempt_not_current_reports_stored_answer(
+    h: H, caplog_json: JsonLogCapture, stored: StoredAnswer, posted: tuple[str, Any, Any]
+) -> None:
+    """C63, R7: on 409 attempt_not_current, a definite bank answer already recorded for the
+    attempt (e.g. its result post failed until the attempt went needs_operator) is reported
+    first with key <event_id>:<outcome>; still no bank call, then finish and Ack."""
+    h.repo.stored = stored
+    h.payroll.instructions = [AttemptNotCurrent()]
+    assert await h.handler.handle(message(), 1) == Ack("attempt_not_current")
+    [(_, _, body, key)] = h.payroll.result_calls
+    assert (body.outcome, body.reason, body.bank_reference) == posted
+    assert key == f"{EVENT_ID}:{posted[0]}"
+    assert h.bank.create_calls == []
+    assert h.bank.get_calls == []
+    names = h.repo.names()
+    assert names.index("definite_answer") < names.index("finish")
+    assert h.repo.last("finish") == ("attempt_not_current", None, None)
+    assert caplog_json.events("payout.attempt_not_current")[0]["reported"] == posted[0]
+
+
+async def test_attempt_not_current_stored_answer_report_fails_retries(h: H) -> None:
+    """C63, design §3.2: if reporting the stored answer fails, the payroll rules apply (pending)."""
+    h.repo.stored = StoredAnswer("settled", None, BANK_REF)
+    h.payroll.instructions = [AttemptNotCurrent()]
+    h.payroll.results = [PayrollUnavailable()]
+    result = await h.handler.handle(message(), 1)
+    assert isinstance(result, Retry)
+    assert (result.kind, result.code) == ("payroll", "payroll_unavailable")
+    assert "finish" not in h.repo.names()
+
+
+async def test_invalid_bank_details_never_reach_a_traceback(
+    h: H, caplog_json: JsonLogCapture
+) -> None:
+    """C63, PAY-NFR-07: bank details that fail the bank's patterns → Retry(payroll,
+    malformed_response) raised from None; no digits in logs or the result."""
+    bad = Instruction.model_construct(
+        **{**instruction().model_dump(), "routing": SecretStr("12345678")}
+    )
+    h.payroll.instructions = [bad]
+    result = await h.handler.handle(message(), 1)
+    assert result == Retry("payroll", "malformed_response", "PayrollRejected: malformed_response")
+    assert h.bank.create_calls == []
+    assert "12345678" not in caplog_json.text
+    assert ACCOUNT not in caplog_json.text
 
 
 async def test_payout_not_found_dead_letters_without_report(h: H) -> None:

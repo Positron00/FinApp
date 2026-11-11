@@ -42,6 +42,7 @@ __all__ = [
     "db_error_kind",
     "error_response",
     "install_handlers",
+    "is_invalid_text",
 ]
 
 _log = get_logger("pycommon.errors")
@@ -207,33 +208,70 @@ _TIMEOUT_SQLSTATES: Final = frozenset(
     {"57014", "55P03"}  # query_canceled (statement_timeout), lock_not_available (lock_timeout)
 )
 _UNAVAILABLE_SQLSTATES_PREFIX: Final = ("08", "57P")  # connection exceptions, admin shutdown
+INVALID_TEXT_SQLSTATE: Final = "22021"  # character_not_in_repertoire (e.g. a NUL byte; C63)
+_DRIVER_MODULES: Final = ("asyncpg", "sqlalchemy")
+
+_DRIVER_TIMEOUTS: Final = (asyncpg.QueryCanceledError, sqlalchemy.exc.TimeoutError)
+_DRIVER_CONNECTION_ERRORS: Final = (
+    asyncpg.ConnectionDoesNotExistError,
+    asyncpg.CannotConnectNowError,
+    asyncpg.InterfaceError,
+    sqlalchemy.exc.OperationalError,
+    sqlalchemy.exc.InterfaceError,
+    sqlalchemy.exc.DisconnectionError,
+)
 
 
-def db_error_kind(exc: BaseException) -> Literal["timeout", "unavailable"] | None:
-    """Classify a DB driver error: ``timeout`` (503 db_timeout), ``unavailable`` or ``None``."""
+def _raised_in_driver(exc: BaseException) -> bool:
+    """True when ``exc`` propagated through asyncpg or SQLAlchemy code (its traceback frames)."""
+    tb = exc.__traceback__
+    while tb is not None:
+        module = str(tb.tb_frame.f_globals.get("__name__", ""))
+        if module.split(".", 1)[0] in _DRIVER_MODULES:
+            return True
+        tb = tb.tb_next
+    return False
+
+
+def _sqlstate(exc: BaseException) -> str | None:
+    value = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
+    return value if isinstance(value, str) else None
+
+
+def db_error_kind(
+    exc: BaseException, *, in_db_call: bool = False
+) -> Literal["timeout", "unavailable"] | None:
+    """Classify a DB driver error: ``timeout`` (503 db_timeout), ``unavailable`` or ``None``.
+
+    Only DB-driver errors count (C63): asyncpg and SQLAlchemy exceptions, a Postgres SQLSTATE,
+    or an ``OSError``/``TimeoutError`` that was raised inside asyncpg or SQLAlchemy (a refused or
+    timed-out connect). A bare ``OSError`` or ``TimeoutError`` from anywhere else is not a DB
+    error, unless the caller says the code was a DB call (``in_db_call``, as ``map_db_errors``).
+    """
     chain = _causes(exc)
     unavailable = False
     for e in chain:
-        sqlstate = getattr(e, "sqlstate", None) or getattr(e, "pgcode", None)
-        if (
-            isinstance(e, asyncpg.QueryCanceledError | sqlalchemy.exc.TimeoutError | TimeoutError)
-            or sqlstate in _TIMEOUT_SQLSTATES
-        ):
+        sqlstate = _sqlstate(e)
+        bare = isinstance(e, OSError) and (in_db_call or _raised_in_driver(e))
+        if isinstance(e, _DRIVER_TIMEOUTS) or sqlstate in _TIMEOUT_SQLSTATES:
             return "timeout"
-        if isinstance(sqlstate, str) and sqlstate.startswith(_UNAVAILABLE_SQLSTATES_PREFIX):
+        if isinstance(e, TimeoutError) and bare:
+            return "timeout"
+        if (sqlstate is not None and sqlstate.startswith(_UNAVAILABLE_SQLSTATES_PREFIX)) or bare:
             unavailable = True
-        if isinstance(
-            e,
-            asyncpg.ConnectionDoesNotExistError
-            | asyncpg.CannotConnectNowError
-            | asyncpg.InterfaceError
-            | sqlalchemy.exc.OperationalError
-            | sqlalchemy.exc.InterfaceError
-            | sqlalchemy.exc.DisconnectionError
-            | OSError,
-        ) or (isinstance(e, sqlalchemy.exc.DBAPIError) and e.connection_invalidated):
+        if isinstance(e, _DRIVER_CONNECTION_ERRORS) or (
+            isinstance(e, sqlalchemy.exc.DBAPIError) and e.connection_invalidated
+        ):
             unavailable = True
     return "unavailable" if unavailable else None
+
+
+def is_invalid_text(exc: BaseException) -> bool:
+    """True when Postgres rejected a text value (SQLSTATE 22021, e.g. a NUL byte; C63)."""
+    return any(_sqlstate(e) == INVALID_TEXT_SQLSTATE for e in _causes(exc))
+
+
+INVALID_TEXT_DETAILS: Final = ({"field": "body", "issue": "invalid_character"},)
 
 
 def _operation(request: Request) -> str:
@@ -272,6 +310,14 @@ async def _http_exception_handler(request: Request, exc: Exception) -> JSONRespo
 
 
 def db_error_response(request: Request, exc: BaseException) -> JSONResponse | None:
+    if is_invalid_text(exc):
+        log_event(_log, logging.INFO, "http.error", code="validation_error", status=422)
+        return error_response(
+            422,
+            ValidationFailed.code,
+            ValidationFailed.default_message,
+            details=[dict(d) for d in INVALID_TEXT_DETAILS],
+        )
     kind = db_error_kind(exc)
     if kind == "timeout":
         log_event(_log, logging.WARNING, "db.timeout", operation=_operation(request))
@@ -315,9 +361,10 @@ def install_handlers(app: FastAPI) -> None:
     app.add_exception_handler(AppError, _app_error_handler)
     app.add_exception_handler(RequestValidationError, _validation_handler)
     app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
+    # Only DB-driver exceptions get the DB handler (C63). A bare OSError/TimeoutError reaches the
+    # Exception handler, which still maps it to 503 when it was raised inside the driver.
     for db_exc in (sqlalchemy.exc.SQLAlchemyError, asyncpg.PostgresError, asyncpg.InterfaceError):
         app.add_exception_handler(db_exc, _db_handler)
-    app.add_exception_handler(OSError, _db_handler)
     app.add_exception_handler(redis.exceptions.ConnectionError, _redis_handler)
     app.add_exception_handler(redis.exceptions.TimeoutError, _redis_handler)
     app.add_exception_handler(Exception, _unhandled_handler)

@@ -51,6 +51,10 @@ class IdentitySettings(CoreSettings):
     identity_email_poll_interval_s: float = 2.0
     identity_email_batch: int = 10
     identity_email_lease_s: int = 60
+    # Collection-time email gauges (§5.2, R26): bound on the one query per collection.
+    identity_gauge_query_timeout_ms: int = 1000
+    # Read by the F1 maintenance task purge_audit (§6.10); the migration's purge function also
+    # clamps any cutoff to at most now() - 400 days (C63).
     identity_retention_audit_days: int = 400
 
     @field_validator("identity_public_base_url")

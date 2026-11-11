@@ -57,7 +57,8 @@ def tf() -> TokenFactory:
 def _app(tf: TokenFactory, **kw: Any) -> FastAPI:
     private, public = _routers()
     settings = kw.pop("settings", None) or make_settings(
-        internal_jwt_public_keys=tf.keyset, max_body_bytes=100
+        internal_jwt_public_keys=tf.keyset,  # gitleaks:allow
+        max_body_bytes=100,
     )
     opts: dict[str, Any] = {"use_db": False, "use_redis": False, "instrument": False}
     opts.update(kw)
@@ -179,6 +180,26 @@ async def test_startup_checks_run_before_any_connection(
     assert app.state.startup_exit_code == 2
     failures = {(e["setting"], e["reason"]) for e in caplog_json.events("startup.check_failed")}
     assert failures == {("DEBUG", "debug_on"), ("INTERNAL_JWT_PUBLIC_KEYS", "missing")}
+
+
+async def test_missing_jwt_keys_refuse_start_even_in_dev(caplog_json: JsonLogCapture) -> None:
+    """C63: without INTERNAL_JWT_PUBLIC_KEYS no route can authenticate, so dev exits 2 too."""
+    app = create_app(
+        make_settings(env="dev", internal_jwt_public_keys=None),
+        use_db=False,
+        use_redis=False,
+        instrument=False,
+    )
+    with pytest.raises(SystemExit) as info:
+        async with app.router.lifespan_context(app):
+            pass  # pragma: no cover
+    assert info.value.code == 2
+    (event,) = caplog_json.events("startup.check_failed")
+    assert (event["setting"], event["reason"], event["level"]) == (
+        "INTERNAL_JWT_PUBLIC_KEYS",
+        "missing",
+        "error",
+    )
 
 
 def test_get_ctx_before_startup() -> None:

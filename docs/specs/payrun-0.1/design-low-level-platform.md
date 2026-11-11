@@ -1,6 +1,6 @@
 # Low-level design: platform
 
-Owner: lead. Sources: [architecture plan](../../plan/architecture-plan.md) v1.2 (§2.2, §6, §8, §11–§13, §17), ADRs [0007](../../adr/0007-data-stores.md), [0008](../../adr/0008-secrets.md), [0010](../../adr/0010-alert-receivers.md), [0011](../../adr/0011-egress.md), [requirements](requirements.md) (PAY-600–609, PAY-NFR-01–15), [high-level design](design-high-level.md), and the spec README's "Spec resolutions" (R) and "Contract decisions" (C) tables, which this body follows.
+Owner: lead. Sources: [architecture plan](../../plan/architecture-plan.md) v1.3 (§2.2, §6, §8, §11–§13, §17), ADRs [0007](../../adr/0007-data-stores.md), [0008](../../adr/0008-secrets.md), [0010](../../adr/0010-alert-receivers.md), [0011](../../adr/0011-egress.md), [requirements](requirements.md) (PAY-600–609, PAY-NFR-01–15), [high-level design](design-high-level.md), and the spec README's "Spec resolutions" (R) and "Contract decisions" (C) tables, which this body follows.
 
 Scope: `libs/pycommon`, the repo scaffold, the DB bootstrap SQL, Redis config and ACLs, `scripts/`, Docker Compose, the observability configs, Kubernetes, images and CI. Service-specific tables, endpoints and pages are in the identity, payroll, payout-worker, bank-stub and web low-level designs; this file gives them the shared pieces they build on.
 
@@ -99,9 +99,10 @@ requires-python = ">=3.14,<3.15"
 [tool.uv]
 package = false
 default-groups = ["dev"]
+exclude-newer = "2026-10-28T00:00:00Z"   # the two-week rule, enforced by the resolver (C58)
 
 [tool.uv.workspace]
-members = ["libs/pycommon", "services/*"]
+members = ["libs/*", "services/*"]
 
 [tool.uv.sources]
 pycommon = { workspace = true }
@@ -110,20 +111,20 @@ pycommon = { workspace = true }
 dev = [
   "ruff", "mypy", "pytest", "pytest-asyncio", "pytest-cov", "pytest-socket", "pytest-timeout",
   "respx", "time-machine", "hypothesis", "polyfactory", "testcontainers[postgres,redis]",
-  "schemathesis", "pip-audit", "httpx", "check-jsonschema", "pre-commit",
+  "schemathesis", "pip-audit", "httpx", "check-jsonschema", "jsonschema", "pre-commit",
 ]   # exact versions are in uv.lock; lower bounds set at scaffold time
 
 [tool.ruff]
 line-length = 100
 target-version = "py314"
-src = ["libs/pycommon/src", "services/*/src", "scripts", "tests"]
+extend-exclude = ["apps", "packages", "node_modules"]   # first-party detection comes from the workspace install
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "UP", "S", "ASYNC", "RUF", "SIM", "PT", "N", "C4", "DTZ", "T20", "TID", "PL", "PERF"]
 ignore = ["PLR0913", "PLR2004"]
 
 [tool.ruff.lint.per-file-ignores]
-"**/tests/**" = ["S101", "S105", "S106", "PLR2004"]
+"**/tests/**" = ["S101", "S105", "S106", "PLR2004", "S311", "S603", "S607", "S608"]   # asserts, fixtures, subprocess and SQL in tests
 "scripts/**" = ["T20"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
@@ -139,7 +140,6 @@ strict = true
 python_version = "3.14"
 plugins = ["pydantic.mypy"]
 warn_unreachable = true
-mypy_path = "libs/pycommon/src"
 
 [[tool.mypy.overrides]]
 module = ["testcontainers.*", "schemathesis.*"]
@@ -153,6 +153,12 @@ parallel = true
 show_missing = true
 skip_covered = true
 exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "@overload"]
+
+[tool.pytest.ini_options]   # suites without their own config: tests/platform, tests/resilience
+addopts = "--strict-markers"
+asyncio_default_fixture_loop_scope = "function"
+markers = ["integration: needs Docker (Testcontainers)", "smoke: PR fault smoke tests"]
+timeout = 180
 ```
 
 **Member `pyproject.toml`** (pycommon shown; services the same shape with `dependencies = ["pycommon", …]`):
@@ -178,11 +184,29 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
+addopts = "--strict-markers"
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 timeout = 60
 testpaths = ["tests"]
 markers = ["integration: needs Docker (Testcontainers)"]
+
+# The coverage gate lives in each member, read when the gate runs from the member directory (C63):
+# fail_under = 90 for pycommon, 85 for each service (PAY-NFR-12).
+[tool.coverage.run]
+branch = true
+parallel = true
+source = ["pycommon"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "@overload"]
 ```
+
+pytest-socket loads from its entry point, so gate commands pass `--disable-socket --allow-unix-socket`
+and never `-p pytest_socket` (C58).
 
 **`pnpm-workspace.yaml`:**
 
@@ -190,9 +214,10 @@ markers = ["integration: needs Docker (Testcontainers)"]
 packages:
   - "apps/*"
   - "packages/*"
+minimumReleaseAge: 20160   # minutes: the two-week rule (C58)
 ```
 
-Root `package.json`: `"private": true`, `"packageManager": "pnpm@<pinned>"` (corepack), `"engines": {"node": ">=24 <25"}`, scripts `lint`, `format:check` (`prettier --check .`), `typecheck`, `test` delegating with `pnpm -r`.
+Root `package.json`: `"private": true`, `"packageManager": "pnpm@<pinned>"` (corepack), `"engines": {"node": ">=22"}` (CI pins Node 24 LTS through `.nvmrc`; README toolchain notes), scripts `lint`, `format:check` (`prettier --check .`), `typecheck`, `test` delegating with `pnpm -r`.
 
 **`.editorconfig`:**
 
@@ -222,6 +247,7 @@ repos:
     hooks:
       - id: check-yaml
         args: [--allow-multiple-documents]
+        exclude: ^deploy/k8s/          # Kustomize patches aren't plain YAML documents; kubeconform checks them
       - id: check-json
         exclude: ^apps/web/tsconfig.*\.json$
       - id: end-of-file-fixer
@@ -248,12 +274,14 @@ repos:
     hooks:
       - id: prettier
         name: prettier
-        entry: pnpm exec prettier --check
+        entry: pnpm exec prettier --check --ignore-unknown
         language: system
-        types_or: [javascript, ts, tsx, json, yaml, css, markdown]
+        types_or: [javascript, ts, tsx, json, yaml, css]
 ```
 
-mypy is not a pre-commit hook (too slow per commit); CI runs it.
+mypy and ESLint are not pre-commit hooks (too slow per commit, and ESLint needs the web's type
+information); CI runs both. Markdown isn't Prettier-checked: `.prettierignore` excludes `docs/`, whose
+tables Prettier would re-wrap.
 
 **`.gitignore` additions** (the existing file only anchors `/node_modules` and `/.next/` at the root, which misses `apps/web`):
 
@@ -350,7 +378,7 @@ environment with `\getenv` (psql ≥ 15; every psql here is 16) and builds the D
   1. Compose: mounted at `/docker-entrypoint-initdb.d` (the entrypoint runs `*.sql` with psql and ignores the `lib/` directory);
   2. Testcontainers: `pycommon.testing` mounts the same directory into `postgres:16-alpine` with the passwords as container env;
   3. the Kubernetes `db-bootstrap` Job: `lib/run-init.sh` loops over the files (it must live in `lib/`: the Postgres image entrypoint executes every `*.sh` in `docker-entrypoint-initdb.d`, found in S3) with `psql -v ON_ERROR_STOP=1 -f`. Kustomize can't read files outside its root, so `scripts/sync-k8s-assets.sh` copies the directory byte for byte to `deploy/k8s/base/bootstrap/init/` and CI fails on any difference (R32, C36). `deploy/compose/init/` stays the only source that is edited.
-- **Missing variable:** the template checks `:{?var}` and raises, so the run fails with the variable's name and never with its value.
+- **Missing variable:** the template checks `:{?var}` and that the value isn't empty, and raises, so the run fails with the variable's name and never with its value.
 - **Idempotent:** roles are created only if missing, then `ALTER ROLE … PASSWORD` keeps them in sync, so the Job can be re-run to rotate passwords. Schema and grants use `IF NOT EXISTS` or are naturally repeatable.
 - **No logging of passwords:** the server keeps `log_statement = none` (the default); `compose.yaml` doesn't change it. The test `test_bootstrap_sql.py` asserts this setting.
 - **Managed Postgres** (uat, prod: the admin is not a superuser): in PG 16 a `CREATEROLE` admin has ADMIN on roles it creates but can't `SET ROLE` to them, which `CREATE SCHEMA … AUTHORIZATION` and `ALTER DEFAULT PRIVILEGES FOR ROLE` need. The template grants each migrator to `current_user WITH SET TRUE, INHERIT FALSE` when `current_user` is not a superuser.
@@ -390,6 +418,16 @@ REVOKE ALL ON SCHEMA public FROM PUBLIC;              -- nothing lives in public
   \echo 'bootstrap: missing env' :runtime_env
   DO $$ BEGIN RAISE EXCEPTION 'bootstrap: required password env var is not set'; END $$;
 \endif
+-- An empty value counts as missing.
+SELECT (:'migrator_pw' = '') AS migrator_pw_empty, (:'runtime_pw' = '') AS runtime_pw_empty \gset
+\if :migrator_pw_empty
+  \echo 'bootstrap: missing env' :migrator_env
+  DO $$ BEGIN RAISE EXCEPTION 'bootstrap: required password env var is empty'; END $$;
+\endif
+\if :runtime_pw_empty
+  \echo 'bootstrap: missing env' :runtime_env
+  DO $$ BEGIN RAISE EXCEPTION 'bootstrap: required password env var is empty'; END $$;
+\endif
 -- \echo prints the variable holding the env var's NAME, never a value
 
 SELECT format('CREATE ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT', :'migrator')
@@ -419,6 +457,10 @@ SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT EXECUTE O
 -- tables that already exist (re-run after migrations) get the same grants
 SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %I TO %I', :'schema', :'runtime') \gexec
 SELECT format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %I TO %I', :'schema', :'runtime') \gexec
+-- C63: the grant above would give the runtime role write access to the Alembic version table
+-- again (run_alembic_env revokes it after each upgrade), so revoke it whenever the table exists.
+SELECT format('REVOKE INSERT, UPDATE, DELETE ON TABLE %I.alembic_version FROM %I', :'schema', :'runtime')
+ WHERE to_regclass(format('%I.alembic_version', :'schema')) IS NOT NULL \gexec
 
 SELECT format('ALTER ROLE %I SET search_path = %I', :'migrator', :'schema') \gexec
 SELECT format('ALTER ROLE %I SET search_path = %I', :'runtime', :'schema') \gexec
@@ -455,6 +497,10 @@ bootstrap re-run.
 \else
   DO $$ BEGIN RAISE EXCEPTION 'bootstrap: POSTGRES_EXPORTER_PASSWORD is not set'; END $$;
 \endif
+SELECT (:'exporter_pw' = '') AS exporter_pw_empty \gset
+\if :exporter_pw_empty
+  DO $$ BEGIN RAISE EXCEPTION 'bootstrap: POSTGRES_EXPORTER_PASSWORD is empty'; END $$;
+\endif
 SELECT 'CREATE ROLE postgres_exporter LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE CONNECTION LIMIT 3'
  WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'postgres_exporter') \gexec
 SELECT format('ALTER ROLE postgres_exporter PASSWORD %L', :'exporter_pw') \gexec
@@ -466,7 +512,8 @@ ALTER ROLE postgres_exporter SET search_path = pg_catalog;
 **Migrations** run as the migrator via `pycommon.db.run_alembic_env(target_metadata, schema)` (§3.7):
 `version_table_schema = schema`, `include_schemas = True`, filter to that schema only. After
 `upgrade`, the helper runs `REVOKE INSERT, UPDATE, DELETE ON <schema>.alembic_version FROM <schema>_app`,
-so the runtime role can read the head (for `/readyz`) but never change it.
+so the runtime role can read the head (for `/readyz`) but never change it. The template re-revokes the
+same privileges on every bootstrap run (C63), because its `GRANT … ON ALL TABLES` would restore them.
 
 ### 2.2 Redis (`deploy/compose/redis/`; PAY-607, ADR 0007)
 
@@ -496,7 +543,7 @@ latency-tracking yes
 | User | Password env | Keys | Commands |
 |---|---|---|---|
 | `default` | `REDIS_ADMIN_PASSWORD` | `~*` `&*` | `+@all` (admin; used by healthchecks, resilience `FLUSHALL`, operators) |
-| `web` | `REDIS_WEB_PASSWORD` | `~web:*` | `+@connection +ping +@read +@write +@keyspace +@transaction -@stream -@scripting -@pubsub -@admin -@dangerous` |
+| `web` | `REDIS_WEB_PASSWORD` | `~web:*` | `+@connection +ping +@read +@write +@keyspace +@transaction -@stream -@scripting -@pubsub -@admin -@dangerous -scan -randomkey` |
 | `identity` | `REDIS_IDENTITY_PASSWORD` | `~identity:*` | same as web |
 | `payroll` | `REDIS_PAYROLL_PASSWORD` | `~payroll:*`, selector `(~stream:payout.requested +xadd)` | same as web on its keys; `XADD` only on the stream |
 | `payout-worker` | `REDIS_PAYOUT_WORKER_PASSWORD` | selectors only | root `+@connection +ping -@scripting -@dangerous`; `(~stream:payout.requested +xreadgroup +xack +xautoclaim +xpending +xinfo +xgroup\|create +xgroup\|delconsumer)`; `(~stream:payout.requested.dlq +xadd +xinfo)` |
@@ -504,6 +551,7 @@ latency-tracking yes
 
 Notes:
 - **No Lua anywhere (C3):** every user except `default` lacks `@scripting`, so `EVAL`, `EVALSHA`, `FCALL` and `SCRIPT` fail with `NOPERM`. identity's limiter and lockout use `pycommon.ratelimit` (`MULTI` + `INCR` + `EXPIRE NX`) and `SET NX EX` (§3.11).
+- **No key enumeration (C63):** key patterns don't filter `SCAN` or `RANDOMKEY` results, so the base rule denies both (`KEYS` is already `@dangerous`). No client uses them.
 - `-@stream` for web and identity, plus their key patterns, means `XADD stream:payout.requested` fails with `NOPERM` (the PAY-607 acceptance test).
 - **PING** is granted explicitly to every user (R12), for `/readyz` and client health checks; `+@connection` also covers `AUTH`, `HELLO`, `CLIENT SETINFO` (sent by redis-py ≥ 5). `-@dangerous` after it removes `CLIENT KILL` and similar.
 - **The worker's commands** match payout-worker LLD §3.3.1: `XREADGROUP`, `XACK`, `XAUTOCLAIM`, `XPENDING`, `XINFO GROUPS` and `XINFO STREAM`, `XGROUP CREATE … MKSTREAM`, `XGROUP DELCONSUMER` (C27; removes stale consumer names), `XADD` to the DLQ (with `MAXLEN ~ 10000`, C21), and `PING`. The `~` key patterns grant read **and** write, which `MKSTREAM` needs to create the stream key (R12). `XINFO` on the DLQ feeds `queue_dlq_messages` and on the main stream `queue_consumer_lag` (Redis 7 `lag`).
@@ -521,7 +569,7 @@ for v in REDIS_ADMIN_PASSWORD REDIS_WEB_PASSWORD REDIS_IDENTITY_PASSWORD REDIS_P
   [ -n "$val" ] || { echo "redis-acl: missing $v" >&2; exit 1; }
 done
 h() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
-BASE='+@connection +ping +@read +@write +@keyspace +@transaction -@stream -@scripting -@pubsub -@admin -@dangerous'
+BASE='+@connection +ping +@read +@write +@keyspace +@transaction -@stream -@scripting -@pubsub -@admin -@dangerous -scan -randomkey'
 WORKER_MAIN='~stream:payout.requested +xreadgroup +xack +xautoclaim +xpending +xinfo +xgroup|create +xgroup|delconsumer'
 WORKER_DLQ='~stream:payout.requested.dlq +xadd +xinfo'
 EXPORTER='+@connection +ping -@scripting -@dangerous +info +config|get +client|list +slowlog|get +slowlog|len +latency|latest +xinfo +xlen +type +dbsize +memory|stats'
@@ -686,7 +734,9 @@ Observation = Mapping[frozenset[tuple[str, str]], float]      # label set → va
 
 def observable_gauge(name: str, *, unit: str, description: str,
                      callback: Callable[[], Observation]) -> ObservableGauge
-    # collection-time helper (R26, C18): `callback` runs synchronously on the metric reader's thread
+    # collection-time helper (R26, C18): `callback` runs synchronously on the metric reader's thread;
+    # unit "1" raises ValueError (C63); re-registering a name replaces its callback
+def clear_gauge_callbacks() -> None                            # pycommon.testing calls it per test
 
 def inject_traceparent() -> str | None                       # W3C traceparent of the current span, None when no valid span
 def new_traceparent() -> str                                   # "00-<32 hex>-<16 hex>-00": fresh, valid, not sampled
@@ -696,9 +746,9 @@ def context_from_traceparent(tp: str | None) -> Context        # empty Context w
 Behaviour:
 - **Exporters:** OTLP gRPC to `OTEL_EXPORTER_OTLP_ENDPOINT` (`http://otel-collector:4317`); metric export every `OTEL_METRIC_EXPORT_INTERVAL` = 15000 ms, cumulative temporality.
 - **Sampling (R27, C23):** `OTEL_TRACES_SAMPLER=parentbased_always_on` in every service and every environment, so the apps send 100% of spans; there is no `OTEL_TRACES_SAMPLER_ARG`. `setup` uses `ParentBased(ALWAYS_ON)` when the variable is unset, and logs `otel.sampler.overridden` {sampler} at warning when it is set to anything else. Prod keeps errors, slow traces and a 10% baseline with the Collector's `tail_sampling` (§8.1), not in the SDK.
-- **Instrumentation:** FastAPI (`excluded_urls="livez,readyz"`, no header capture, a `server_request_hook` that drops `url.query`), httpx (a request hook that drops `url.query` and never records headers), SQLAlchemy (`engine.sync_engine`; `enable_commenter=False`), Redis (a `request_hook` that records only the command name, never arguments: arguments can carry session IDs), system metrics (process CPU and memory only).
-- **Metric naming rule:** instruments are created with the **final Prometheus name minus `_total`** for counters (the Collector appends `_total`), and with the full name, `_seconds` included, for histograms and gauges with unit `s` (the Collector doesn't duplicate a suffix already present). `scripts/ci/check_metrics.sh` confirms the names in Prometheus in the e2e job.
-- **`observable_gauge`** is D7. It registers an OTel observable gauge whose callback runs at **collection time**, every export interval (15 s), on the `PeriodicExportingMetricReader` thread. So the callback must be synchronous and must not touch the event loop: a service that needs the DB there uses a sync engine with a short statement timeout (payroll LLD §7.2), or reads values its own poller cached (payout-worker LLD §3.3.8). The helper wraps the callback: an exception logs `metrics.gauge_query_failed` {gauge, error_type} at warning and yields **no observation** for that cycle, never a stale or zero value. pycommon registers no domain gauges itself: the queries for `payroll_*` and `outbox_*` (payroll LLD §7.2), `identity_email*` (identity LLD §5.2) and `queue_*` (payout-worker LLD §5.2) are owned by those services (C18).
+- **Instrumentation:** FastAPI (`excluded_urls="livez,readyz"`, no header capture, a `server_request_hook` that drops `url.query`), httpx (a request hook that drops `url.query` and never records headers), SQLAlchemy (`engine.sync_engine`; `enable_commenter=False`; `skip_dep_check=True`, because instrumentation 0.66b1 declares sqlalchemy < 2.1 and otherwise instruments nothing, while its engine hooks work on 2.1.6, verified by `test_db_spans.py`; C61), Redis (a `request_hook` that records only the command name, never arguments: arguments can carry session IDs), system metrics (process CPU and memory only).
+- **Metric naming rule:** instruments are created with the **final Prometheus name minus `_total`** for counters (the Collector appends `_total`), and with the full name, `_seconds` included, for histograms and gauges with unit `s` (the Collector doesn't duplicate a suffix already present). **Gauges never use unit `"1"` (C63):** the Collector's Prometheus exporter appends `_ratio` to a gauge with that unit, so `circuit_breaker_state` would arrive as `circuit_breaker_state_ratio`. Gauges use a curly-brace annotation (`"{state}"`, `"{entry}"`, `"{run}"`), which adds no suffix, or `"s"` for ages; `observable_gauge` raises `ValueError` for `"1"`. Counters may keep `"1"` (they only get `_total`). `scripts/ci/check_metrics.sh` confirms the names in Prometheus in the e2e job.
+- **`observable_gauge`** is D7. It registers an OTel observable gauge whose callback runs at **collection time**, every export interval (15 s), on the `PeriodicExportingMetricReader` thread. So the callback must be synchronous and must not touch the event loop: a service that needs the DB there uses a sync engine with a short statement timeout (payroll LLD §7.2), or reads values its own poller cached (payout-worker LLD §3.3.8). The helper wraps the callback: an exception logs `metrics.gauge_query_failed` {gauge, error_type} at warning and yields **no observation** for that cycle, never a stale or zero value. The SDK keeps only the first instrument per name and ignores later callbacks, so the helper registers one instrument per meter provider and name and **replaces the callback** when the same name is registered again (a second app instance in one process; C63). pycommon registers no domain gauges itself: the queries for `payroll_*` and `outbox_*` (payroll LLD §7.2), `identity_email*` (identity LLD §5.2) and `queue_*` (payout-worker LLD §5.2) are owned by those services (C18).
 - **`new_traceparent`** gives producers a valid, unsampled context when no span is active, so `Envelope.traceparent` is always present (C22).
 - **`asyncio_event_loop_lag_seconds`** (gauge) is measured by a 1 s ticker task started by `create_app`.
 
@@ -739,10 +789,20 @@ Handler mapping (PAY-602):
 | `AppError` subclass | its `status` | its `code` | `http.error` at info (4xx) or warning (503) |
 | `RequestValidationError` | 422 | `validation_error`; `details = [{field: "body.email", issue: "value_error"}]`, never the input | info |
 | Starlette 404 / 405 | 404 / 405 | `not_found` / `method_not_allowed` | — |
-| `asyncpg.QueryCanceledError`, SQLAlchemy pool `TimeoutError`, `asyncio.TimeoutError` inside a DB call | 503 | `db_timeout` | `db.timeout` warning |
-| `asyncpg` / SQLAlchemy connection errors (`OperationalError`, `ConnectionDoesNotExistError`, `OSError`) | 503 | `db_unavailable` | `db.unavailable` warning |
+| `asyncpg.QueryCanceledError`, SQLAlchemy pool `TimeoutError`, SQLSTATE `57014` or `55P03` (lock_timeout; C60), or a `TimeoutError` raised inside asyncpg/SQLAlchemy | 503 | `db_timeout` | `db.timeout` warning |
+| `asyncpg` / SQLAlchemy connection errors (`OperationalError`, `ConnectionDoesNotExistError`, SQLSTATE `08xxx`/`57Pxx`), or an `OSError` raised inside asyncpg/SQLAlchemy (a refused connect) | 503 | `db_unavailable` | `db.unavailable` warning |
+| SQLSTATE `22021` (character_not_in_repertoire, e.g. a NUL byte in text; C63) | 422 | `validation_error`, `details = [{field: "body", issue: "invalid_character"}]` | `http.error` info |
 | `redis.exceptions.ConnectionError` / `TimeoutError` not handled by a caller | 503 | `service_unavailable` | `redis.unavailable` warning |
 | any other `Exception` | 500 | `internal_error`, message "Something went wrong." | `http.unhandled` error, with the traceback, recorded on the span |
+
+**Only DB-driver errors are DB errors (C63).** `db_error_kind(exc, *, in_db_call=False)` walks the
+`__cause__`/`__context__` chain and returns `"timeout"`, `"unavailable"` or `None`. It counts asyncpg and
+SQLAlchemy exceptions, Postgres SQLSTATEs, and an `OSError`/`TimeoutError` only when its traceback passes
+through asyncpg or SQLAlchemy code (a refused or timed-out connect surfaces raw from `engine.connect()`).
+A bare `OSError` or `TimeoutError` from anywhere else (an `asyncio.timeout` in a route, an SMTP socket
+error, an httpx connect error) is not a DB error and gives 500 `internal_error`. There is no handler for
+bare `OSError`. `map_db_errors()` passes `in_db_call=True`, because its block is a DB call by
+construction. `is_invalid_text(exc)` reports SQLSTATE 22021 anywhere in the chain.
 
 Every error body carries `request_id`. No traceback or exception text ever reaches a response.
 
@@ -796,7 +856,7 @@ class TokenSigner:
                  clock: Clock = SystemClock()) -> None: ...
     def mint(self, *, aud: str, sub: str, cid: UUID, roles: Iterable[str] = (),
              name: str | None = None, sid: str | None = None, ttl_s: int = 60) -> str: ...
-        # claims iss, aud, sub, cid, roles, iat, exp, jti (UUID4); name and sid only when given
+        # claims iss, aud, sub, cid, roles, iat, exp, jti (UUIDv7, C61); name and sid only when given
 
 # FastAPI dependencies
 SubjectKind = Literal["user", "service:web", "service:payout-worker"]
@@ -861,7 +921,7 @@ def session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]
 @asynccontextmanager
 async def transaction(sf: async_sessionmaker[AsyncSession]) -> AsyncIterator[AsyncSession]
 @contextmanager
-def map_db_errors() -> Iterator[None]                 # raises DbTimeout / DbUnavailable
+def map_db_errors(operation: str = "db") -> Iterator[None]   # raises DbTimeout / DbUnavailable / ValidationFailed (22021)
 def new_id() -> UUID                                  # uuid.uuid7() (Python 3.14 stdlib)
 def advisory_lock_key(name: str) -> int               # signed 64-bit from sha256(name)[:8]
 class Base(DeclarativeBase): ...
@@ -869,6 +929,10 @@ class TimestampMixin:                                  # created_at, updated_at 
     created_at: Mapped[datetime]; updated_at: Mapped[datetime]
 def run_alembic_env(target_metadata: MetaData, *, schema: str, runtime_role: str) -> None
 ```
+
+`map_db_errors(operation)` logs `db.timeout` / `db.unavailable` {operation} and raises `DbTimeout` /
+`DbUnavailable`; text Postgres rejects (SQLSTATE 22021) raises `ValidationFailed` (422, C63). Services
+that reject NUL in their request models never reach that path; it's the defence in depth.
 
 `create_engine` uses `postgresql+asyncpg`, `pool_size`, `max_overflow`, `pool_timeout = DB_POOL_TIMEOUT_S`,
 `pool_pre_ping = True`, `pool_recycle = 1800`, and `connect_args = {"server_settings": {"statement_timeout":
@@ -961,7 +1025,8 @@ span's context in `envelope_json`, as payroll does (payroll LLD §5.2).
 3. `publish_many` the claimed items in order.
 4. `repo.mark_sent` for the items that got an entry id, `repo.mark_failed(error_type=<class name>)` for the rest; commit.
 5. Any failure (per item, or the whole pipeline raising): log `outbox.relay.error` {error_type, batch_size, failed, backoff_ms} at error, then sleep full-jitter `min(0.2 × 2^k, max_backoff_s)` s, `k += 1`; a clean batch resets `k`. A row that was XADDed but whose commit failed is sent again later: delivery is at least once, and the consumer is idempotent.
-6. A full batch loops at once; on `stop`, the current batch finishes, then `run` returns.
+6. A batch with at least one sent item logs `outbox.relay.published` {count, duration_ms} at info (C63).
+7. A full batch loops at once; on `stop`, the current batch finishes, then `run` returns.
 
 Several replicas are safe because the repository claims with `SKIP LOCKED`. The `outbox_unsent`
 and `outbox_oldest_age_seconds` gauges are payroll's (payroll LLD §7.2, C18), not the loop's.
@@ -1065,6 +1130,13 @@ class RateLimiter:
         # __init__ calls rate_limiter_errors_total.add(0, {component}) so the series exists before any error
     async def hit(self, limit: Limit, subject: str) -> Decision: ...
     async def check(self, limit: Limit, subject: str) -> None: ...   # raises RateLimited / ServiceUnavailable
+    @property
+    def component(self) -> str: ...
+    def record_denied(self, scope: str) -> None: ...                  # rate_limited_total{scope} +1 (C63)
+    def record_error(self, exc: BaseException | None = None, *,
+                     fail_mode: FailMode | str = FailMode.open) -> None: ...
+        # rate_limiter_errors_total{component} +1 and ratelimit.backend_error (≤ 1 per 10 s); the caller
+        # then allows or refuses (C63)
 
 def caller_rate_limit(settings: BaseServiceSettings, *,
                       exempt_subs: Iterable[str] = ("service:web",)) -> Callable[..., Awaitable[None]]
@@ -1074,6 +1146,7 @@ def caller_rate_limit(settings: BaseServiceSettings, *,
 - **Algorithm (D6):** fixed window. Key `"{prefix}:{scope}:{sha256(subject)[:32]}:{now // window_s}"`; in one `MULTI`: `INCR key`, `EXPIRE key window_s+1 NX`. Allowed when the count ≤ `limit`; otherwise `retry_after_s = window_end − now` (≥ 1). The subject is hashed, so emails and IPs never appear in Redis keys. Bursts up to 2× at a window edge are accepted at this scale.
 - **Redis error or timeout** (500 ms socket timeout): `rate_limiter_errors_total{component}` +1 and log `ratelimit.backend_error` (warning, at most once per 10 s); then `open` → `Decision(allowed=True, degraded=True)`; `closed` → `ServiceUnavailable` (503 `service_unavailable`).
 - **Denied:** `rate_limited_total{scope}` +1; `check` raises `RateLimited` with `Retry-After`.
+- **Service decisions (C63):** a service that denies or fails on its own Redis call (identity's lockout `SET NX EX` and its "locked" check) reports through the same limiter: `record_denied(scope)` and `record_error(exc, fail_mode=…)`. Services create no `rate_limited` or `rate_limiter_errors` counters of their own.
 - **`caller_rate_limit` (PAY-603, C17):** scope `caller`, component `caller`, subject `Principal.caller_key` (`"<iss>:<sub>"`), so the key is `"{prefix}:caller:{sha256(caller_key)[:32]}:{window}"` in every service; identity and payroll use this format and build no caller keys of their own. A principal whose `sub` is in `exempt_subs` (default `("service:web",)`: the BFF's public flows, which identity limits per IP instead) is not counted. `iss=payout-worker` uses `SERVICE_RATE_LIMIT_WORKER` (6000/min), every other caller `SERVICE_RATE_LIMIT_USER` (600/min), window 60 s; fail open. Login, reset and invite-accept limits (fail closed) are built by identity with the same `RateLimiter`.
 
 ### 3.12 `startup_checks.py` (PAY-605)
@@ -1090,7 +1163,9 @@ StartupCheck = Callable[[BaseServiceSettings], Iterable[CheckFailure]]
 DEV_DEFAULTS: Final = frozenset({"", "changeme", "change-me", "password", "secret", "dev", "test", "REPLACE_ME", "placeholder"})
 DEV_KID_PREFIXES: Final = ("dev-", "test-")
 
-def check_secrets(s: BaseServiceSettings) -> Iterable[CheckFailure]          # every SecretStr: present, not in DEV_DEFAULTS, length ≥ 16
+def check_secrets(s: BaseServiceSettings) -> Iterable[CheckFailure]          # every SecretStr: present, not in DEV_DEFAULTS, length ≥ 16;
+    # optional service secrets that default to None (SMTP_PASSWORD) are skipped, and services enforce
+    # their own "required in prod" rules as extra checks (C59)
 def check_jwt_kids(s: BaseServiceSettings) -> Iterable[CheckFailure]         # INTERNAL_JWT_PUBLIC_KEYS kids and any *_KID field
 def check_debug_and_docs(s: BaseServiceSettings) -> Iterable[CheckFailure]
 def check_field_keys(keys_json: str, active_kid: str, *, setting: str = "PAYROLL_FIELD_KEYS") -> Iterable[CheckFailure]
@@ -1106,10 +1181,11 @@ def check_mark_rejected_wait(mark_rejected_min_wait_s: float, bank_total_deadlin
                              payroll_call_deadline_s: float) -> Iterable[CheckFailure]
     # mark_rejected_min_wait_s > (bank_total_deadline_s + 2*payroll_call_deadline_s + 10) + 30   (C48)
 
-def run_startup_checks(settings: BaseServiceSettings, extra: Sequence[StartupCheck] = ()) -> None
+def run_startup_checks(settings: BaseServiceSettings, extra: Sequence[StartupCheck] = (), *,
+                       fatal: Sequence[StartupCheck] = ()) -> None
 ```
 
-- `run_startup_checks` runs the common checks plus `extra`. In **uat and prod** any failure logs `startup.check_failed` {setting, reason} at error for **each** failure (never the value), then exits with code 2. In **dev** the same failures are logged at warning and start-up continues, so a developer sees them.
+- `run_startup_checks` runs the common checks plus `extra`. In **uat and prod** any failure logs `startup.check_failed` {setting, reason} at error for **each** failure (never the value), then exits with code 2. In **dev** the same failures are logged at warning and start-up continues, so a developer sees them. `fatal` checks log at error and exit 2 in **every** env, dev included: `create_app` passes the JWT keyset check there, because without `INTERNAL_JWT_PUBLIC_KEYS` no route could authenticate (C63).
 - The timing checks are extras: payroll registers `check_republish_after` and `check_mark_rejected_wait`; the worker registers `check_claim_idle` and `check_republish_after`. Both services therefore read the shared timing keys (`PAYOUT_MAX_DELIVERIES`, `PAYOUT_CLAIM_MIN_IDLE_MS`, `BANK_TOTAL_DEADLINE_S`, `PAYOUT_PAYROLL_CALL_DEADLINE_S`, `PAYOUT_REPUBLISH_AFTER_S`, `PAYOUT_MARK_REJECTED_MIN_WAIT_S`) from one shared source: `x-payout-timing` in Compose, the `payout-timing` ConfigMap in Kubernetes.
 - **The defaults pass all three checks:** republish 360 > 5 × 60 + 15 = 315 (R1; the old plan value 300 failed); claim idle 60 > 15 + 2 × 5 + 10 = 35; mark_rejected wait 120 > 35 + 30 = 65 (C48).
 - **Every Python service uses this module (C29):** a failed check logs `startup.check_failed` {setting, reason} and exits **2**; services add their checks as `extra` and log no other start-up refusal event (no `worker.startup.refused`, `bank_stub.startup.refused` or exit 1). The web does the same in TypeScript: `config.invalid`, exit 2.
@@ -1176,7 +1252,7 @@ Order of assembly (outermost first):
 5. Error handlers (`install_handlers`).
 6. Routers: `routers` included with `dependencies=[Depends(authenticate)]` (and `Depends(caller_rate_limit(settings))`, exempting `service:web`, when Redis is used); `public_routers` as given; `health_router` with no dependencies.
 7. Lifespan:
-   1. `setup_logging`; `run_startup_checks(settings, startup_checks)` (`startup.check_failed`, exit 2 in uat/prod on failure; C29), **before** any connection is opened;
+   1. `setup_logging`; `run_startup_checks(settings, startup_checks, fatal=[jwt keyset present])` (`startup.check_failed`, exit 2 in uat/prod on failure, C29; a missing keyset exits 2 in every env, C63), **before** any connection is opened;
    2. create the engine, Redis client, verifier and limiter as configured; build `AppContext` on `app.state.ctx`;
    3. `on_startup(ctx)`; log `service.started` {version, env};
    4. start each `background` task with a shared `stop` event (relay, maintenance, gauges, the worker's consumer, the event-loop-lag ticker);
@@ -1185,18 +1261,25 @@ Order of assembly (outermost first):
 
 **`serve.py`:** `python -m pycommon.serve` reads `PYCOMMON_APP` (`identity.main:app`), host `0.0.0.0`, port `PORT` (8000), and runs `uvicorn.Server(Config(app, access_log=False, proxy_headers=False, server_header=False, timeout_graceful_shutdown=<from settings>, lifespan="on"))`. The worker is served the same way: its `app` has only health routes and the consumer as a background task.
 
-**`testing.py`** (pytest plugin `pycommon.testing`, registered with `pytest_plugins`): fixtures `pg_bootstrapped` (Postgres 16 with `deploy/compose/init` mounted at `/docker-entrypoint-initdb.d` and generated test passwords in the container env), `db_env_for(role)` (the C1 keys `DB_HOST` … `DB_SCHEMA` for that role), `alembic_upgrade(service)`, `redis_acl` (Redis 7 with `deploy/compose/redis/` mounted and the same entrypoint), `redis_env_for(user)` (the C1 keys `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`, `REDIS_PASSWORD` for that ACL user), `token_factory` (a throwaway Ed25519 key pair, `TokenSigner` and a matching `Keyset`), `otel_memory` (in-memory span exporter and `InMemoryMetricReader`), `fake_clock`, `caplog_json`. Service tests reuse them, so bootstrap SQL and ACLs are exercised in every service's integration suite (PAY-606, 607).
+**`testing.py`** (pytest plugin `pycommon.testing`, registered with `pytest_plugins`): fixtures `pg_bootstrapped` (Postgres 16 with `deploy/compose/init` mounted at `/docker-entrypoint-initdb.d` and generated test passwords in the container env), `db_env_for(role)` (the C1 keys `DB_HOST` … `DB_SCHEMA` for that role), `alembic_upgrade(service)`, `redis_acl` (Redis 7 with `deploy/compose/redis/` mounted and the same entrypoint), `redis_env_for(user)` (the C1 keys `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`, `REDIS_PASSWORD` for that ACL user), `token_factory` (a throwaway Ed25519 key pair, `TokenSigner` and a matching `Keyset`), `otel_memory` (in-memory span exporter, `InMemoryMetricReader` and log exporter), `fake_clock`, `caplog_json`.
+**OTel isolation (C61, C63):** the plugin's `pytest_configure` installs **one** in-memory provider set as the
+OTel globals for the whole process (`session_otel()`), and nothing resets the globals afterwards, so
+instruments created at import time or by an earlier test keep reporting to the same provider and suites can
+share a process. `otel_memory` clears the span and log exporters and the pending metric data per test, and
+drops every gauge callback (`otel.clear_gauge_callbacks()`). Synchronous counters and histograms use delta
+temporality in this reader, and `OtelMemory.metric_points` adds the deltas up, so each test sees counts from
+its own start; gauges show what the current collection reports. Service tests reuse them, so bootstrap SQL and ACLs are exercised in every service's integration suite (PAY-606, 607).
 
 ### 3.15 `scripts/`
 
 #### `scripts/dev-env.sh`
 
-`scripts/dev-env.sh [--env-file PATH] [--k8s-dev]`. Bash, `set -euo pipefail`, shellcheck-clean.
+`scripts/dev-env.sh [--env-file PATH] [--k8s-dev [--k8s-dev-file PATH]]`. Bash, `set -euo pipefail`, shellcheck-clean. It runs from the repository root wherever it's called from; `--env-file` and `--k8s-dev-file` paths are taken relative to the caller's directory.
 
 - **Idempotent:** it reads the existing `.env` (default `./.env`, mode 0600) and appends only missing keys. Existing values are kept, except the *derived* keys (ports and keysets), which are recomputed every run from their sources. It never prints a secret; it prints the names of keys it added.
 - **Tooling:** needs OpenSSL ≥ 3 for Ed25519 (`openssl genpkey -algorithm ed25519`). macOS's `/usr/bin/openssl` is LibreSSL, so the script prefers `$(brew --prefix openssl@3)/bin/openssl` and fails with a clear message when no OpenSSL 3 is found. CI runners have OpenSSL 3.
 - **Encoding in `.env`:** PEMs are written double-quoted with `\n` escapes (Compose expands `\n` in double-quoted values); JSON values are single-quoted (taken literally, so the JSON's own `\n` escapes reach the parser intact). `pycommon.settings.normalise_pem` and the web's loader accept both forms, so `source .env` in bash also works.
-- `--k8s-dev` also writes `deploy/k8s/overlays/dev/secrets.env` (git-ignored) from the same values, for the dev overlay's `secretGenerator`.
+- `--k8s-dev` also writes `deploy/k8s/overlays/dev/secrets.env` (git-ignored; `--k8s-dev-file` overrides the path, for tests) from the same values, for the dev overlay's `secretGenerator`. Kustomize reads env files literally, so each value is written **unquoted** on one line: JSON as-is, PEMs with literal `\n` escapes. The Compose-only keys (`APP_PORT_BASE`, `COMPOSE_PROJECT_NAME` and the host ports) are left out; `SMTP_PORT` stays. The file is mode 0600.
 
 Variables written:
 
@@ -1404,7 +1487,7 @@ Service LLDs add their domain events and business metrics. These come from pycom
 | `auth.token.rejected` | warning | reason, kid, iss | JWT verification failed | PAY-600 |
 | `auth.forbidden` | info | route, subject_kind or missing_roles | 403 by the C30 rule | PAY-601 |
 | `settings.invalid` | error | fields | settings validation failed; exit 2 | PAY-605 |
-| `startup.check_failed` | error (uat/prod) / warning (dev) | setting, reason | a startup check fails; exit 2 in uat/prod (C29) | PAY-605 |
+| `startup.check_failed` | error (uat/prod) / warning (dev) | setting, reason | a startup check fails; exit 2 in uat/prod (C29), and in every env for a missing JWT keyset (C63) | PAY-605 |
 | `otel.sampler.overridden` | warning | sampler | `OTEL_TRACES_SAMPLER` isn't `parentbased_always_on` | plan §11 |
 | `metrics.gauge_query_failed` | warning | gauge, error_type | an `observable_gauge` callback raised | plan §2.1 |
 | `service.started` / `service.stopped` | info | version, env | lifespan | — |
@@ -1412,6 +1495,7 @@ Service LLDs add their domain events and business metrics. These come from pycom
 | `health.check_failed` | warning | check, error_type | `/readyz` failure (rate-limited) | PAY-605 |
 | `db.timeout` / `db.unavailable` | warning | operation | DB timeout / connection failure | PAY-605 |
 | `redis.unavailable` | warning | operation | Redis error not handled by the caller | plan §2.1 |
+| `outbox.relay.published` | info | count, duration_ms | a `RelayLoop` batch sent at least one row (C63) | PAY-402 |
 | `outbox.relay.error` | error | error_type, batch_size, failed, backoff_ms | `RelayLoop` XADD or commit failed | PAY-402 |
 | `external.request.retry` / `external.request.failed` | warning | provider, operation, attempt, reason, delay_ms | resilient client | plan §9 |
 | `external.breaker.opened` / `.half_open` / `.closed` | warning / info / info | target | breaker transition | plan §9 |
@@ -1422,9 +1506,9 @@ Service LLDs add their domain events and business metrics. These come from pycom
 | `asyncio_event_loop_lag_seconds` | gauge | — | 1 s ticker | NFR-10 saturation |
 | `external_requests_total` | counter | `provider`, `operation`, `outcome` | per attempt | plan §9, 11 |
 | `external_request_duration_seconds` | histogram | `provider`, `operation` | per attempt | plan §9 |
-| `circuit_breaker_state` | gauge (0 closed, 1 half-open, 2 open) | `target` | breaker | plan §11 |
-| `rate_limiter_errors_total` | counter | `component` | Redis failure in the limiter | PAY-603 |
-| `rate_limited_total` | counter | `scope` | request denied | PAY-603 |
+| `circuit_breaker_state` | gauge, unit `{state}` (0 closed, 1 half-open, 2 open; C63) | `target` | breaker | plan §11 |
+| `rate_limiter_errors_total` | counter | `component` | Redis failure in the limiter, or `RateLimiter.record_error()` (C63) | PAY-603 |
+| `rate_limited_total` | counter | `scope` | request denied, or `RateLimiter.record_denied(scope)` (C63) | PAY-603 |
 | `maintenance_runs_total` / `maintenance_duration_seconds` | counter / histogram | `task`, `outcome` / `task` | per task per tick | PAY-608 |
 
 All metrics carry `service_name` and `deployment_environment_name` from the resource (§8.1). No
@@ -1442,25 +1526,26 @@ owning LLD defines them, and these names and labels are the contract):
 ### 6.1 pycommon (gate: ≥ 90% line coverage, branch coverage on; unit + integration combined)
 
 Unit tests run with `--disable-socket --allow-unix-socket`; integration tests use the
-`pycommon.testing` containers. Each test cites its requirement in its docstring.
+`pycommon.testing` containers. Each test cites its requirement in its docstring. Fake credentials are
+generated at runtime (`secrets.token_urlsafe`), never committed as literals (testing.md §9, C63).
 
 | Test file | Covers |
 |---|---|
 | `tests/unit/test_settings.py` | Precedence env > `.env` > defaults; the C1 names are read unprefixed (`DB_HOST` … `REDIS_PASSWORD`) and `DATABASE_URL`/`REDIS_URL` are ignored; `LOG_LEVEL=info`, `Info` and `INFO` all load as `INFO`, `verbose` fails (C24); `SettingsError` lists field names and never values (a secret placed in an invalid field doesn't appear in the message), and `load_settings` exits 2; `normalise_pem`; `db_url` quoting; `secret_fields` |
 | `tests/unit/test_logging.py` | JSON line has every required field; `trace_id`/`span_id` inside a span (in-memory exporter); `redact` masks each of the 7 PAY-NFR-07 keys and the extra ones, case-insensitively, nested in dicts and lists, plus JWT / Bearer / PEM values under innocent keys; depth cap; `user_text` length outside dev; uvicorn access log silenced; OTLP handler gets redacted attributes (NFR-07) |
-| `tests/unit/test_otel.py` | Resource attributes; `OTEL_SEMCONV_STABILITY_OPT_IN` set before instrumentation import; the sampler is `ParentBased(ALWAYS_ON)` when `OTEL_TRACES_SAMPLER` is unset or `parentbased_always_on`, and another value logs `otel.sampler.overridden` (C23); a TestClient request yields `http.server.request.duration` with `http.route` (the stable name, checked with `InMemoryMetricReader`); `url.query` dropped from server and client spans; Redis hook records no arguments; histogram buckets applied; `observable_gauge` reports the callback's value at collection, and a raising callback yields no observation and logs `metrics.gauge_query_failed` (R26, C18); traceparent inject/extract round trip, `new_traceparent` format (unsampled flag), and invalid input → empty context |
-| `tests/unit/test_errors.py` | Each handler row of §3.4: status, code, body shape with `request_id`, no traceback or exception text in the body, 422 details without input values, `Retry-After` on 429 (PAY-602) |
+| `tests/unit/test_otel.py` | Resource attributes; `OTEL_SEMCONV_STABILITY_OPT_IN` set before instrumentation import; the sampler is `ParentBased(ALWAYS_ON)` when `OTEL_TRACES_SAMPLER` is unset or `parentbased_always_on`, and another value logs `otel.sampler.overridden` (C23); a TestClient request yields `http.server.request.duration` with `http.route` (the stable name, checked with `InMemoryMetricReader`); `url.query` dropped from server and client spans; Redis hook records no arguments; histogram buckets applied; `observable_gauge` reports the callback's value at collection, and a raising callback yields no observation and logs `metrics.gauge_query_failed` (R26, C18); unit `"1"` is refused and `circuit_breaker_state` has unit `{state}` (C63); a re-registered gauge uses the latest callback; an import-time counter reports per test without global resets, and histogram deltas add up (C61, C63); traceparent inject/extract round trip, `new_traceparent` format (unsampled flag), and invalid input → empty context |
+| `tests/unit/test_errors.py` | Each handler row of §3.4: status, code, body shape with `request_id`, no traceback or exception text in the body, 422 details without input values, `Retry-After` on 429 (PAY-602); a bare `OSError`/`TimeoutError` from a route is 500, while one raised inside the driver is 503 (C63); SQLSTATE 22021 is 422 `validation_error`, in the handler and in `map_db_errors` (C63) |
 | `tests/unit/test_jwt.py` | PAY-600: valid web and worker tokens pass; `name` round-trips to `Principal.name` and is `None` when absent (C10); 401 `invalid_token` for missing header, malformed, unknown kid, `alg` ≠ EdDSA (including `none` and HS256 with the public key as secret), tampered signature, expired, iat in the future, wrong aud, missing each required claim, lifetime > 60 s; **a token signed with the worker key but `iss=web` is rejected (`issuer_mismatch`)**; 5 s leeway accepted and 6 s rejected (`FakeClock`); the token never appears in captured logs; `Keyset.from_json` rejects bad JSON, unknown iss, non-Ed25519 PEM; `TokenSigner.mint` claims |
 | `tests/unit/test_auth_deps.py` | The C30 matrix: route issuer not allowed → 401 `invalid_token` (web token on an internal route; worker token on a user route; PAY-411); `service:web` on a user route → 403 `forbidden_role`; a user token on a `service:web`-only route → 403; the issuer check runs first, so a web user token on a worker-only route is 401, not 403; missing role → 403 `forbidden_role`; `any_role` vs all roles; logs carry no token, `name` or `sid`; `Principal.caller_key` (PAY-601, 411) |
 | `tests/unit/test_health.py` | `/livez` always 200; `/readyz` 200 / 503 with per-check status and no error text; a hanging check times out at 1 s; checks run concurrently; health routes have no auth |
 | `tests/unit/test_db.py` | `create_engine` arguments (statement timeout, search path, pool timeout, pre-ping); `map_db_errors` maps each driver error to `DbTimeout` / `DbUnavailable`; `advisory_lock_key` is stable and signed 64-bit; `new_id` is version 7 and time-ordered |
-| `tests/unit/test_streams_unit.py` | `Envelope.new` fields and `extra="forbid"`; `traceparent` is required (a missing or malformed one fails validation) and is filled from the active span or `new_traceparent()` (C22); `StreamProducer.publish` sends exactly `event_id`, `type`, `envelope` with `MAXLEN ~` (fake Redis port; R7); `RelayLoop` with a fake `OutboxRepository`: sent items marked sent, failed items marked failed with the class name, backoff doubles with jitter up to 5 s and resets after a clean batch, `wake()` skips the poll wait, a full batch loops at once |
+| `tests/unit/test_streams_unit.py` | `Envelope.new` fields and `extra="forbid"`; `traceparent` is required (a missing or malformed one fails validation) and is filled from the active span or `new_traceparent()` (C22); `StreamProducer.publish` sends exactly `event_id`, `type`, `envelope` with `MAXLEN ~` (fake Redis port; R7); `RelayLoop` with a fake `OutboxRepository`: sent items marked sent, failed items marked failed with the class name, backoff doubles with jitter up to 5 s and resets after a clean batch, `wake()` skips the poll wait, a full batch loops at once; `outbox.relay.published` {count, duration_ms} after a batch with sent items, and not after an empty one (C63) |
 | `tests/unit/test_http.py` | Every behaviour line of §3.10 with respx and `FakeClock`: per-attempt timeouts; total deadline across retries; retries only for idempotent methods or with an `Idempotency-Key` (same key on every attempt); 429/502/503/504 retried, other 4xx not; `Retry-After` honoured or abandoned when past the deadline; full-jitter bounds; `auth_headers` called per attempt; `request` mapping to each typed error; `request_raw` returns 4xx/5xx unmapped; metrics labels per outcome; no body or header in logs |
 | `tests/unit/test_breaker.py` | closed → open after 5 consecutive failures; 4xx/429 don't count; open fails fast without sending; half-open after 30 s allows exactly one trial; trial success closes, failure re-opens; `circuit_breaker_state` values and transition logs |
-| `tests/unit/test_ratelimit_unit.py` | Key layout and subject hashing (the `caller` key format of §3.11); window arithmetic and `retry_after_s`; worker vs user limit selection in `caller_rate_limit`; `service:web` is exempt by default and `exempt_subs` overrides it (C17) |
+| `tests/unit/test_ratelimit_unit.py` | Key layout and subject hashing (the `caller` key format of §3.11); window arithmetic and `retry_after_s`; worker vs user limit selection in `caller_rate_limit`; `service:web` is exempt by default and `exempt_subs` overrides it (C17); `record_denied` and `record_error` count on the shared series and log at most once per 10 s (C63) |
 | `tests/unit/test_startup_checks.py` | PAY-605: each check fails and passes on crafted settings; missing secret; each `DEV_DEFAULTS` value; `dev-`/`test-` kids in the keyset, `*_KID` fields and `PAYROLL_FIELD_KEYS`; debug and docs on; bank URL pointing at `bank-stub`, `localhost` or a placeholder in prod (accepted in uat); `check_claim_idle` boundary (35 s fails, 35.001 s passes); `check_republish_after` boundary (315 fails, 315.001 passes), with the R1 default 360 passing and the old 300 failing; `BANK_BASE_URL=https://bank-provider.invalid` refused in prod; uat/prod exit 2 with one `startup.check_failed` line per failure naming the setting and never the value (C29); dev logs warnings and continues |
 | `tests/unit/test_maintenance_unit.py` | Interval with jitter; first tick delay; a failing task doesn't stop the next; log names `maintenance.task.completed`, `maintenance.task.failed`, `maintenance.skipped` (C44) |
-| `tests/unit/test_app.py` | `create_app` assembly: docs off unless enabled; `app.openapi()` works with docs off; request id accepted / regenerated / echoed in `x-request-id`, `x-trace-id` set; body limit 413 by `Content-Length` and by streamed size; every router except health requires a JWT; `public_routers` don't; startup checks run before any connection (a failing check means no engine is created); background tasks start and stop within the timeout; a crashing background task is restarted with backoff |
+| `tests/unit/test_app.py` | `create_app` assembly: docs off unless enabled; `app.openapi()` works with docs off; request id accepted / regenerated / echoed in `x-request-id`, `x-trace-id` set; body limit 413 by `Content-Length` and by streamed size; every router except health requires a JWT; `public_routers` don't; startup checks run before any connection (a failing check means no engine is created); a missing JWT keyset exits 2 even in dev (C63); background tasks start and stop within the timeout; a crashing background task is restarted with backoff |
 | `tests/unit/test_serve.py` | `pycommon.serve` builds the uvicorn config from env (access log off, server header off) |
 | `tests/integration/test_db_pg.py` | Statement timeout → 503 `db_timeout` via a `pg_sleep(3)` route; pool exhaustion → `db_timeout` after 2 s; DB stopped → `db_unavailable` fast, and recovery without stuck connections once restarted; `migrations_check` detects a head mismatch; `run_alembic_env` puts the version table in the schema and revokes runtime writes on it |
 | `tests/integration/test_streams.py` | With real Redis and the ACL users: the `payroll` user publishes with `MAXLEN ~` and the entry has exactly the three fields; `XREADGROUP` as `payout-worker` reads the envelope back and `context_from_traceparent` continues the producer's trace (same trace id); a client from `create_redis(socket_timeout_ms=5500)` survives `BLOCK 5000` while the default client times out at 500 ms |
@@ -1473,9 +1558,9 @@ Unit tests run with `--disable-socket --allow-unix-socket`; integration tests us
 
 | Test file | Covers |
 |---|---|
-| `test_bootstrap_sql.py` | PAY-606: the init SQL runs in a fresh Postgres; each runtime role gets `permission denied` on every other schema and can't `CREATE` in its own; each migrator owns its schema; default privileges give the runtime role DML on a table the migrator creates; `public` has no rights; `postgres_exporter` has `pg_monitor` and can't read any table; a missing password env var fails with the variable's name; re-running all files succeeds and rotates a changed password; after identity's migrations and a full re-run, `identity_app` still gets `permission denied` for `UPDATE` and `DELETE` on `identity.audit_log` and can `INSERT` and `SELECT` (C50), and the files run cleanly when the table doesn't exist yet; `log_statement` is `none`. identity's own `services/identity/tests/integration/test_grants.py` also asserts that `audit_log` UPDATE is denied after a bootstrap re-run (C50) |
-| `test_redis_acl.py` | PAY-607: `entrypoint.sh` output loads; every user can `PING` (R12); `EVAL` and `FCALL` give `NOPERM` for every user but `default` (C3); web and identity get `NOPERM` on `XADD stream:payout.requested`; payroll can `XADD` the stream but not read sessions; the worker can XREADGROUP, XACK, XAUTOCLAIM, XPENDING, XINFO, `XGROUP CREATE … MKSTREAM` on an absent stream, and `XGROUP DELCONSUMER` (C27) on the stream, and only XADD and XINFO on the DLQ; the exporter can read stream info but can't write or read string keys (R12); `--print` masks the hashes; the file contains no plaintext password; a missing env var aborts |
-| `test_dev_env.py` | `dev-env.sh` in a temp dir: every §3.15 key present; `OTEL_TRACES_SAMPLER=parentbased_always_on` and no `OTEL_TRACES_SAMPLER_ARG` (C23); `COMPANY_ID` is the C28 value and equals `data.company_id` in every `contracts/events/examples` file; a second run changes no kept value; keysets parse with `Keyset.from_json` and their PEMs match the private keys; kids start with `dev-`; derived ports follow `APP_PORT_BASE` |
+| `test_bootstrap_sql.py` | PAY-606: the init SQL runs in a fresh Postgres; each runtime role gets `permission denied` on every other schema and can't `CREATE` in its own; each migrator owns its schema; default privileges give the runtime role DML on a table the migrator creates; `public` has no rights; `postgres_exporter` has `pg_monitor` and can't read any table; an unset or empty password env var fails with the variable's name and no value; re-running a file succeeds and rotates a changed password; a re-run leaves `<schema>.alembic_version` SELECT-only for the runtime role (C63); after identity's migrations and a full re-run, `identity_app` still gets `permission denied` for `UPDATE` and `DELETE` on `identity.audit_log` and can `INSERT` and `SELECT` (C50), and the files run cleanly when the table doesn't exist yet; `log_statement` is `none`. identity's own `services/identity/tests/integration/test_grants.py` also asserts that `audit_log` UPDATE is denied after a bootstrap re-run (C50) |
+| `test_redis_acl.py` | PAY-607: `entrypoint.sh` output loads; every user can `PING` (R12); `EVAL` and `FCALL` give `NOPERM` for every user but `default` (C3); web and identity get `NOPERM` on `XADD stream:payout.requested`; payroll can `XADD` the stream but not read sessions; the worker can XREADGROUP, XACK, XAUTOCLAIM, XPENDING, XINFO, `XGROUP CREATE … MKSTREAM` on an absent stream, and `XGROUP DELCONSUMER` (C27) on the stream, and only XADD and XINFO on the DLQ; the exporter can read stream info but can't write or read string keys (R12); `web`, `identity` and `payroll` get `NOPERM` for `SCAN`, `RANDOMKEY` and `KEYS` (C63); `--print` masks the hashes; the file contains no plaintext password; a missing env var aborts |
+| `test_dev_env.py` | `dev-env.sh` in a temp dir: every §3.15 key present, file mode 0600, hex infrastructure passwords; output names keys and never values; `OTEL_TRACES_SAMPLER=parentbased_always_on` and no `OTEL_TRACES_SAMPLER_ARG` (C23); `COMPANY_ID` is the C28 value and equals `data.company_id` in every `contracts/events/examples` file; a second run changes no kept value; keysets parse with `Keyset.from_json` and their PEMs match the private keys; kids start with `dev-`; derived ports follow `APP_PORT_BASE` with no duplicated lines; `--k8s-dev-file` writes unquoted values that parse (keyset JSON, PEM with literal `\n`), without the Compose ports and with `SMTP_PORT` |
 | `test_compose.py` | `docker compose config` for both files: every published port binds `127.0.0.1` and matches §7.1; every core service has a healthcheck; services depend on their migration with `service_completed_successfully` (PAY-NFR-13); **env contract (C1):** no service env has `DATABASE_URL`, `MIGRATOR_DATABASE_URL` or `REDIS_URL`, every Python service and migrate one-shot has `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_SCHEMA` with `DB_USER` matching C2, and every Redis client (web included) has `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`, `REDIS_PASSWORD`; `OTEL_TRACES_SAMPLER=parentbased_always_on` everywhere (C23); the web has `PORT=3000`, port `${WEB_PORT}:3000` and a healthcheck on `/api/readyz` (C4); `bootstrap-owner` runs with `--if-empty` (R16) |
 | `test_toxiproxy_config.py` | `toxiproxy.json` has exactly the four proxies and listen ports used by `compose.test.yaml` |
 | `test_alert_sink.py` | POST /page and /ticket store payloads; GET returns them; DELETE clears; bounded at 500 per route |
@@ -2431,7 +2516,7 @@ payrun namespaces has general internet egress.
 | Images | `payrun/<svc>:dev` (kind-loaded) | registry + `0.1.0` | registry + `0.1.0@sha256:…` (digest) |
 | `ENV` | dev | uat | prod |
 | `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | `parentbased_always_on` | `parentbased_always_on`; the Collector's `tail_sampling` (`collector.prod.yaml`) keeps errors, > 300 ms and 10% (R27, C23) |
-| `TRUSTED_PROXY_HOPS` | 0 | 1 | 1 |
+| `TRUSTED_PROXY_HOPS` (the web refuses < 1 in uat and prod: `config.invalid`, exit 2; C62) | 0 | 1 | 1 |
 | `BANK_BASE_URL` | `http://bank-stub:8000` | `http://bank-stub:8000` | provider placeholder `https://bank-provider.invalid`; the prod startup check refuses it until a real adapter exists (plan §13), and with 0 replicas the worker never starts, so it can't crash-loop (R14) |
 | `BANK_KEY_SAFE_WINDOW_S` | 86400 | 86400 | provider's key retention (placeholder) |
 | SMTP | in-cluster Mailpit | in-cluster Mailpit | provider, via ExternalSecret |
@@ -2693,8 +2778,8 @@ through the same scripts.
 | Python lint | `ruff check <paths>` | 0 errors | python |
 | Python format | `ruff format --check <paths>` | no diff | python |
 | Python types | `mypy --strict <src> <tests>` | 0 errors | python |
-| Service coverage | `pytest … --cov=<pkg> --cov-branch --cov-append --cov-fail-under=85` (unit + integration) | ≥ 85% lines, per service | python |
-| pycommon coverage | same, `--cov=pycommon --cov-fail-under=90` | ≥ 90% lines | python |
+| Service coverage | `pytest … --cov=<pkg> --cov-branch --cov-append --cov-fail-under=85` (unit + integration); the same threshold is `fail_under = 85` in each service's `pyproject.toml`, so a local run from the member directory enforces it too (C63) | ≥ 85% lines, per service | python |
+| pycommon coverage | same, `--cov=pycommon --cov-fail-under=90`; `fail_under = 90` in `libs/pycommon/pyproject.toml` (C63) | ≥ 90% lines | python |
 | Web lint / format / types | `pnpm --filter web lint`, `prettier --check .`, `pnpm --filter web typecheck` (`tsc --noEmit`) | 0 errors | web |
 | Web coverage | Vitest `coverage.thresholds.lines = 80` | ≥ 80% lines | web |
 | Web build | `pnpm --filter web build` | succeeds | web |
@@ -2764,6 +2849,6 @@ through the same scripts.
 ## Change log
 
 - 2026-11-10: incorporated README R-table and C-table decisions (R1, R2, R12, R14, R16, R22, R25, R26, R27, R28, R29, R30, R31, R32; C1, C2, C3, C4, C10, C12, C17, C18, C19, C20, C21, C22, C23, C24, C27, C28, C29, C30, C32, C33, C35, C36, C38, C44, and the later lead decisions C46, C47, C49, C50, C51 and the `not_deployable` startup-check reason).
+- 2026-11-10 (Step 5): folded in C53–C63. C53 settles the worker timing in the test stack: `compose.test.yaml` keeps the shared `x-payout-timing` values, and only in-process integration fixtures lower them. C58 (§1.2 tool settings, pytest-socket), C59 (`check_secrets`, `export_openapi.py`), C60 (`55P03`), C61 (SQLAlchemy `skip_dep_check`, UUIDv7 `jti`, OTel test isolation) and C63 (gauge units, DB-only error mapping and 22021, `fail_under` per member, `alembic_version` re-revoke, `-scan -randomkey`, fatal JWT keyset check, runtime test secrets, `outbox.relay.published`, `RateLimiter.record_denied` / `record_error`, `--k8s-dev-file`). §1.2 now matches the committed workspace files.
 
-Still open:
-- **Worker timing in the test stack:** payout-worker LLD §4 says `compose.test.yaml` lowers `PAYOUT_CLAIM_MIN_IDLE_MS`, `PAYOUT_CLAIM_INTERVAL_S` and the payroll/bank deadlines. This design's `compose.test.yaml` keeps the shared `x-payout-timing` values, because payroll's republish check reads the same keys and the e2e stack should run production timing. Integration fixtures may lower them; the lead to confirm whether the Compose test override should too.
+Nothing is open.

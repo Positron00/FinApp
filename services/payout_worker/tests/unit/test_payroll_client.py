@@ -3,6 +3,7 @@ C34)."""
 
 from __future__ import annotations
 
+import traceback
 from collections.abc import Callable
 from typing import Any
 from uuid import UUID
@@ -252,3 +253,30 @@ async def test_deadline_is_unavailable() -> None:
     with pytest.raises(PayrollUnavailable):
         await c.get_instruction(PAYOUT_ID, 1, COMPANY_ID)
     assert 1 <= len(seen) <= 4
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("routing", "12345678"), ("routing", "0210000219"), ("account", "123"), ("account", "12a456")],
+)
+async def test_instruction_bad_bank_details_never_leak(field: str, value: str) -> None:
+    """C63, PAY-NFR-07: bank details outside the bank's patterns → PayrollRejected
+    ("malformed_response") raised from None, so neither the message nor the traceback carries
+    the digits."""
+    body = {
+        "payout_id": str(PAYOUT_ID),
+        "attempt": 1,
+        "amount_cents": 100,
+        "currency": "USD",
+        "routing": "021000021",
+        "account": "000123456789",
+        "requested_at": "2026-11-10T14:03:07.123Z",
+        field: value,
+    }
+    c, _, _ = client(lambda r: httpx.Response(200, json=body), payout_payroll_max_retries=0)
+    with pytest.raises(PayrollRejected) as e:
+        await c.get_instruction(PAYOUT_ID, 1, COMPANY_ID)
+    assert e.value.code == "malformed_response"
+    assert e.value.__suppress_context__
+    text = "".join(traceback.format_exception(e.value))
+    assert value not in text

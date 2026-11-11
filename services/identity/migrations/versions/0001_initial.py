@@ -25,6 +25,8 @@ AUDIT_EVENTS_SQL = (
     "'user.roles_changed','user.deactivated'"
 )
 
+# The cutoff is clamped to at most now() - 400 days (C63), so the runtime role can't use the
+# function to delete recent entries.
 PURGE_AUDIT_FN = """
 CREATE FUNCTION identity.purge_audit_log(cutoff timestamptz) RETURNS integer
 LANGUAGE plpgsql
@@ -34,7 +36,7 @@ AS $$
 DECLARE
   n integer;
 BEGIN
-  DELETE FROM identity.audit_log WHERE at < cutoff;
+  DELETE FROM identity.audit_log WHERE at < LEAST(cutoff, now() - interval '400 days');
   GET DIAGNOSTICS n = ROW_COUNT;
   RETURN n;
 END

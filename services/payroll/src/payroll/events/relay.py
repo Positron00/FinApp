@@ -3,27 +3,35 @@
 Each claimed row gets a PRODUCER span ``payroll.outbox.publish`` whose parent is the traceparent
 stored at write time; the published envelope carries the publish span's own traceparent, so the
 worker becomes its child (PAY-NFR-09). ``mark_sent``/``mark_failed`` end the spans.
+
+With ``validate`` on (``PAYROLL_VALIDATE_EVENTS``), the envelope is re-validated against the JSON
+Schema after the traceparent rewrite (C60, C63). An invalid row is never published: it is marked
+failed (``relay_attempts``, ``last_error``), logged as ``outbox.relay.error`` and left unsent, so
+``OutboxStuck`` fires, while the rest of the batch still goes out.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Final
 
 from opentelemetry import trace
 from opentelemetry.trace import Span, SpanKind, Status, StatusCode
+from pycommon.logging import get_logger, log_event
 from pycommon.otel import context_from_traceparent, inject_traceparent, tracer
 from pycommon.streams import RelayLoop, StreamItem, StreamProducer
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from payroll.events.envelope import EVENT_TYPE, STREAM
+from payroll.events.envelope import EVENT_TYPE, STREAM, EnvelopeInvalidError, validate_envelope
 
 __all__ = ["PayrollOutboxSource", "RelayRef", "build_relay"]
 
 SPAN_NAME: Final = "payroll.outbox.publish"
+_log: Final = get_logger("payroll.outbox")
 
 _CLAIM: Final = text(
     "SELECT id, payload, payout_id, attempt FROM payroll.outbox "
@@ -52,6 +60,9 @@ class RelayRef:
 class PayrollOutboxSource:
     """``claim_unsent`` / ``mark_sent`` / ``mark_failed`` over ``payroll.outbox`` (C22)."""
 
+    def __init__(self, *, validate: bool = True) -> None:
+        self._validate = validate
+
     async def claim_unsent(self, session: AsyncSession, *, limit: int) -> Sequence[StreamItem]:
         rows = (await session.execute(_CLAIM, {"limit": limit})).all()
         items: list[StreamItem] = []
@@ -73,15 +84,28 @@ class PayrollOutboxSource:
                 publish_tp = inject_traceparent()
             if publish_tp is not None:
                 payload["traceparent"] = publish_tp
-            items.append(
-                StreamItem(
-                    event_id=row.id,
-                    type=EVENT_TYPE,
-                    envelope_json=json.dumps(payload, separators=(",", ":")),
-                    ref=RelayRef(row.payout_id, row.attempt, span),
-                )
+            item = StreamItem(
+                event_id=row.id,
+                type=EVENT_TYPE,
+                envelope_json=json.dumps(payload, separators=(",", ":")),
+                ref=RelayRef(row.payout_id, row.attempt, span),
             )
+            if self._validate:
+                try:
+                    validate_envelope(payload)
+                except EnvelopeInvalidError:
+                    await self._reject(session, item)
+                    continue
+            items.append(item)
         return items
+
+    async def _reject(self, session: AsyncSession, item: StreamItem) -> None:
+        error_type = EnvelopeInvalidError.__name__
+        await self.mark_failed(session, [item], error_type=error_type)
+        log_event(
+            _log, logging.ERROR, "outbox.relay.error", error_type=error_type, batch_size=1,
+            failed=1, backoff_ms=0,
+        )  # fmt: skip
 
     async def mark_sent(self, session: AsyncSession, items: Sequence[StreamItem]) -> None:
         await session.execute(_MARK_SENT, {"ids": [i.event_id for i in items]})
@@ -118,11 +142,12 @@ def build_relay(
     maxlen: int,
     batch_size: int,
     poll_ms: int,
+    validate: bool = True,
 ) -> RelayLoop:
     return RelayLoop(
         sessions,
         producer,
-        PayrollOutboxSource(),
+        PayrollOutboxSource(validate=validate),
         stream=STREAM,
         maxlen=maxlen,
         batch_size=batch_size,

@@ -6,7 +6,9 @@ else that isn't a settled 2xx is "no answer". Nothing here can return ``Rejected
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from typing import Final
 
 import httpx
 from pycommon.http import ProviderError, ProviderTimeout, ProviderUnavailable
@@ -22,6 +24,8 @@ from payout_worker.models import (
 )
 
 __all__ = ["BankCallResult", "classify_lookup_response", "classify_transfer_response"]
+
+NOT_FOUND_CODE: Final = "transfer_not_found"
 
 
 @dataclass(frozen=True)
@@ -78,7 +82,24 @@ def classify_transfer_response(r: BankCallResult) -> Settled | Rejected | NoAnsw
     return NoAnswer(_status_reason(status), status)
 
 
+def _is_transfer_not_found(resp: httpx.Response) -> bool:
+    try:
+        body = json.loads(resp.content)
+    except ValueError:
+        return False
+    err = body.get("error") if isinstance(body, dict) else None
+    return isinstance(err, dict) and err.get("code") == NOT_FOUND_CODE
+
+
 def classify_lookup_response(r: BankCallResult) -> Settled | Rejected | NotFound | NoAnswer:
-    if r.response is not None and r.error is None and r.response.status_code == 404:
+    """As ``classify_transfer_response``, plus: a 404 whose body has the bank's
+    ``transfer_not_found`` code is ``NotFound``. Any other 404 (a wrong base URL, a proxy page)
+    is ``NoAnswer("http_404")``, never "no transfer" (C63)."""
+    if (
+        r.response is not None
+        and r.error is None
+        and r.response.status_code == 404
+        and _is_transfer_not_found(r.response)
+    ):
         return NotFound()
     return classify_transfer_response(r)

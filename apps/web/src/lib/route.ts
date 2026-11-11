@@ -218,8 +218,9 @@ async function pipeline<B, Q, P>(
   }
   if (session) setSession(session);
 
-  // 5. Session rate limit
-  if (session) {
+  // 5. Session rate limit. Telemetry has its own per-IP budget and never spends the session's,
+  // so beacons can't push the run page's polling into 429s (C63).
+  if (session && ipLimit !== "telemetry") {
     await applyLimit("session", session.key, c.BFF_RATE_LIMIT_SESSION, "fail_open", def.name);
   }
 

@@ -82,5 +82,6 @@ exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "@overload"]
 [tool.pytest.ini_options]
 # Used by suites without their own config (tests/platform, tests/resilience).
 addopts = "--strict-markers"
+asyncio_default_fixture_loop_scope = "function"
 markers = ["integration: needs Docker (Testcontainers)", "smoke: PR fault smoke tests"]
 timeout = 180

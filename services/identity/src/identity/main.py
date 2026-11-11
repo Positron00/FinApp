@@ -20,7 +20,7 @@ from identity.domain.passwords import PasswordHasher
 from identity.email.relay import EmailRelay
 from identity.email.smtp import EmailSender, SmtpSender
 from identity.limits import AuthLimits
-from identity.metrics import create_metrics
+from identity.metrics import EmailGaugeSource, create_metrics, register_email_gauges
 from identity.paths import MIGRATIONS_DIR
 from identity.runtime import IdentityRuntime
 from identity.settings import IdentitySettings, Settings
@@ -65,6 +65,7 @@ def build_app(
         raise TypeError("build_app needs IdentitySettings")
     s = settings
     clk = clock or SystemClock()
+    gauges = EmailGaugeSource(s)
 
     async def on_startup(ctx: AppContext) -> None:
         if ctx.sessions is None or ctx.redis is None:  # pragma: no cover  (use_db/use_redis on)
@@ -78,13 +79,14 @@ def build_app(
             metrics=metrics,
         )
         await hasher.start()
+        register_email_gauges(gauges)
         relay = EmailRelay(ctx.sessions, s, sender or SmtpSender(s, clock=clk), metrics)
         app.state.identity = IdentityRuntime(
             settings=s,
             sessions=ctx.sessions,
             redis=ctx.redis,
             hasher=hasher,
-            limits=AuthLimits(ctx.redis, s, metrics, clock=clk),
+            limits=AuthLimits(ctx.redis, s, clock=clk),
             metrics=metrics,
             relay=relay,
             clock=clk,
@@ -94,12 +96,17 @@ def build_app(
         rt: IdentityRuntime = app.state.identity
         await rt.relay.run(stop)
 
+    async def close_gauges(_ctx: AppContext, stop: asyncio.Event) -> None:
+        """Dispose the gauge source's engine and thread on shutdown."""
+        await stop.wait()
+        await asyncio.to_thread(gauges.close)
+
     app = create_app(
         s,
         routers=[auth.router, invites.router, users.router],
         migrations_script_location=str(MIGRATIONS_DIR),
         startup_checks=IDENTITY_CHECKS,
-        background=[email_relay] if run_relay else [],
+        background=[*([email_relay] if run_relay else []), close_gauges],
         on_startup=on_startup,
         instrument=instrument,
     )

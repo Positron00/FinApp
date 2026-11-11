@@ -151,7 +151,7 @@ async def create_transfer(
 ) -> JSONResponse:
     if idempotency_key is None:
         raise IdempotencyKeyRequired()
-    if not IDEMPOTENCY_KEY_RE.match(idempotency_key):
+    if not IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key):
         raise _key_error("header.Idempotency-Key")
     key = idempotency_key
     await rt.sleep(rt.settings.bank_stub_latency_ms / 1000)
@@ -207,7 +207,7 @@ async def create_transfer(
     responses=_errors(404),
 )
 async def get_transfer(key: str, rt: RT) -> JSONResponse:
-    if not IDEMPOTENCY_KEY_RE.match(key):
+    if not IDEMPOTENCY_KEY_RE.fullmatch(key):
         raise _key_error("path.key")
     await rt.sleep(rt.settings.bank_stub_latency_ms / 1000)
     with _transfer_span("get", key) as span:

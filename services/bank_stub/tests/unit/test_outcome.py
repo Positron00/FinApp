@@ -46,6 +46,16 @@ def test_threshold_boundary() -> None:
     assert decide_outcome(_key_with_bucket(500), "12345678", 0.05) == ("settled", None)
 
 
+def test_threshold_is_exact_not_rounded() -> None:
+    """C63, PAY-412: the comparison is bucket < rate * 10000 with no rounding: at 0.00025 the
+    threshold is 2.5, so bucket 2 is rejected (round() would give 2 and settle it) and bucket 3
+    isn't; at 0.00015 (1.5) bucket 1 is rejected and bucket 2 isn't."""
+    assert decide_outcome(_key_with_bucket(2), "12345678", 0.00025)[0] == "rejected"
+    assert decide_outcome(_key_with_bucket(3), "12345678", 0.00025) == ("settled", None)
+    assert decide_outcome(_key_with_bucket(1), "12345678", 0.00015)[0] == "rejected"
+    assert decide_outcome(_key_with_bucket(2), "12345678", 0.00015) == ("settled", None)
+
+
 def test_rejected_share_is_about_five_percent() -> None:
     """PAY-412: over 10 000 random keys at 0.05 the rejected share is 5% ± 1%."""
     rejected = sum(

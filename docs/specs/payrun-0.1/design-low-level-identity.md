@@ -19,12 +19,16 @@ All paths are under `services/identity/` unless absolute.
 | Image | — | No service Dockerfile: built from the shared `deploy/docker/python-service.Dockerfile` with `PACKAGE=identity`, `SERVICE_DIR=identity`, served by `python -m pycommon.serve` with `PYCOMMON_APP=identity.main:app` on port 8000 (platform LLD §10.1). |
 | `alembic.ini`, `migrations/env.py`, `migrations/versions/0001_initial.py` | new | Alembic setup and the initial schema (§2.9). |
 | `openapi.json` | new (generated) | Committed contract, written by `scripts/export_openapi.py identity`. |
-| `src/identity/main.py` | new | `app = pycommon.create_app(settings, routers=[...], migrations_script_location=..., startup_checks=IDENTITY_CHECKS, background=[email_relay, maintenance], on_startup=...)`. `on_startup` creates the `PasswordHasher` (computes the dummy hash) and the identity limiters (§6.4). Background tasks: the email relay (§6.9), the gauge refresher (§5.2) and the maintenance runner (§6.10); on shutdown pycommon sets `stop` and waits, so the relay finishes its in-flight send (≤ `IDENTITY_SMTP_TIMEOUT_S`). |
-| `src/identity/settings.py` | new | `IdentitySettings(pycommon.BaseServiceSettings)` with `service_name = "identity"` and `db_schema = "identity"`. The pycommon keys (`DB_*`, `REDIS_*`, `LOG_LEVEL`, `DOCS_ENABLED`, `SERVICE_RATE_LIMIT_USER`, `BREAKER_*`, `MAINTENANCE_INTERVAL_S`, `RETENTION_*`, …) are inherited unchanged (C1); identity adds the keys in §4.2, each field named exactly as its env var. |
+| `src/identity/main.py` | new | `build_app(settings, *, instrument, clock, sender, run_relay)` calls `pycommon.create_app(settings, routers=[...], migrations_script_location=..., startup_checks=IDENTITY_CHECKS, background=[email_relay, close_gauges, maintenance], on_startup=...)` and adds a `Cache-Control: no-store` middleware; `identity.main:app` is built from the environment on first access (`scripts/export_openapi.py` calls `build_app` with placeholder settings). `on_startup` creates the `PasswordHasher` (computes the dummy hash), the identity limiters (§6.4) and the relay, and points the email gauges at this app's `EmailGaugeSource` (§5.2). Background tasks: the email relay (§6.9), `close_gauges` (disposes the gauge source on stop) and, from F1, the maintenance runner (§6.10); on shutdown pycommon sets `stop` and waits, so the relay finishes its in-flight send (≤ `IDENTITY_SMTP_TIMEOUT_S`). |
+| `src/identity/settings.py` | new | `CoreSettings(pycommon.BaseServiceSettings)` holds the pycommon keys plus the `IDENTITY_ARGON2_*` keys, which is all the `bootstrap_owner` CLI needs (its container has the migrator's `DB_*` keys but not the service secrets). `IdentitySettings(CoreSettings)` is the service's settings, with `service_name = "identity"` and `db_schema = "identity"`. The pycommon keys (`DB_*`, `REDIS_*`, `LOG_LEVEL`, `DOCS_ENABLED`, `SERVICE_RATE_LIMIT_USER`, `BREAKER_*`, `MAINTENANCE_INTERVAL_S`, `RETENTION_*`, …) are inherited unchanged (C1); identity adds the keys in §4.2, each field named exactly as its env var. |
 | `src/identity/startup_checks.py` | new | `IDENTITY_CHECKS: list[pycommon.StartupCheck]`, the identity-specific checks passed to `create_app` (§4.3). |
 | `src/identity/api/deps.py` | new | FastAPI dependencies: `public_caller` (requires `sub == "service:web"`), `user_caller` (requires a UUID `sub`), `admin_actor` (loads the actor row from the DB, requires `status = active` and `admin` in its DB roles), `client_ip` (parses `X-Client-IP`; `None` when absent). The per-caller limit is pycommon's `caller_rate_limit(exempt_subs=("service:web",))` (C17), attached to every `/v1` router. |
 | `src/identity/api/schemas.py` | new | All Pydantic request and response models (§3.3). |
-| `src/identity/api/errors.py` | new | `IdentityError(code, status, message)` subclasses for every code in §3.5, raised by use cases and rendered by pycommon's handler. |
+| `src/identity/api/errors.py` | new | One class per identity code in §3.5, each subclassing the pycommon `AppError` type with the right status (`Unauthorized`, `BadRequest`, `ValidationFailed`, `Conflict`, `NotFound`) and setting `code` and `default_message`; raised by use cases and rendered by pycommon's handler. |
+| `src/identity/api/responses.py` | new | `errors(*statuses)`: the documented `ErrorBody` responses for a route's `responses=` (the common errors plus its own). |
+| `src/identity/runtime.py` | new | `IdentityRuntime` (settings, sessions, Redis, hasher, limits, metrics, relay, clock), built in `on_startup` and stored on `app.state`; `ip_hash()` / `email_key()` with `AUDIT_IP_HASH_KEY`; the `get_runtime` dependency. |
+| `src/identity/paths.py` | new | `MIGRATIONS_DIR`, shared by the app (readiness) and the CLI (migrations-at-head check). |
+| `src/identity/usecases/common.py` | new | Mapping helpers `session_user`, `user_out`, `me_out`. |
 | `src/identity/api/auth.py` | new | Router: `POST /v1/auth/login`, `POST /v1/auth/password-reset/request`, `POST /v1/auth/password-reset/confirm`. HTTP mapping only. |
 | `src/identity/api/invites.py` | new | Router: `POST /v1/invites/accept`, `POST /v1/invites/{id}/resend`. |
 | `src/identity/api/users.py` | new | Router: `GET /v1/users/me`, `GET /v1/users`, `POST /v1/users/invite`, `PATCH /v1/users/{id}`. |
@@ -43,14 +47,13 @@ All paths are under `services/identity/` unless absolute.
 | `src/identity/domain/ip.py` | new | `normalise_ip(raw: str) -> str` (via `ipaddress`; raises `ValueError`); `ip_hash(ip: str, key: bytes) -> str` (HMAC-SHA256 hex, 64 chars); `email_key(email: str, key: bytes) -> str` (HMAC-SHA256 hex of the lower-cased email, for Redis keys). |
 | `src/identity/domain/audit_events.py` | new | Constants for every audit event name (§2.6). |
 | `src/identity/db/models.py` | new | SQLAlchemy 2.0 declarative models, `MetaData(schema="identity")` (§2). |
-| `src/identity/db/repositories.py` | new | `UserRepo`, `CredentialRepo`, `InviteRepo`, `ResetRepo`, `AuditRepo`, `OutboxRepo`. Every query takes `company_id` (from the token's `cid`) as a required argument. |
-| `src/identity/db/session.py` | new | Engine and `async_sessionmaker` from pycommon `db.create_engine(settings)` / `session_factory` (`statement_timeout` = `DB_STATEMENT_TIMEOUT_MS`). |
-| `src/identity/limits.py` | new | Login, reset and accept limits and the account lockout (§6.4), built on pycommon `RateLimiter` (`MULTI` with `INCR` and `EXPIRE … NX`) plus `SET … NX EX` (the lock), `SET … EX` (its level), `PTTL`, `GET` and `DEL`. **No Lua** (C3). Fails **closed**: any Redis error raises `ServiceUnavailable` (503) and logs `ratelimit.backend_error`. |
+| `src/identity/db/repositories.py` | new | `UserRepo`, `CredentialRepo`, `InviteRepo`, `ResetRepo` (F1; S4 has `ResetTokenRepo`, the relay's token-issuing half), `AuditRepo`, `OutboxRepo`. Every request-path query and write takes `company_id` (from the token's `cid`) as a required argument; only the relay's outbox claim and token issue, which act on rows by primary key, don't. |
+| `src/identity/limits.py` | new | Login, reset and accept limits and the account lockout (§6.4), built on pycommon `RateLimiter` (`MULTI` with `INCR` and `EXPIRE … NX`) plus `SET … NX EX` (the lock), `SET … EX` (its level), `PTTL`, `GET` and `DEL`. `check_login` gates on the current failure count; `record_failure` counts a failed verify (C63). **No Lua** (C3). Fails **closed**: any Redis error raises `ServiceUnavailable` (503) and logs `ratelimit.backend_error`. |
 | `src/identity/email/templates.py` | new | `render(template, *, name, link, expires_at) -> RenderedEmail(subject, text, html)`; `link_for(template, raw_token, base_url) -> str` (§3.9). |
 | `src/identity/email/templates/{invite,password_reset}.{txt,html}.j2` | new | Jinja2 templates; HTML with autoescape. |
-| `src/identity/email/smtp.py` | new | `SmtpSender.send(msg: EmailMessage) -> None` over `aiosmtplib`, run through pycommon `Guard(ProviderPolicy(name="smtp", max_retries=0, total_deadline=IDENTITY_SMTP_TIMEOUT_S, breaker_failures=BREAKER_FAILURES, breaker_reset_s=BREAKER_RESET_S))` with `operation="send"`, so it gets the breaker (`circuit_breaker_state{target="smtp"}`) and `external_requests_total` / `external_request_duration_seconds` with `provider="smtp"`. No retries inside the call: the relay owns the backoff (§6.9). |
+| `src/identity/email/smtp.py` | new | `EmailSender` protocol: `available() -> bool` (false while the breaker is open; reads the state without taking the half-open trial) and `send(msg)`. `SmtpSender.send(msg: EmailMessage) -> None` over `aiosmtplib`, run through pycommon `Guard(ProviderPolicy(name="smtp", max_retries=0, total_deadline=IDENTITY_SMTP_TIMEOUT_S, breaker_failures=BREAKER_FAILURES, breaker_reset_s=BREAKER_RESET_S))` with `operation="send"`, so it gets the breaker (`circuit_breaker_state{target="smtp"}`) and `external_requests_total` / `external_request_duration_seconds` with `provider="smtp"`. No retries inside the call: the relay owns the backoff (§6.9). |
 | `src/identity/email/relay.py` | new | `EmailRelay.run(stop: asyncio.Event)`: claim with `SKIP LOCKED`, issue the token, render, send, mark (§6.9). One instance per replica. |
-| `src/identity/metrics.py` | new | Instruments (§5.2) and the `GaugeRefresher` task. |
+| `src/identity/metrics.py` | new | identity's own instruments (§5.2: `auth_signins`, `identity_emails_failed`, `identity_password_hash_seconds`; the limiter counters are pycommon's), `EmailGaugeSource` (the collection-time query for the two email gauges, on a private event-loop thread with a one-connection engine) and `register_email_gauges`. |
 | `src/identity/maintenance.py` | new | `IDENTITY_MAINTENANCE_TASKS: list[pycommon.MaintenanceTask]`, run by pycommon's `MaintenanceRunner(lock_name="identity:maintenance", interval_s=MAINTENANCE_INTERVAL_S)` (§6.10). |
 | `src/identity/bootstrap_owner.py` | new | The CLI `python -m identity.bootstrap_owner` (§3.8). `main(argv) -> int`; `if __name__ == "__main__": sys.exit(main(sys.argv[1:]))`. |
 | `tests/{unit,integration,contract}/` | new | §7. |
@@ -147,7 +150,7 @@ Indexes: `uq_password_resets_token_hash` UNIQUE on `(token_hash)` `WHERE token_h
 
 Indexes: `ix_audit_log_company_id_id` on `(company_id, id DESC)` (listing); `ix_audit_log_at` on `(at)` (purge).
 
-The migration runs `REVOKE UPDATE, DELETE ON identity.audit_log FROM identity_app` (C2, C50), so the runtime role can append but never rewrite or delete entries. Retention purging goes through `identity.purge_audit_log(cutoff timestamptz) RETURNS integer`, a `SECURITY DEFINER` function owned by `identity_migrator` (with `SET search_path = identity, pg_temp`) that deletes only rows with `at < cutoff`. EXECUTE on it is granted to `identity_app` (bootstrap default privileges cover functions).
+The migration runs `REVOKE UPDATE, DELETE ON identity.audit_log FROM identity_app` (C2, C50), so the runtime role can append but never rewrite or delete entries. Retention purging goes through `identity.purge_audit_log(cutoff timestamptz) RETURNS integer`, a `SECURITY DEFINER` function owned by `identity_migrator` (with `SET search_path = identity, pg_temp`) that deletes only rows with `at < LEAST(cutoff, now() − interval '400 days')`: the cutoff is clamped (C63), so a caller holding `identity_app` can't use it to delete entries younger than 400 days. EXECUTE on it is granted to `identity_app` (bootstrap default privileges cover functions).
 
 **Audit events** (`domain/audit_events.py`):
 
@@ -233,7 +236,7 @@ Claims expected (verified by pycommon; EdDSA; leeway 5 s):
 **Headers:**
 - `Authorization: Bearer <jwt>`: all `/v1` routes.
 - `X-Request-ID`: optional; echoed (pycommon).
-- `X-Client-IP`: the browser's IP as the BFF derived it (`TRUSTED_PROXY_HOPS`; R18). Optional everywhere: the BFF omits it when it doesn't know the IP (C16). On the four public endpoints a request without it is limited in one shared per-IP bucket, subject `unknown` (§6.4), and audited with `ip_hash = NULL`. A value that isn't a valid IPv4/IPv6 address → 422 `validation_error`. When present it's hashed into `audit_log.ip_hash`. It's trusted only because the request carries a valid `iss=web` token. Never logged raw.
+- `X-Client-IP`: the browser's IP as the BFF derived it (`TRUSTED_PROXY_HOPS`; R18). Optional everywhere: the BFF omits it when it doesn't know the IP (C16). On the four public endpoints a request without it is limited in one shared per-IP bucket, subject `unknown` (§6.4), and audited with `ip_hash = NULL`. A value that isn't a valid IPv4/IPv6 address → 422 `validation_error`. When present it's hashed into `audit_log.ip_hash`: on the four public endpoints and on `POST /v1/users/invite` (the `user.invited` row), the routes that write audit rows in S4. It's trusted only because the request carries a valid `iss=web` token. Never logged raw.
 
 ### 3.2 Authorization
 
@@ -246,13 +249,13 @@ Claims expected (verified by pycommon; EdDSA; leeway 5 s):
 
 ### 3.3 Pydantic models (`api/schemas.py`)
 
-All models use `model_config = ConfigDict(extra="forbid", str_strip_whitespace=False)`; trimming is explicit where stated. `Email = Annotated[EmailStr, StringConstraints(max_length=254)]`.
+All models use `model_config = ConfigDict(extra="forbid", str_strip_whitespace=False)`; trimming is explicit where stated. `Email = Annotated[EmailStr, StringConstraints(max_length=254), NoNul]`. Free-text fields (`Email`, `Name`) reject NUL characters before any other check (`NoNul`, a `BeforeValidator`): 422 `validation_error` with issue `invalid_character` (C63). The `bootstrap_owner` CLI applies the same rule to `--email` and `--name` (exit 2).
 
 ```python
 class Role(StrEnum): admin = "admin"; payroll_admin = "payroll_admin"; approver = "approver"
 Password = Annotated[str, StringConstraints(min_length=1, max_length=256)]   # policy (≥ 12) is checked in domain → 422 password_too_weak
 Token    = Annotated[str, StringConstraints(min_length=1, max_length=128)]   # format is checked in domain → 400 invite_invalid / reset_invalid
-Name     = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+Name     = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200), NoNul]
 RoleList = Annotated[list[Role], Field(min_length=1, max_length=3)]          # duplicates → 422 (validator)
 
 class LoginIn(BaseModel):          email: Email; password: Password
@@ -327,7 +330,7 @@ Every endpoint can also return the **common errors**: 401 `invalid_token`; 413 `
 - Errors: 403 `forbidden_role`; 429 `rate_limited`.
 
 **POST /v1/users/invite** — `users_invite` — admin — PAY-101
-- Request `InviteUserIn`.
+- Request `InviteUserIn`; header `X-Client-IP` (optional; hashed into the `user.invited` audit row).
 - 201 `UserOut` with `status = "pending"` and `pending_invite_id` set (its outbox row is `pending`).
 - Errors: 409 `user_email_taken` (any existing user with that email in the company, any status, case-insensitive); 422 `validation_error` (empty or unknown role, duplicate roles, bad email or name); 403 `forbidden_role`; 429 `rate_limited`.
 
@@ -456,7 +459,7 @@ The `.html.j2` versions carry the same text, with the link as an `<a href>` and 
 ### 4.1 Naming
 
 - **pycommon keys** (C1): `IdentitySettings` inherits `BaseServiceSettings`, whose names are the contract for every Python service: `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_SCHEMA`, `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`, `REDIS_PASSWORD`, plus `ENV`, `COMPANY_ID`, `LOG_LEVEL`, `DOCS_ENABLED`, `DB_POOL_SIZE`, `SERVICE_RATE_LIMIT_USER`, `BREAKER_*`, `MAINTENANCE_INTERVAL_S` and `RETENTION_*`. There is no `DATABASE_URL` or `REDIS_URL`. The migrate and bootstrap-owner containers set the same `DB_*` keys with the migrator's credentials.
-- Identity keys the plan or requirements already name keep their exact names, without a prefix (`INVITE_TTL_H`, `RESET_TTL_H`, `AUTH_LOGIN_LIMIT_ACCOUNT`, `AUTH_LOGIN_LIMIT_IP`, `EMAIL_MAX_ATTEMPTS`, `AUDIT_IP_HASH_KEY`, and the unprefixed SMTP keys `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD` per C49).
+- Identity keys the plan or requirements already name keep their exact names, without a prefix (`INVITE_TTL_H`, `RESET_TTL_H`, `AUTH_LOGIN_LIMIT_ACCOUNT`, `AUTH_LOGIN_LIMIT_IP`, `EMAIL_MAX_ATTEMPTS`, `AUDIT_IP_HASH_KEY`, and the unprefixed SMTP keys `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD` per C49). `SMTP_STARTTLS` is the same kind of unprefixed infrastructure key, like C49's four.
 - Identity-only keys this design introduces use the `IDENTITY_` prefix (C1).
 - Each settings field is named exactly as its env var (pycommon settings are case-insensitive), so no aliases are needed.
 - "gen" means generated by `scripts/dev-env.sh` into `.env`; "ES" means External Secrets (ADR 0008).
@@ -501,11 +504,12 @@ The `.html.j2` versions carry the same text, with the link as an `<a href>` and 
 | `IDENTITY_EMAIL_POLL_INTERVAL_S` | float | 2 | 2 | 2 | PAY-110 |
 | `IDENTITY_EMAIL_BATCH` | int | 10 | 10 | 10 | PAY-110 |
 | `IDENTITY_EMAIL_LEASE_S` | int | 60 | 60 | 60 | PAY-110 |
+| `IDENTITY_GAUGE_QUERY_TIMEOUT_MS` | int | 1000 | 1000 | 1000 | PAY-110, R26 (connect and statement timeout of the email-gauge query) |
 | `BREAKER_FAILURES` / `BREAKER_RESET_S` | int / float | 5 / 30 | same | same | PAY-110 |
 | `MAINTENANCE_INTERVAL_S` | int | 60 | 60 | 60 | PAY-608 |
 | `RETENTION_TOKENS_DAYS` | int | 7 | 7 | 7 | PAY-608 |
 | `RETENTION_OUTBOX_DAYS` | int (used for sent/failed/cancelled emails) | 7 | 7 | 7 | PAY-608 |
-| `IDENTITY_RETENTION_AUDIT_DAYS` | int | 400 | 400 | 400 | PAY-NFR-08 |
+| `IDENTITY_RETENTION_AUDIT_DAYS` | int | 400 | 400 | 400 | PAY-NFR-08 (read by the F1 `purge_audit` task; `purge_audit_log` also clamps any cutoff to ≥ 400 days old, §2.6) |
 | `DOCS_ENABLED` | bool (pycommon) | true | false | false | PAY-605 |
 | `LOG_LEVEL` | str (case-insensitive, upper-cased by pycommon; C24) | `INFO` | `INFO` | `INFO` | PAY-NFR-07 |
 | `OTEL_SERVICE_NAME` | str | `identity` | same | same | PAY-NFR-09 |
@@ -532,14 +536,14 @@ As for every service (C29), pycommon logs `startup.check_failed` {setting, reaso
 
 ### 5.1 Log events
 
-Every line has pycommon's base fields (`ts`, `level`, `service`, `env`, `version`, `logger`, `event`, `msg`, `trace_id`, `span_id`, `request_id`). Identity never logs emails, names, passwords, tokens, token hashes, raw IPs, `sid` or JWTs; it logs IDs, `ip_hash` and counts.
+Every line has pycommon's base fields (`ts`, `level`, `service`, `env`, `version`, `logger`, `event`, `msg`, `trace_id`, `span_id`, `request_id`). The table is an allow-list: `integration/test_telemetry_redaction.py` fails when an identity event carries a field it doesn't list. Identity never logs emails, names, passwords, tokens, token hashes, raw IPs, `sid` or JWTs; it logs IDs, `ip_hash` and counts.
 
 | Event | Level | Fields | When | Requirement |
 |---|---|---|---|---|
 | `identity.bootstrap.completed` | info | `user_id`, `company_id`, `mode` | CLI created the owner | PAY-100 |
 | `identity.bootstrap.refused` | warning | `company_id` | `users` not empty, no `--if-empty` (exit 3) | PAY-100 |
 | `identity.bootstrap.skipped` | info | `company_id` | `users` not empty with `--if-empty` (exit 0; R16) | PAY-100, PAY-609 |
-| `identity.bootstrap.failed` | error | `reason` (`invalid_args`, `db_unavailable`, `unexpected`) | Exit 1, 2 or 4 | PAY-100 |
+| `identity.bootstrap.failed` | error | `reason` (`invalid_args`, `db_unavailable`, `unexpected`); `detail` (a fixed text naming the bad argument, never a value) for `invalid_args`; `error_type` and the traceback for `unexpected` | Exit 1, 2 (bad arguments) or 4. Invalid settings exit 2 with pycommon's `settings.invalid` (field names only) instead | PAY-100 |
 | `user.invited` | info | `user_id`, `invite_id`, `actor_user_id`, `roles` | Invite created | PAY-101 |
 | `user.invite_resent` | info | `user_id`, `invite_id`, `revoked_invite_id`, `actor_user_id` | Resend | PAY-102 |
 | `user.invite_accepted` | info | `user_id`, `invite_id` | Accept succeeded | PAY-103 |
@@ -554,15 +558,17 @@ Every line has pycommon's base fields (`ts`, `level`, `service`, `env`, `version
 | `user.roles_changed` | info | `user_id`, `actor_user_id`, `old_roles`, `new_roles`, `roles_version` | PATCH roles | PAY-108 |
 | `user.deactivated` | info | `user_id`, `actor_user_id`, `roles_version`, `revoked_invite_id` (if any) | PATCH status | PAY-108 |
 | `user.update_refused` | info | `user_id`, `actor_user_id`, `code` (`cannot_modify_self`, `last_admin`) | PATCH 409 | PAY-108 |
-| `email.queued` | info | `email_id`, `template`, `user_id` | Outbox row inserted | PAY-110 |
+| `email.queued` | info | `email_id`, `template`, `user_id` | Outbox row inserted (invite, and the bootstrap owner's invite) | PAY-110 |
 | `email.sent` | info | `email_id`, `template`, `attempts`, `duration_ms` | SMTP accepted | PAY-110 |
 | `email.send_failed` | warning | `email_id`, `template`, `attempts`, `error` (class/code), `next_attempt_in_s` | Attempt failed, will retry | PAY-110 |
 | `email.failed` | error | `email_id`, `template`, `attempts`, `error` | `EMAIL_MAX_ATTEMPTS` reached | PAY-110 |
 | `email.cancelled` | info | `email_id`, `template`, `reason` (`invite_not_pending`, `reset_not_pending`) | Token no longer issuable (invite or reset revoked, used or accepted; user no longer pending or active) | PAY-110 |
 | `email.relay.error` | error | `error` | Unexpected error in the relay loop (it continues after 5 s) | PAY-110 |
-| `ratelimit.backend_error` | warning (≤ 1 per 10 s) | `component` (`login`, `reset`, `accept`, or pycommon's caller limiter), `fail_mode` | Redis error in a limiter or in the lock commands (pycommon event) | PAY-603 |
+| `metrics.gauge_query_failed` | warning | `gauge`, `error_type` (pycommon) | An email-gauge query failed or timed out; that cycle reports nothing | PAY-110, R26 |
+| `ratelimit.backend_error` | warning (≤ 1 per 10 s) | `component` (`login`, `reset`, `accept`, or pycommon's caller limiter), `fail_mode`, `error_type` | Redis error in a limiter or in the lock commands (pycommon event) | PAY-603 |
 | `maintenance.task.completed` / `maintenance.task.failed` | info / error | `task` (§6.10 names), `affected`, `duration_ms` / `error_type` | Each maintenance task per tick (pycommon events; C44) | PAY-608 |
 | `auth.token.rejected` | warning | `reason`, `kid`, `iss` (pycommon) | JWT 401 | PAY-600 |
+| `auth.forbidden` | info | `route`; `reason` = `db_role` from `admin_actor` (pycommon's JWT checks log `subject_kind` or `missing_roles` instead) | 403 `forbidden_role` | PAY-601 |
 | `http.request` | info | pycommon (route template, status, duration_ms) | Every request | PAY-NFR-09 |
 | `startup.check_failed` | error (uat/prod; exit 2) / warning (dev) | `setting`, `reason` (pycommon; C29) | Startup check | PAY-605 |
 
@@ -573,18 +579,18 @@ Names as in plan §11 and `observability.md` §5; labels bounded.
 | Metric | Type | Labels | When | Requirement |
 |---|---|---|---|---|
 | `auth_signins_total` | counter | `outcome`: `success`, `failure`, `rate_limited` | Every login response (401 → `failure`, 429 → `rate_limited`) | PAY-104, PAY-NFR-10 |
-| `rate_limited_total` | counter (pycommon) | `scope`: the `Limit.scope` values `login_ip`, `login_account`, `reset_ip`, `reset_account`, `accept_ip`, `caller`, plus `login_locked` (incremented by identity for a request refused while the account is locked) | Every 429 from identity | PAY-603 |
-| `rate_limiter_errors_total` | counter (pycommon) | `component`: `login`, `reset`, `accept`, and pycommon's caller limiter | Every limiter or lock-command Redis error | PAY-603 |
-| `identity_emails_pending` | gauge | — | Count of `status = 'pending'` | PAY-110 |
+| `rate_limited_total` | counter (pycommon) | `scope`: the `Limit.scope` values `login_ip`, `reset_ip`, `reset_account`, `accept_ip`, `caller` (counted by pycommon's limiter), plus `login_account` (the failed-attempt gate refused, §6.4) and `login_locked` (refused while the account is locked), which identity records through the login limiter's `record_denied(scope)`; identity has no counter of its own (C63) | Every 429 from identity | PAY-603 |
+| `rate_limiter_errors_total` | counter (pycommon) | `component`: `login`, `reset`, `accept`, and pycommon's caller limiter | Every limiter or lock-command Redis error; lock-command errors go through the login limiter's `record_error(exc, fail_mode=closed)`, which also writes the throttled `ratelimit.backend_error` log | PAY-603 |
+| `identity_emails_pending` | observable gauge, collection-time (unit `{email}`) | — | Count of `status = 'pending'` | PAY-110 |
 | `identity_emails_failed_total` | counter | — | +1 each time an email becomes `failed` (§6.9; R25). Pre-initialised with `add(0)` at start | PAY-110 |
-| `identity_email_oldest_pending_age_seconds` | gauge | — | `now − min(created_at)` of pending rows; 0 when none | PAY-110 |
+| `identity_email_oldest_pending_age_seconds` | observable gauge, collection-time (unit `s`) | — | `now − min(created_at)` of pending rows; 0 when none | PAY-110 |
 | `external_requests_total` | counter (pycommon `Guard`) | `provider="smtp"`, `operation="send"`, `outcome`: pycommon's values (`ok`, `server_error`, `client_error`, `timeout`, `connect_error`, `breaker_open`) | Every SMTP send attempt | PAY-110 |
 | `external_request_duration_seconds` | histogram | `provider="smtp"`, `operation="send"` | Every SMTP send | PAY-110 |
 | `circuit_breaker_state` | gauge | `target="smtp"` | Breaker transitions (pycommon) | PAY-110 |
 | `identity_password_hash_seconds` | histogram | `op`: `hash`, `verify` | Each argon2 call (sizing and the timing-class check) | PAY-104 |
 | `http_server_request_duration_seconds` | histogram | auto (route, status) | Every request | PAY-NFR-05 |
 
-The two email gauges are computed by **every replica** at metric collection (R26): the OTel observable-gauge callback runs one DB query on a small sync engine (as payroll §7.2 does), and reports nothing for that cycle if the query fails (log `metrics.gauge_query_failed`). Alert rules use `max()` across replicas.
+The two email gauges are computed by **every replica** at metric collection (R26, C63) through pycommon `observable_gauge`. The callback runs one query (`SELECT count(*), COALESCE(EXTRACT(EPOCH FROM now() - min(created_at)), 0) FROM identity.email_outbox WHERE status = 'pending'`) through `EmailGaugeSource`, which owns a private event loop on its own thread and a one-connection asyncpg engine (identity has no sync driver). The callback can therefore run on the exporter's thread or on a thread that is itself running an event loop. One result serves both gauges of a collection (reused for 1 s). The wait is bounded by `IDENTITY_GAUGE_QUERY_TIMEOUT_MS` (connect and statement timeout). A failed or timed-out query reports nothing for that cycle (pycommon logs `metrics.gauge_query_failed`). The source starts lazily at the first collection and is disposed on shutdown. pycommon keeps one callback per gauge name and meter provider, so a second app in the same process replaces the first. Alert rules use `max()` across replicas.
 
 **`EmailOutboxStuck`** (platform rules; R25) fires on `max(identity_email_oldest_pending_age_seconds) > 900 or increase(identity_emails_failed_total[1h]) > 0`, so it clears an hour after the last failure. Alerts, promtool tests and dashboards use `auth_signins_total{outcome="failure"}` (C19). The Step 6 email drill reads the alert from alert-sink on host port 4135 (`ALERT_SINK_PORT`, test override; R31).
 
@@ -642,7 +648,7 @@ Limiters, created in `on_startup`: `RateLimiter(redis, prefix="identity:rl", com
 | `Limit.scope` | Limit | Window | Subject | Used by |
 |---|---|---|---|---|
 | `login_ip` | `AUTH_LOGIN_LIMIT_IP` | `IDENTITY_LOGIN_WINDOW_S` | `ih` | login |
-| `login_account` | `AUTH_LOGIN_LIMIT_ACCOUNT` | `IDENTITY_LOGIN_WINDOW_S` | `f"{ek}:{level}"` (see below) | login |
+| `login_account` | `AUTH_LOGIN_LIMIT_ACCOUNT` **failed** attempts (C63) | `IDENTITY_LOGIN_WINDOW_S` | `f"{ek}:{level}"` (see below) | login |
 | `reset_ip` | `AUTH_LOGIN_LIMIT_IP` | `IDENTITY_LOGIN_WINDOW_S` | `ih` | reset request |
 | `reset_account` | `AUTH_LOGIN_LIMIT_ACCOUNT` | `IDENTITY_LOGIN_WINDOW_S` | `ek` | reset request |
 | `accept_ip` | `AUTH_LOGIN_LIMIT_IP` | `IDENTITY_LOGIN_WINDOW_S` | `ih` | invite accept and reset confirm (R18) |
@@ -656,27 +662,29 @@ Keys:
 | `identity:rl:login:level:<ek>` | string: the last lock level | `IDENTITY_LOCKOUT_LEVEL_TTL_S`, rewritten on each lock | Lock level; gone after 24 h without a new lock |
 | `identity:rl:caller:<hash>:<window>` | counter (pycommon `caller_rate_limit`) | 61 s | Per-user service limit (`SERVICE_RATE_LIMIT_USER`; §3.2) |
 
-**Login algorithm:**
+**Login algorithm.** The per-IP limit counts every attempt. The per-account limit counts **failed** attempts only (C63): the gate reads the current failure count, and a failure is added only after a failed verify. So successful sign-ins never move an account toward a lock, which settles PAY-104's "5 / 15 min" as five *failed* attempts per window.
 1. `login.hit(login_ip, ih)`. Denied → 429, `Retry-After = retry_after_s`, scope `login_ip`.
 2. In one pipeline: `PTTL login:lock:<ek>` and `GET login:level:<ek>` (`level` = 0 when absent). If the lock exists → 429, `Retry-After = ceil(PTTL / 1000)`, and identity increments `rate_limited_total{scope="login_locked"}`. No argon2 runs; the attempt doesn't extend the lock or count toward the next level (R15).
-3. `login.hit(login_account, f"{ek}:{level}")`. If denied:
+3. `GET` the `login_account` counter for `f"{ek}:{level}"` in the current window (pycommon's key, `identity:rl:login_account:<sha256(subject)[:32]>:<now // window_s>`). If it is ≥ `AUTH_LOGIN_LIMIT_ACCOUNT`:
+   - identity increments `rate_limited_total{scope="login_account"}`;
    - `next = level + 1`; `lock_s = lock_seconds(next) = min(IDENTITY_LOCKOUT_BASE_S × 2^(next−1), IDENTITY_LOCKOUT_MAX_S)` (60, 120, 240, 480, 960, 1920, 3600, 3600 … s);
    - `SET login:lock:<ek> <next> NX EX lock_s`;
    - set → `SET login:level:<ek> <next> EX IDENTITY_LOCKOUT_LEVEL_TTL_S`; audit and log `auth.lockout`; 429, `Retry-After = lock_s`;
    - not set (a concurrent attempt locked first) → 429 with `Retry-After = ceil(PTTL / 1000)` of that lock; no second audit row.
 4. Otherwise verify the password (§6.3).
-5. Success: `DEL login:level:<ek>` → 200. Failure: → 401 (the attempt was already counted in step 3).
+5. Success: `DEL login:level:<ek>` → 200 (nothing is counted). Failure: `login.hit(login_account, f"{ek}:{level}")` (`MULTI` `INCR` + `EXPIRE … NX`, fail closed) → 401.
 
-`INCR` is atomic and `SET NX` lets exactly one attempt start a lock, so concurrent attempts can't overshoot or double-lock. Because the account subject includes the level, each lock starts a fresh count. With the production values, attempts 1–5 in a window return 401, and the 6th returns 429 and locks for 60 s. After each lock the next 5 failures return 401 and the 6th locks for twice as long, up to 60 minutes. Unknown emails lock exactly the same way, so a 429 reveals nothing about whether the account exists (R15).
+`SET NX` lets exactly one attempt start a lock, so concurrent attempts can't double-lock. Because the gate reads before the verify, attempts that pass the gate together can each add a failure, so a burst of concurrent failures can exceed the limit by its own size before the next attempt locks; the lock still starts on the next attempt. Because the account subject includes the level, each lock starts a fresh count. With the production values, failed attempts 1–5 in a window return 401, and the 6th attempt (whatever its password) returns 429 and locks for 60 s. After each lock the next 5 failures return 401 and the 6th locks for twice as long, up to 60 minutes. Unknown emails lock exactly the same way, so a 429 reveals nothing about whether the account exists (R15).
 
 Limits of the fixed window (pycommon D6, accepted):
 - up to 2× a limit can pass across a window edge;
 - a window can't be cleared, so a success resets only the level, and failures already counted at level 0 in the current window still count until it ends (≤ `IDENTITY_LOGIN_WINDOW_S`).
+- identity reads the counter key itself in step 3, so it relies on pycommon's key format (C17, C55); `unit/test_limits.py` fails if the two drift.
 
 **Reset request:** `reset.hit(reset_ip, ih)`, then `reset.hit(reset_account, ek)`; no lock. **Accept and reset confirm:** `accept.hit(accept_ip, ih)` only.
 
 **Redis errors:**
-- The four public flows fail **closed** with 503 `service_unavailable`. pycommon raises it for the counters, and identity raises it for a Redis error in steps 2–3. Exception: a failed `DEL` after a successful login is logged and counted, and the login still returns 200, because a kept level only makes the next lock longer.
+- The four public flows fail **closed** with 503 `service_unavailable`. pycommon raises it for the counters (including the failure count in step 5), and identity raises it for a Redis error in steps 2–3. Exception: a failed `DEL` after a successful login is logged and counted, and the login still returns 200, because a kept level only makes the next lock longer.
 - The per-caller limit fails **open** (pycommon).
 - Every error increments `rate_limiter_errors_total{component}` and logs `ratelimit.backend_error`.
 
@@ -701,14 +709,14 @@ Only `inactive` is accepted for `status`: user reactivation is out of scope for 
 
 ### 6.6 Invite, resend and accept (PAY-101–103)
 
-- **Invite** (one transaction): insert `users` (pending), `invites` (`token_hash` and `expires_at` `NULL`: both are set when the relay sends, §6.7), `email_outbox` (template `invite`, current `traceparent`), audit `user.invited`. A unique violation on `uq_users_company_email` → 409 `user_email_taken`.
+- **Invite** (one transaction): insert `users` (pending), `invites` (`token_hash` and `expires_at` `NULL`: both are set when the relay sends, §6.7), `email_outbox` (template `invite`, current `traceparent`), audit `user.invited` (with `ip_hash` when `X-Client-IP` was sent). A unique violation on `uq_users_company_email` → 409 `user_email_taken`.
 - **Resend** (one transaction): load the invite by `(cid, id)` (404 `invite_not_found`); lock its user; if the user isn't `pending` → 409 `invite_not_pending`. Set the user's pending invite (if any) to `revoked`, cancel that invite's pending outbox rows, insert a new invite (`token_hash` and `expires_at` `NULL`) and outbox row, audit `user.invite_resent`. The old token then fails with `invite_invalid` (PAY-102). Return `PendingInviteOut` for the new invite.
 - **Accept:**
   1. `digest = digest_of(token)`; malformed → 400 `invite_invalid`.
   2. `SELECT` the invite by `token_hash` and `company_id`; it must be `pending`, `expires_at > now()` (TTL from the send; C31), and its user `pending`. Else 400 `invite_invalid`.
   3. Password policy → 422 `password_too_weak`.
   4. Hash the password (outside the transaction).
-  5. One transaction: `UPDATE invites SET status = 'accepted', accepted_at = now() WHERE id = :id AND status = 'pending' AND expires_at > now() RETURNING user_id` (0 rows → 400 `invite_invalid`, which handles a concurrent double accept); `UPDATE users SET status = 'active', activated_at = now() WHERE id = :uid AND status = 'pending'` (0 rows → rollback, 400); insert `credentials`; audit `user.invite_accepted`.
+  5. One transaction: `UPDATE invites SET status = 'accepted', accepted_at = now() WHERE company_id = :cid AND id = :id AND status = 'pending' AND expires_at > now() RETURNING user_id` (0 rows → 400 `invite_invalid`, which handles a concurrent double accept); `UPDATE users SET status = 'active', activated_at = now() WHERE company_id = :cid AND id = :uid AND status = 'pending'` (0 rows → rollback, 400); insert `credentials`; audit `user.invite_accepted`.
   6. Return `SessionUser` (C6).
 - **Reset request:** if an active user matches: revoke their pending reset, insert `password_resets` (`token_hash` and `expires_at` `NULL` until the relay sends) and an outbox row (`password_reset`), audit `auth.password_reset.requested`. Always 202.
 - **Reset confirm:** like accept (400 `reset_invalid`; the reset must be `pending` with `expires_at > now()`, and the user `active`); then in one transaction mark the reset `used`, upsert `credentials` (`password_changed_at = now()`), bump `roles_version`, audit `auth.password_reset.completed`. Return `{user_id, roles_version}`. The BFF deletes every session in `web:user-sess:<user_id>` at once (R19; identity's Redis ACL can't reach `web:*`); the `roles_version` bump makes any session it misses end at the next re-check (PAY-107).
@@ -745,14 +753,16 @@ loop until stop:
     UPDATE email_outbox SET attempts = attempts + 1,
                             next_attempt_at = now() + IDENTITY_EMAIL_LEASE_S
      WHERE id = ANY(:ids) RETURNING *;
-  for each claimed row, in order:
+  for each claimed row, in id order (oldest first):
+    0. sender.available() is false (breaker open) → attempts = attempts − 1, next_attempt_at = now() + BREAKER_RESET_S,
+       last_error 'breaker_open'; no token is issued, so expires_at and any earlier link are untouched (C31, C63); next.
     1. issue the token and set expires_at = now() + TTL (own transaction, §6.7). No row updated → status 'cancelled',
        finished_at = now(); log email.cancelled; next.
     2. render (§3.9) with the user's name and the new expires_at.
     3. send through SmtpSender (pycommon Guard: breaker, deadline IDENTITY_SMTP_TIMEOUT_S, no inner retries),
        in span identity.email.send (parent = row.traceparent).
     4. ok        → status 'sent', finished_at = now(), last_error NULL; log email.sent.
-       breaker open → attempts = attempts − 1, next_attempt_at = now() + BREAKER_RESET_S (not counted).
+       breaker opened meanwhile (another send tripped it) → as step 0 (not counted).
        error     → if attempts >= EMAIL_MAX_ATTEMPTS: status 'failed', finished_at = now();
                    identity_emails_failed_total += 1; log email.failed
                    else next_attempt_at = now() + retry_delay_s(attempts); log email.send_failed.
@@ -765,6 +775,8 @@ loop until stop:
 - **Never stored:** the rendered subject and body, the link and the raw token are local variables only. `aiosmtplib` debug logging is off; the redactor masks `token`, `link` is never a log field.
 - **Shutdown:** the loop stops claiming when `stop` is set, finishes the message in flight, and returns. Claimed but unsent rows are retried after their lease.
 - **Unexpected errors** in the loop are logged (`email.relay.error`), and the loop sleeps 5 s and continues.
+- **Failed sends** set the `identity.email.send` span's status to error, with the error class only (`error.type`).
+- **Expiry and failed attempts:** a token is issued for each attempt the breaker allows, so `expires_at` is set by the first *attempted* send even if that attempt fails (the link in an email that was delivered but reported as failed still works until the next attempt). C31's "set when the relay sends" means "when the relay attempts a send"; with the breaker open nothing is attempted and nothing is issued.
 
 ### 6.10 Maintenance (PAY-608)
 
@@ -784,7 +796,7 @@ Failing emails after `EMAIL_MAX_ATTEMPTS` happens in the relay (§6.9), not here
 
 ## 7. Tests
 
-Every test names its requirement IDs in its docstring. Unit tests run with `--disable-socket --allow-unix-socket`. Integration tests use the shared Testcontainers fixtures (`pycommon.testing`: Postgres 16 with the bootstrap SQL, Redis 7 with the ACL file, plus a Mailpit container), migrate as `identity_migrator`, and connect as `identity_app` (Redis user `identity`).
+Every test names its requirement IDs in its docstring. No test sleeps to synchronise; waits poll a condition with a deadline (`wait_until`), and time moves through `FakeClock`, time-machine or SQL. Test secrets (`STRONG_SECRET`, `AUDIT_KEY` in `tests/helpers.py`) are generated per run (C63). Unit tests run with `--disable-socket --allow-unix-socket`. Integration tests use the shared Testcontainers fixtures (`pycommon.testing`: Postgres 16 with the bootstrap SQL, Redis 7 with the ACL file), migrate as `identity_migrator`, and connect as `identity_app` (Redis user `identity`). SMTP is an in-process `aiosmtpd` server (`tests/integration/conftest.py`), which the tests can stop and restart; Mailpit itself is exercised at stack level (S8, PAY-609, e2e). Coverage: `fail_under = 85` in `pyproject.toml`, enforced on the combined unit and integration run (`--cov-append --cov-fail-under=85`).
 
 ### 7.1 `services/identity/tests/unit/`
 
@@ -793,14 +805,18 @@ Every test names its requirement IDs in its docstring. Unit tests run with `--di
 | `test_passwords.py` | Policy (11 → `PasswordTooWeak`, 12 and 256 OK, code points not bytes); argon2 parameters read from the encoded hash (`m=65536,t=3,p=4`, argon2id); `verify` with `None` uses the dummy hash and returns false; `needs_rehash` after a parameter change | PAY-103, PAY-104 |
 | `test_tokens.py` | 32 random bytes, 43-char base64url, digest = SHA-256 of the raw bytes, `digest_of` rejects wrong length, padding and alphabet | PAY-101, PAY-103, PAY-105 |
 | `test_lockout.py` | `lock_seconds` sequence 60, 120 … 3600 and the cap; settings defaults equal the production values (5, 20, 900, 60, 3600, 86400) | PAY-104 |
+| `test_limits.py` | The login gate against an in-memory Redis double: only recorded failures count (C63), and identity's counter key equals pycommon's; the 6th attempt starts a level-1 lock; a concurrent `SET NX` winner is reported, not re-locked; Redis errors in steps 2–3 fail closed (503, counted, throttled log); a failed `DEL` after success is swallowed | PAY-104, PAY-603 |
+| `test_audit_events.py` | `ck_audit_log_event` and `ck_users_roles` in the models and migration 0001 list exactly `ALL_EVENTS` and the three roles | PAY-109, PAY-101 |
+| `test_smtp.py` | 4xx/5xx classification; `last_error` labels carry no message text; settings reach `aiosmtplib`; connect errors open the breaker and `available()` reports it | PAY-110 |
+| `test_relay_loop.py` | `email.relay.error` (class only) and the loop continues; a full batch claims again at once; stop before start | PAY-110 |
 | `test_user_rules.py` | `cannot_modify_self`; `last_admin` for demote and for deactivate; pending admins don't count; `roles_version` bumps only on a real change or deactivation; role de-duplication and ordering | PAY-108, PAY-107 |
 | `test_email_schedule.py` | Backoff sequence and cap; exhaustion at `EMAIL_MAX_ATTEMPTS` | PAY-110 |
 | `test_email_templates.py` | Links are `{base}/accept#token=` and `{base}/reset#token=`; no `?` in the link; base URL trailing slash stripped; HTML escapes the name; subject has no token | PAY-103, PAY-105, PAY-NFR-07 |
 | `test_ip.py` | IPv4/IPv6 normalisation; `ip_hash` is HMAC-SHA256 with the key (known vector), 64 hex chars, differs with another key | PAY-NFR-08 |
-| `test_routes_auth.py` | Parametrised matrix: every route × {no token, expired, wrong `aud`, `iss=payout-worker` (kid not in the keyset), issuer/kid mismatch, `service:web`, user without admin, admin} → 401 `invalid_token` for the token failures, 403 `forbidden_role` for the wrong kind of token or a missing role, 2xx otherwise (C30); `service:web` accepted only on the four public routes | PAY-600, PAY-601 |
-| `test_api_errors.py` | Each error code in §3.5 maps to its status and shape; `validation_error` details are `[{field, issue}]` (C14) and never contain the input (a 300-char password, a token); `PATCH` with `status: "active"` → 422 (C25) | PAY-602, PAY-NFR-07, PAY-108 |
-| `test_redaction.py` | **The redaction test (unit):** with an in-memory log handler and span exporter, call login, accept, reset confirm and the relay's send with fakes; assert that no log line or span attribute contains the password, the raw token, the email, the raw IP or the `Authorization` header, and that every identity log event's fields are in §5.1's allow-list | PAY-NFR-07 |
-| `test_metrics.py` | `InMemoryMetricReader`: a 401 increments `auth_signins_total{outcome="failure"}` (C19); a 429 past the account limit increments `rate_limited_total{scope="login_account"}` and `auth_signins_total{outcome="rate_limited"}`, and one while locked `rate_limited_total{scope="login_locked"}`; an SMTP connect error increments `external_requests_total{provider="smtp",outcome="connect_error"}`; an email reaching `failed` increments `identity_emails_failed_total` (R25), which is exported as 0 from start; a limiter error increments `rate_limiter_errors_total{component="login"}` | PAY-NFR-10, PAY-603, PAY-110 |
+| `test_routes_auth.py` | Parametrised matrix: every route × {no token, expired, wrong `aud`, `iss=payout-worker` (kid not in the keyset), issuer/kid mismatch, garbage, `service:web`, user token} → 401 `invalid_token` for the token failures, 403 `forbidden_role` for the wrong kind of token (C30); `service:web` accepted only on the public routes. Also: `validation_error` details never echo the input (C14, C56), a bad `X-Client-IP` is 422 `header.X-Client-IP`, 413 over 256 KB, `Cache-Control: no-store`. The admin cells (user without admin → 403 from the DB check, admin → 2xx) are in `integration/test_invites.py` | PAY-600, PAY-601, PAY-602, PAY-604 |
+| `test_api_errors.py` (F1) | Each error code in §3.5 maps to its status and shape; `PATCH` with `status: "active"` → 422 (C25). In S4 the shape and no-echo checks live in `test_routes_auth.py` and `integration/test_invites.py` | PAY-602, PAY-NFR-07, PAY-108 |
+
+The redaction and metric checks run against real Postgres, Redis and SMTP instead of fakes, so they live in the integration suite: the allow-list and no-secret checks in `integration/test_telemetry_redaction.py`; `auth_signins_total{outcome}` (all three outcomes, C19) and `rate_limited_total{scope}` (`login_ip`, `login_account`, `login_locked`) in `integration/test_login.py` and `integration/test_lockout.py`; `external_requests_total{provider="smtp"}` and `identity_emails_failed_total` (0 from start, R25) in `integration/test_email_relay.py`; `rate_limiter_errors_total{component}` in `integration/test_rate_limits.py` and `unit/test_limits.py`.
 | `test_startup_checks.py` | Each §4.3 check returns `CheckFailure(setting, reason)`; in uat/prod `run_startup_checks` logs `startup.check_failed` with the setting's name and reason, never the value, and exits 2 (C29); in dev it only warns | PAY-605 |
 | `test_bootstrap_args.py` | Argument parsing (including `--if-empty`) and exit code 2 cases (bad email, bad UUID, `--password-env` outside dev, unset env var, weak password, company id ≠ `COMPANY_ID`) | PAY-100, PAY-609 |
 
@@ -809,16 +825,16 @@ Every test names its requirement IDs in its docstring. Unit tests run with `--di
 | Test file | Covers | Requirement |
 |---|---|---|
 | `test_migrations.py` | Upgrade to head, downgrade one step, upgrade again; `alembic_version` lives in schema `identity`; all §2 constraints exist | PAY-606 |
-| `test_grants.py` | `identity_app`: `permission denied` on `payroll.*`, `payouts.*`, `bank_stub.*` and on `CREATE TABLE identity.x`; `UPDATE` and `DELETE` on `identity.audit_log` denied (C2, C50), including after re-running the bootstrap SQL; `identity.purge_audit_log(cutoff)` deletes only rows older than the cutoff; `INSERT`/`UPDATE` on `identity.alembic_version` denied; DML on the other identity tables allowed. `identity_migrator`: no rights in other schemas | PAY-606 |
+| `test_grants.py` | `identity_app`: `permission denied` on `payroll.*`, `payouts.*`, `bank_stub.*` and on `CREATE TABLE identity.x`; `UPDATE` and `DELETE` on `identity.audit_log` denied (C2, C50), including after re-running the bootstrap SQL; `identity.purge_audit_log(cutoff)` deletes only rows older than the cutoff, and a future or recent cutoff deletes nothing (clamped to 400 days, C63); only `identity_app` may execute it; `INSERT`/`UPDATE` on `identity.alembic_version` denied; DML on the other identity tables allowed. `identity_migrator`: no rights in other schemas | PAY-606 |
 | `test_redis_acl.py` | The `identity` Redis user can use `identity:*` (`MULTI`/`INCR`/`EXPIRE NX`, `SET NX EX`, `PTTL`) but gets `NOPERM` on `web:sess:x`, on `XADD stream:payout.requested` and on `EVAL` (C3) | PAY-607 |
-| `test_bootstrap_owner.py` | Runs as `identity_migrator`. Empty DB → exit 0, pending owner with all three roles, invite (`expires_at` `NULL`) and outbox row, audit `user.bootstrapped`; second run → exit 3 and `identity.bootstrap.refused`; second run with `--if-empty` → exit 0, `identity.bootstrap.skipped`, no new rows (R16); two concurrent runs → one 0, one 3; `--if-empty --password-env SEED_OWNER_PASSWORD` in dev → active owner who can log in, no invite and no email; `--password-env` with `ENV=uat` → exit 2; DB down → exit 4 | PAY-100, PAY-609 |
-| `test_invites.py` | Invite 201 with a pending user, `pending_invite_id` set (C11) and a pending outbox row; `GET /v1/users` shows `pending_invite_id` only for pending users; 409 `user_email_taken` (case-insensitive, concurrent duplicates); 422 for empty/unknown roles; 403 for non-admin; resend 200 revokes the old token (`invite_invalid` afterwards) and 409 `invite_not_pending` for an active user; the invite's `expires_at` is `NULL` until sent, then send time + `INVITE_TTL_H`, and moves forward on a re-send (time-machine; C31); accept: 200 `SessionUser` with `user_id`, `company_id`, `email`, `name`, `roles`, `roles_version` and `status` (C6), used / expired / unknown / revoked token → 400, 11-char password → 422, two concurrent accepts → one 200; the token travels only in the body | PAY-101, PAY-102, PAY-103, PAY-106 |
-| `test_login.py` | 200 `SessionUser` for an active user; identical 401 body for wrong password, unknown email, pending and inactive users; argon2 runs on every path (`identity_password_hash_seconds{op="verify"}` count increments for each); **timing class (C45):** with limits raised, the median latency of 30 unknown-email logins and 30 wrong-password logins differ by ≤ 20%; audit rows with `ip_hash` and no raw IP, and `ip_hash` `NULL` without `X-Client-IP`; rehash on parameter change | PAY-104, PAY-NFR-08 |
-| `test_lockout.py::test_lockout_production_values` | With settings forced to the production values (5 / 20 / 900 s / 60 s / 3600 s) regardless of the test env, and a `FakeClock` at the start of a window: attempts 1–5 → 401, the 6th → 429 with `Retry-After` 60 and `auth.lockout` audited (level 1); the correct password during the lock → 429 (R15); two concurrent 6th attempts → one lock and one audit row; after the lock key is expired (`PEXPIRE` 1 ms), 5 more failures → 401 and the next → 429 with lock TTL 120; success deletes the level key; unknown emails lock identically; 21 attempts from one IP over different emails → the 21st is 429 `scope=login_ip`; the Redis keys contain no email or IP | PAY-104 |
+| `test_bootstrap_owner.py` | Runs as `identity_migrator`. Empty DB → exit 0, pending owner with all three roles, invite (`expires_at` `NULL`) and outbox row, audit `user.bootstrapped`, `email.queued` logged; second run → exit 3 and `identity.bootstrap.refused`; second run with `--if-empty` → exit 0, `identity.bootstrap.skipped`, no new rows (R16); two concurrent runs → one 0, one 3; `--if-empty --password-env SEED_OWNER_PASSWORD` in dev → active owner who can log in, no invite and no email; `--password-env` with `ENV=uat` → exit 2; DB down → exit 4 | PAY-100, PAY-609 |
+| `test_invites.py` | Invite 201 with a pending user, `pending_invite_id` set (C11), a pending outbox row and `user.invited` audited with the client's `ip_hash`; 422 `invalid_character` for NUL in `email` or `name` (C63); non-admin 403 logs `auth.forbidden` (`db_role`); `GET /v1/users` shows `pending_invite_id` only for pending users; 409 `user_email_taken` (case-insensitive, concurrent duplicates); 422 for empty/unknown roles; 403 for non-admin; resend 200 revokes the old token (`invite_invalid` afterwards) and 409 `invite_not_pending` for an active user; the invite's `expires_at` is `NULL` until sent, then send time + `INVITE_TTL_H`, and moves forward on a re-send (time-machine; C31); accept: 200 `SessionUser` with `user_id`, `company_id`, `email`, `name`, `roles`, `roles_version` and `status` (C6), used / expired / unknown / revoked token → 400, 11-char password → 422, two concurrent accepts → one 200; the token travels only in the body | PAY-101, PAY-102, PAY-103, PAY-106 |
+| `test_login.py` | 200 `SessionUser` for an active user; identical 401 body for wrong password, unknown email, pending and inactive users; argon2 runs on every path (`identity_password_hash_seconds{op="verify"}` count increments for each); **timing class (C45, `test_login_timing`):** with limits raised, the median latency of 30 unknown-email logins and 30 wrong-password logins differ by ≤ 20%; audit rows with `ip_hash` and no raw IP, and `ip_hash` `NULL` without `X-Client-IP`; rehash on parameter change | PAY-104, PAY-NFR-08 |
+| `test_lockout.py::test_lockout_production_values` | With settings forced to the production values (5 / 20 / 900 s / 60 s / 3600 s) regardless of the test env, and a `FakeClock` at the start of a window: failed attempts 1–5 → 401, the 6th → 429 with `Retry-After` 60 and `auth.lockout` audited (level 1); the correct password during the lock → 429 (R15); two concurrent 6th attempts → one lock and one audit row; after the lock key is deleted (the lock's end), 5 more failures → 401 and the next → 429 with lock TTL 120; success deletes the level key; unknown emails lock identically; ten successful sign-ins in a row don't count, and five failures after them are still 401 (C63); `auth_signins_total` counts `success`, `failure` and `rate_limited`; 21 attempts from one IP over different emails → the 21st is 429 `scope=login_ip`; the Redis keys contain no email or IP | PAY-104 |
 | `test_password_reset.py` | Request is 202 for known, unknown and inactive emails, with an outbox row only for the active user; the reset's `expires_at` is set at send to send time + `RESET_TTL_H` (C31); confirm sets the password (old fails, new works), bumps `roles_version`, returns `user_id` (R19); reused / expired / unknown token → 400 `reset_invalid`; deactivating the user revokes a pending reset; reset requests rate-limited like login | PAY-105 |
 | `test_users_admin.py` | List `{items, next_cursor}` with cursor and limit ≤ 100 (101 → 422); `/me` returns `MeOut` with `status`, `roles_version`, `name` and `company_id` (R19), also for an inactive user; PATCH `status: "active"` on an inactive user → 422 (C25); PATCH roles bumps `roles_version` and audits `user.roles_changed`; deactivate bumps, audits `user.deactivated` and revokes a pending invite; self-PATCH → 409 `cannot_modify_self`; last-admin guard (two admins demoting each other concurrently: one 200, one 403/409, never zero admins); actor demoted in DB but JWT still says admin → 403 | PAY-107, PAY-108, PAY-601 |
 | `test_audit_log.py` | Newest first, cursor paging, admin only; after a full J1 run (invite, accept, login fail and success, reset, role change) the table contains the expected events and **no** password, token, email or raw IP in any column | PAY-109, PAY-NFR-08 |
-| `test_email_relay.py` | Invite → Mailpit receives one message with a `http://127.0.0.1:<WEB_PORT>/accept#token=` link (C12) whose token accepts the invite; SMTP stopped → invite still 201, row stays pending with growing `attempts`, sent after Mailpit restarts; 10 failures → `failed` and `identity_emails_failed_total` +1 (R25); two relays on one table never send a row twice (SKIP LOCKED); a resent invite's old outbox row is `cancelled`; no column of `email_outbox` contains the token or the link | PAY-110 |
+| `test_email_relay.py` | Invite → the SMTP server receives one message with a `http://127.0.0.1:<WEB_PORT>/accept#token=` link (C12) whose token accepts the invite; SMTP stopped → invite still 201, row stays pending with growing `attempts`, sent after the server restarts; with the breaker open the attempt is given back and no token is issued (`expires_at` stays `NULL`, C63); the two email gauges are 0, then the pending count and age, then 0 after sending, and a failing gauge query reports nothing and logs `metrics.gauge_query_failed` (R26); 10 failures → `failed` and `identity_emails_failed_total` +1 (R25); two relays on one table never send a row twice (SKIP LOCKED); a resent invite's old outbox row is `cancelled`; no column of `email_outbox` contains the token or the link | PAY-110 |
 | `test_rate_limits.py` | Two app instances share login counts; Redis stopped → login, reset request, reset confirm and accept return 503 `service_unavailable`, while `/v1/users/me` still works (fail open) and `rate_limiter_errors_total` increments; per-caller limit 429 with `Retry-After` for a user token, while `service:web` is never caller-limited (R18, C17); accept and reset confirm share `accept_ip` at `AUTH_LOGIN_LIMIT_IP`; requests without `X-Client-IP` share the `unknown` bucket (C16) | PAY-603 |
 | `test_maintenance.py` | Expired tokens purged after `RETENTION_TOKENS_DAYS` (time-machine), a pending user's latest invite kept with hash nulled; a revoked never-sent invite (`expires_at` `NULL`) purged 7 days after revocation; sent/failed/cancelled emails purged after 7 days; audit rows past 400 days purged; only one replica runs under the advisory lock; each task logs `maintenance.task.completed` | PAY-608, PAY-NFR-08 |
 | `test_readyz.py` | `/readyz` fails with the DB down, with Redis down, and when the migration isn't at head; `/livez` stays up | PAY-605 |
@@ -840,30 +856,31 @@ The Schemathesis run against identity (no 5xx, no schema violations) is in the C
 | PAY-101 | `api/users.py`, `usecases/invites.py`, `domain/tokens.py`, `email/relay.py` | `integration/test_invites.py`, `unit/test_tokens.py` |
 | PAY-102 | `api/invites.py`, `usecases/invites.py` | `integration/test_invites.py` |
 | PAY-103 | `api/invites.py`, `usecases/invites.py`, `domain/passwords.py`, `email/templates.py` | `integration/test_invites.py`, `unit/test_passwords.py`, `unit/test_email_templates.py`, `contract/test_openapi.py` |
-| PAY-104 | `api/auth.py`, `usecases/signin.py`, `limits.py`, `domain/lockout.py`, `domain/passwords.py` | `integration/test_login.py`, `integration/test_lockout.py::test_lockout_production_values`, `unit/test_lockout.py`, `unit/test_passwords.py` |
+| PAY-104 | `api/auth.py`, `usecases/signin.py`, `limits.py`, `domain/lockout.py`, `domain/passwords.py` | `integration/test_login.py` (`test_login_timing`), `integration/test_lockout.py::test_lockout_production_values`, `unit/test_lockout.py`, `unit/test_limits.py`, `unit/test_passwords.py` |
 | PAY-105 | `api/auth.py`, `usecases/resets.py`, `limits.py`, `email/relay.py` (token and TTL at send) | `integration/test_password_reset.py`, `unit/test_email_templates.py` |
 | PAY-106 | (web LLD) — identity supplies `SessionUser` | `integration/test_invites.py`, `integration/test_login.py` (response shape) |
 | PAY-107 | `api/users.py` (`/me`, `MeOut`), `domain/users.py` (`roles_version`) | `integration/test_users_admin.py`, `unit/test_user_rules.py` |
 | PAY-108 | `api/users.py`, `usecases/users.py`, `domain/users.py` | `integration/test_users_admin.py`, `integration/test_invites.py` (`pending_invite_id`), `unit/test_user_rules.py`, `unit/test_api_errors.py` |
 | PAY-109 | `api/audit.py`, `usecases/audit.py`, `db/repositories.py` | `integration/test_audit_log.py` |
-| PAY-110 | `email/relay.py`, `email/smtp.py`, `email/templates.py`, `domain/email_schedule.py`, `metrics.py` | `integration/test_email_relay.py`, `unit/test_email_schedule.py`, `unit/test_email_templates.py`, `unit/test_metrics.py` |
+| PAY-110 | `email/relay.py`, `email/smtp.py`, `email/templates.py`, `domain/email_schedule.py`, `metrics.py` | `integration/test_email_relay.py`, `unit/test_email_schedule.py`, `unit/test_email_templates.py`, `unit/test_smtp.py`, `unit/test_relay_loop.py` |
 | PAY-600 | pycommon verifier; `settings.py` keyset; `startup_checks.py` | `unit/test_routes_auth.py`, `unit/test_startup_checks.py` |
 | PAY-601 | `api/deps.py` | `unit/test_routes_auth.py`, `integration/test_users_admin.py` |
 | PAY-602 | `api/errors.py` (+ pycommon) | `unit/test_api_errors.py` |
-| PAY-603 | `limits.py`, `api/deps.py` (pycommon `caller_rate_limit`) | `integration/test_rate_limits.py`, `integration/test_lockout.py`, `unit/test_metrics.py` |
+| PAY-603 | `limits.py`, `api/deps.py` (pycommon `caller_rate_limit`) | `integration/test_rate_limits.py`, `integration/test_lockout.py`, `unit/test_limits.py` |
 | PAY-604 | pycommon body limit (256 KB) | `unit/test_api_errors.py` (413) |
 | PAY-605 | `main.py`, `startup_checks.py` | `integration/test_readyz.py`, `unit/test_startup_checks.py` |
 | PAY-606 | `migrations/`, `db/models.py`, `settings.py` (`DB_*`) | `integration/test_migrations.py`, `integration/test_grants.py` |
 | PAY-607 | `settings.py` (`REDIS_USERNAME=identity`) | `integration/test_redis_acl.py` |
 | PAY-608 | `maintenance.py` | `integration/test_maintenance.py` |
 | PAY-609 | `bootstrap_owner.py` (`--if-empty`, `--password-env`) | `integration/test_bootstrap_owner.py`, `unit/test_bootstrap_args.py` |
-| PAY-NFR-07 | `email/relay.py`, `api/errors.py`, pycommon redactor | `unit/test_redaction.py`, `integration/test_telemetry_redaction.py`, `unit/test_api_errors.py` |
+| PAY-NFR-07 | `email/relay.py`, `api/errors.py`, pycommon redactor | `integration/test_telemetry_redaction.py`, `unit/test_routes_auth.py` |
 | PAY-NFR-08 | `domain/ip.py`, `maintenance.py`, `db/models.py` | `unit/test_ip.py`, `integration/test_audit_log.py`, `integration/test_maintenance.py` |
-| PAY-NFR-09 | `email/relay.py` (`traceparent`), pycommon logging | `unit/test_redaction.py` (trace_id on lines); e2e `trace.spec.ts` (web) |
-| PAY-NFR-10 | `metrics.py` | `unit/test_metrics.py` |
+| PAY-NFR-09 | `email/relay.py` (`traceparent`), pycommon logging | `integration/test_telemetry_redaction.py` (`identity.email.send` span); e2e `trace.spec.ts` (web) |
+| PAY-NFR-10 | `metrics.py` | `integration/test_login.py`, `integration/test_lockout.py`, `integration/test_email_relay.py` |
 | PAY-NFR-12 | all; `openapi.json` | `contract/test_openapi.py`; CI coverage ≥ 85% |
 
 ## 9. Change log
 
 - 2026-11-10: incorporated README R-table and C-table decisions (R3, R4, R9, R15, R16, R17, R18, R19, R21, R24, R25, R27, R30, R31, R37; C1, C2, C3, C6, C10, C11, C12, C14, C16, C17, C19, C23, C24, C25, C28, C29, C30, C31, C35, C44, C45).
 - Resolved: SMTP keys (C49); the audit-log revoke and purge function (C50; this design §2.6, §6.10).
+- 2026-11-11 (S4 alignment review, C63): `purge_audit_log` clamps its cutoff to ≥ 400 days old (§2.6). The per-account login limit counts failed attempts only (§6.4), and identity's limiter metrics go through pycommon `RateLimiter.record_denied` / `record_error` (§5.2). The relay checks the breaker before issuing a token (§6.9). The email gauges are collection-time callbacks through `EmailGaugeSource`, with the new key `IDENTITY_GAUGE_QUERY_TIMEOUT_MS` (§4.2, §5.2). `email` and `name` reject NUL (§3.3). `user.invited` carries `ip_hash` (§3.1, §6.6). The accept writes are scoped by `company_id` (§6.6). `auth.forbidden` is logged for DB-role denials, and the §5.1 field lists are an allow-list. §1 now matches the modules. Tests use in-process SMTP and generated secrets (§7), and the coverage gate is 85%.

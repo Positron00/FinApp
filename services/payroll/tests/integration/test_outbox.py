@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from typing import Any, cast
 
 import pytest
@@ -14,7 +13,7 @@ from payroll.db.repositories import AuditRepo
 from payroll.events.envelope import STREAM, validate_envelope
 from payroll.events.relay import build_relay
 from pycommon.streams import RelayLoop, StreamProducer
-from pycommon.testing import OtelMemory
+from pycommon.testing import JsonLogCapture, OtelMemory
 
 from tests.integration.conftest import Api, ApiFactory
 
@@ -29,7 +28,7 @@ def _relay(api: Api, **kw: Any) -> RelayLoop:
     ctx = api.app.state.ctx
     return build_relay(
         api.rt.sessions, StreamProducer(ctx.redis), maxlen=100_000,
-        batch_size=kw.get("batch_size", 100), poll_ms=20,
+        batch_size=kw.get("batch_size", 100), poll_ms=20, validate=kw.get("validate", True),
     )  # fmt: skip
 
 
@@ -85,14 +84,11 @@ async def test_two_relays_never_send_a_row_twice(
     """PAY-402: two relays in parallel (SKIP LOCKED) publish each row exactly once."""
     await api.approved_run(12)
     a, b = _relay(api, batch_size=3), _relay(api, batch_size=3)
-    stop = asyncio.Event()
-    tasks = [asyncio.create_task(a.run(stop)), asyncio.create_task(b.run(stop))]
-    deadline = time.monotonic() + 20
-    while await db.fetchval("SELECT count(*) FROM payroll.outbox WHERE sent_at IS NULL"):
-        assert time.monotonic() < deadline
-        await asyncio.sleep(0.05)
-    stop.set()
-    await asyncio.gather(*tasks)
+    for _ in range(12):  # each round runs both batches concurrently; at most 4 rounds are needed
+        sent = list(await asyncio.gather(a.relay_once(), b.relay_once()))
+        if sent == [0, 0]:
+            break
+    assert await db.fetchval("SELECT count(*) FROM payroll.outbox WHERE sent_at IS NULL") == 0
     ids = [f[b"event_id"] for _, f in await _entries(redis_admin)]
     assert len(ids) == len(set(ids)) == 12
 
@@ -103,10 +99,9 @@ async def test_background_relay_wakes_after_approve(
     """PAY-402: the in-process relay publishes right after the approve commits."""
     api = await api_factory(relay=True, payroll_outbox_poll_ms=60_000)
     await api.approved_run(1)
-    deadline = time.monotonic() + 5
-    while await redis_admin.xlen(STREAM) < 1:
-        assert time.monotonic() < deadline, "the relay was not woken"
-        await asyncio.sleep(0.02)
+    # XREAD BLOCK returns as soon as the entry lands; the 60 s poll can't be what delivers it.
+    got = await redis_admin.xread({STREAM: "0"}, count=1, block=5000)
+    assert got, "the relay was not woken"
 
 
 async def test_redis_failure_keeps_rows_unsent(api: Api, db: Any) -> None:
@@ -162,3 +157,29 @@ async def test_traceparent_continues_the_approve_trace(
     assert tp.startswith(f"00-{publish.context.trace_id:032x}-{publish.context.span_id:016x}-")
     assert publish.attributes is not None
     assert publish.attributes["messaging.destination.name"] == STREAM
+
+
+async def test_relay_revalidates_and_holds_back_an_invalid_envelope(
+    api: Api, db: Any, redis_admin: aioredis.Redis, caplog_json: JsonLogCapture
+) -> None:
+    """PAY-402, C60, C63: with PAYROLL_VALIDATE_EVENTS the relay re-validates each envelope after
+    the traceparent rewrite. An invalid row isn't published: it's marked failed, logged and left
+    unsent, while the valid rows of the batch go out. With validation off it is published."""
+    await api.approved_run(2)
+    bad = await db.fetchval("SELECT id FROM payroll.outbox ORDER BY id LIMIT 1")
+    await db.execute(
+        "UPDATE payroll.outbox SET payload = jsonb_set(payload, '{data,currency}', '\"EUR\"') "
+        "WHERE id = $1",
+        bad,
+    )
+    assert await _relay(api).relay_once() == 1
+    row = await db.fetchrow("SELECT * FROM payroll.outbox WHERE id = $1", bad)
+    assert row["sent_at"] is None
+    assert (row["relay_attempts"], row["last_error"]) == (1, "EnvelopeInvalidError")
+    published = [f[b"event_id"].decode() for _, f in await _entries(redis_admin)]
+    assert len(published) == 1
+    assert str(bad) not in published
+    [event] = caplog_json.events("outbox.relay.error")
+    assert (event["error_type"], event["failed"]) == ("EnvelopeInvalidError", 1)
+    assert await _relay(api, validate=False).relay_once() == 1
+    assert len(await _entries(redis_admin)) == 2

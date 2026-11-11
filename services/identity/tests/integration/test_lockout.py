@@ -52,8 +52,9 @@ async def test_lockout_production_values(  # noqa: PLR0915  (one scripted scenar
     """PAY-104, R15: attempts 1-5 → 401, the 6th → 429 Retry-After 60 and auth.lockout (level 1);
     the right password while locked → 429; after the lock, 5 more failures → 401 and the next
     locks for 120 s; success deletes the level; unknown emails lock identically; concurrent 6th
-    attempts make one lock and one audit row; the 21st attempt from one IP is 429 (login_ip);
-    no Redis key holds an email or IP."""
+    attempts make one lock and one audit row; successful sign-ins never count toward the account
+    limit (C63); the 21st attempt from one IP is 429 (login_ip); no Redis key holds an email or
+    IP; auth_signins_total counts success, failure and rate_limited (C19)."""
     clock = FakeClock()  # 2026-11-10T12:00:00Z: the start of a 900 s window
     async with harness(clock=clock, **PRODUCTION_LIMITS, **PRODUCTION_ARGON2) as h:
         uid = await h.create_user("ann@example.com", password=PW)
@@ -76,8 +77,7 @@ async def test_lockout_production_values(  # noqa: PLR0915  (one scripted scenar
         assert len(await lockouts(admin_db)) == 1
 
         # The lock ends: 5 more failures → 401, the next → a level-2 lock of 120 s.
-        await redis_admin_client.pexpire(AuthLimits.lock_key(ek("ann@example.com")), 1)
-        await asyncio.sleep(0.05)
+        await redis_admin_client.delete(AuthLimits.lock_key(ek("ann@example.com")))
         await fail_n(h, "ann@example.com", 5, ip="198.51.100.1")
         r = await h.login("ann@example.com", BAD, ip="198.51.100.1")
         assert r.status_code == 429
@@ -86,8 +86,7 @@ async def test_lockout_production_values(  # noqa: PLR0915  (one scripted scenar
         assert 115_000 < pttl <= 120_000
 
         # Success after the lock deletes the level key.
-        await redis_admin_client.pexpire(AuthLimits.lock_key(ek("ann@example.com")), 1)
-        await asyncio.sleep(0.05)
+        await redis_admin_client.delete(AuthLimits.lock_key(ek("ann@example.com")))
         assert await redis_admin_client.get(AuthLimits.level_key(ek("ann@example.com"))) == b"2"
         assert (await h.login("ann@example.com", PW, ip="198.51.100.1")).status_code == 200
         assert await redis_admin_client.exists(AuthLimits.level_key(ek("ann@example.com"))) == 0
@@ -110,6 +109,14 @@ async def test_lockout_production_values(  # noqa: PLR0915  (one scripted scenar
         assert (a.status_code, b.status_code) == (429, 429)
         assert len(await lockouts(admin_db)) == before + 1
 
+        # Only failed attempts count toward the account limit (C63): ten sign-ins in a row are
+        # fine, and five failures after them are still 401.
+        await h.create_user("carl@example.com", password=PW)
+        for _ in range(10):
+            assert (await h.login("carl@example.com", PW, ip="198.51.100.4")).status_code == 200
+        await fail_n(h, "carl@example.com", 5, ip="198.51.100.5")
+        assert (await h.login("carl@example.com", PW, ip="198.51.100.5")).status_code == 429
+
         # 21 attempts from one IP over different emails → the 21st is 429 (login_ip).
         for i in range(20):
             r = await h.login(f"user{i}@example.com", BAD, ip="198.51.100.9")
@@ -128,3 +135,7 @@ async def test_lockout_production_values(  # noqa: PLR0915  (one scripted scenar
     assert limited["login_locked"] >= 1
     assert limited["login_account"] >= 3
     assert limited["login_ip"] == 1
+    signins = {a["outcome"]: v for a, v in otel_memory.metric_points("auth_signins")}
+    assert signins["success"] == 11  # ann once, carl ten times
+    assert signins["rate_limited"] >= 8
+    assert signins["failure"] >= 45

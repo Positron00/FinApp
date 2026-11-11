@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from bank_stub.settings import Settings
 from pycommon.settings import load_settings
@@ -56,11 +58,16 @@ def test_loads_c1_keys_and_ignores_database_url(monkeypatch: pytest.MonkeyPatch)
 def test_out_of_bounds_exits_2(
     monkeypatch: pytest.MonkeyPatch, caplog_json: JsonLogCapture, name: str, value: str
 ) -> None:
-    """PAY-605: rate and latency bounds → settings.invalid (names only) and exit 2."""
+    """PAY-605: rate and latency bounds → settings.invalid (names only) and exit 2.
+
+    The value is looked for in the logged fields without the timestamp: ``"1.5"`` against the
+    whole text failed whenever ``ts`` had seconds ending in 1 and milliseconds starting with 5
+    (a C61 flake)."""
     _env(monkeypatch, **{name: value})
     with pytest.raises(SystemExit) as exc:
         load_settings(Settings)
     assert exc.value.code == 2
     [event] = caplog_json.events("settings.invalid")
     assert event["fields"] == [name]
-    assert value not in caplog_json.text
+    logged = [{k: v for k, v in r.items() if k != "ts"} for r in caplog_json.records()]
+    assert value not in json.dumps(logged)

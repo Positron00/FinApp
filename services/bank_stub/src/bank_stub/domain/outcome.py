@@ -1,12 +1,14 @@
 """The deterministic outcome function and bank reference (design §3.4; PAY-412).
 
-The same key always gives the same outcome, whatever the replica, restart or body. Integer
-arithmetic only.
+The same key always gives the same outcome, whatever the replica, restart or body. The
+threshold is the exact PAY-412 comparison ``bucket < BANK_STUB_FAILURE_RATE * 10000`` in decimal
+arithmetic (no rounding, no binary-float error; C63).
 """
 
 from __future__ import annotations
 
 import hashlib
+from decimal import Decimal
 from typing import Final, Literal
 
 __all__ = ["BUCKETS", "Outcome", "bank_reference_for", "bucket_of", "decide_outcome"]
@@ -26,7 +28,8 @@ def bucket_of(key: str) -> int:
 def decide_outcome(key: str, account: str, failure_rate: float) -> Outcome:
     if account.endswith("0000"):
         return ("rejected", "account_closed")
-    if bucket_of(key) < round(failure_rate * BUCKETS):
+    # repr() is the shortest decimal that round-trips, i.e. the configured value ("0.05").
+    if bucket_of(key) < Decimal(repr(failure_rate)) * BUCKETS:
         return ("rejected", "insufficient_funds_at_bank")
     return ("settled", None)
 

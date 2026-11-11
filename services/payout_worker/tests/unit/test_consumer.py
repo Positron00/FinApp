@@ -113,9 +113,9 @@ class Rig:
     done: list[tuple[str, HandleResult]]
 
 
-def make_rig(handler: Any = None, **settings: Any) -> Rig:
+def make_rig(handler: Any = None, *, redis: FakeRedis | None = None, **settings: Any) -> Rig:
     s = make_settings(**settings)
-    redis = FakeRedis()
+    redis = redis or FakeRedis()
     metrics = make_metrics(s)
     done: list[tuple[str, HandleResult]] = []
 
@@ -250,17 +250,110 @@ async def test_ensure_group() -> None:
 
 
 async def test_slots() -> None:
-    """PAY-403: at most PAYOUT_CONCURRENCY handlers; a full pool waits for a release."""
-    slots = Slots(2)
-    await slots.acquire()
-    await slots.acquire()
-    assert (slots.free, slots.used) == (0, 2)
-    waiter = asyncio.create_task(slots.acquire())
+    """PAY-403, C63: reservations take free slots; a full pool waits for a release."""
+    slots = Slots(3)
+    assert await slots.reserve(2) == 2
+    assert await slots.reserve() == 1
+    assert (slots.free, slots.used) == (0, 3)
+    assert slots.try_reserve() == 0
+    waiter = asyncio.create_task(slots.reserve())
     await asyncio.sleep(0)
     assert not waiter.done()
-    await slots.release()
-    await asyncio.wait_for(waiter, 1)
+    await slots.release(2)
+    assert await asyncio.wait_for(waiter, 1) == 2
+    await slots.release(0)
     assert slots.free == 0
+
+
+async def test_slots_are_served_in_turn() -> None:
+    """C63: a queued reservation (the claim loop) is served before a later one (the reader),
+    so the reader re-reserving after each read can't starve the claim loop; a cancelled
+    waiter gives up its turn."""
+    slots = Slots(2)
+    assert await slots.reserve() == 2
+    cancelled = asyncio.create_task(slots.reserve())
+    first = asyncio.create_task(slots.reserve())
+    await asyncio.sleep(0)
+    second = asyncio.create_task(slots.reserve())
+    await asyncio.sleep(0)
+    cancelled.cancel()
+    await asyncio.gather(cancelled, return_exceptions=True)
+    assert slots.try_reserve() == 0  # someone is queued
+    await slots.release(2)
+    assert await asyncio.wait_for(first, 1) == 2
+    assert not second.done()
+    await slots.release(1)
+    assert await asyncio.wait_for(second, 1) == 1
+
+
+@dataclass
+class HoldingRedis(FakeRedis):
+    """Counts entries handed out (read with ``>`` or claimed) and not yet XACKed."""
+
+    held: int = 0
+    peak: int = 0
+    counts: list[int] = field(default_factory=list)
+
+    def _hand_out(self, n: int) -> None:
+        self.held += n
+        self.peak = max(self.peak, self.held)
+
+    async def xreadgroup(self, group: str, name: str, streams: dict[str, str], **kw: Any) -> Any:
+        self.counts.append(kw["count"])
+        resp = await super().xreadgroup(group, name, streams, **kw)
+        self._hand_out(sum(len(entries) for _, entries in resp))
+        return resp
+
+    async def xautoclaim(self, *a: Any, **kw: Any) -> Any:
+        self.counts.append(kw["count"])
+        resp = await super().xautoclaim(*a, **kw)
+        self._hand_out(len(resp[1]))
+        return resp
+
+    async def xack(self, stream: str, group: str, entry_id: str) -> int:
+        self.held -= 1
+        return await super().xack(stream, group, entry_id)
+
+
+async def test_never_holds_more_than_concurrency() -> None:
+    """C63, PAY-403: slots are reserved before each XREADGROUP/XAUTOCLAIM, which never ask for
+    more than the reservation, so the reader and the claim loop together never hold more than
+    PAYOUT_CONCURRENCY messages (an entry never waits for a slot after it is delivered)."""
+    gate = asyncio.Event()
+
+    class Gated:
+        async def handle(self, msg: StreamMessage, delivery: int) -> HandleResult:
+            await gate.wait()
+            return Ack("settled")
+
+    redis = HoldingRedis()
+    rig = make_rig(
+        handler=Gated(), redis=redis, payout_concurrency=2, payout_claim_interval_s=0.001
+    )
+    env = message().field("envelope")
+    assert env is not None
+    redis.new = [
+        [(b"1-0", {b"envelope": env}), (b"2-0", {b"envelope": env})],
+        [(b"3-0", {b"envelope": env})],
+    ]
+    redis.pending = {"4-0": 2}
+    redis.claims = [[b"0-0", [(b"4-0", {b"envelope": env})], []]]
+    stop = asyncio.Event()
+    runner = asyncio.create_task(rig.consumer.run(stop))
+    for _ in range(30):
+        await asyncio.sleep(0.01)
+    assert rig.consumer.in_flight == 2
+    assert redis.held == 2  # the claim loop and the reader wait: nothing read beyond the slots
+    gate.set()
+    for _ in range(200):
+        if len(rig.done) >= 4:
+            break
+        await asyncio.sleep(0.01)
+    stop.set()
+    await asyncio.wait_for(runner, 2)
+    assert sorted(eid for eid, _ in rig.done) == ["1-0", "2-0", "3-0", "4-0"]
+    assert redis.peak <= 2
+    assert all(1 <= c <= 2 for c in redis.counts)
 
 
 async def test_poll_gauges_once() -> None:

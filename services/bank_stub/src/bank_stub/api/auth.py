@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-import hmac
 import logging
+from hmac import compare_digest
 from typing import Annotated, Final
 
 from fastapi import Depends, Header, Request
@@ -33,7 +33,7 @@ async def require_api_key(
     expected = rt.settings.bank_stub_api_key.get_secret_value().encode()
     if x_api_key is None:
         reason = "missing"
-    elif hmac.compare_digest(x_api_key.encode(), expected):
+    elif compare_digest(x_api_key.encode(), expected):
         return
     else:
         reason = "mismatch"

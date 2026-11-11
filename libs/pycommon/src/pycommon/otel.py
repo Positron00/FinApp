@@ -14,6 +14,7 @@ os.environ.setdefault("OTEL_SEMCONV_STABILITY_OPT_IN", "http")
 import contextlib
 import logging
 import secrets
+import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
@@ -72,6 +73,7 @@ __all__ = [
     "Observation",
     "Telemetry",
     "build_resource",
+    "clear_gauge_callbacks",
     "context_from_traceparent",
     "histogram",
     "inject_traceparent",
@@ -335,17 +337,41 @@ def histogram(name: str, *, unit: str, description: str, buckets: Sequence[float
     )
 
 
+# One SDK instrument per (meter provider, gauge name); re-registering a name replaces its callback.
+_GAUGE_LOCK: Final = threading.Lock()
+_GAUGES: dict[tuple[Any, str], ObservableGauge] = {}
+_GAUGE_CALLBACKS: dict[tuple[Any, str], Callable[[], Observation]] = {}
+
+
 def observable_gauge(
     name: str, *, unit: str, description: str, callback: Callable[[], Observation]
 ) -> ObservableGauge:
     """Register a gauge whose ``callback`` runs at collection time on the reader thread (R26, C18).
 
     A raising callback logs ``metrics.gauge_query_failed`` and yields no observation that cycle.
+    Gauges never use unit ``"1"``: the Collector's Prometheus exporter would append ``_ratio`` to
+    the name (C63). Use a curly-brace annotation such as ``"{entry}"`` or ``"{state}"``.
+
+    Each name has one callback per meter provider: calling this again with the same name (a new
+    app instance in the same process) replaces the callback instead of registering a second,
+    silently ignored instrument.
     """
+    if unit == "1":
+        raise ValueError(f"gauge {name!r}: unit '1' adds a _ratio suffix in Prometheus (C63)")
+    key = (metrics.get_meter_provider(), name)
+    with _GAUGE_LOCK:
+        _GAUGE_CALLBACKS[key] = callback
+        existing = _GAUGES.get(key)
+    if existing is not None:
+        return existing
 
     def _observe(_options: CallbackOptions) -> Iterable[OtelObservation]:
+        with _GAUGE_LOCK:
+            current = _GAUGE_CALLBACKS.get(key)
+        if current is None:
+            return []
         try:
-            values = callback()
+            values = current()
         except Exception as exc:
             log_event(
                 _log,
@@ -357,9 +383,18 @@ def observable_gauge(
             return []
         return [OtelObservation(float(v), attributes=dict(labels)) for labels, v in values.items()]
 
-    return meter().create_observable_gauge(
+    gauge = meter().create_observable_gauge(
         name, callbacks=[_observe], unit=unit, description=description
     )
+    with _GAUGE_LOCK:
+        _GAUGES[key] = gauge
+    return gauge
+
+
+def clear_gauge_callbacks() -> None:
+    """Drop every registered gauge callback (``pycommon.testing`` calls this before each test)."""
+    with _GAUGE_LOCK:
+        _GAUGE_CALLBACKS.clear()
 
 
 def inject_traceparent() -> str | None:

@@ -376,3 +376,20 @@ async def test_real_wait_returns_on_wake() -> None:
     stop.set()
     await asyncio.wait_for(task, 2)
     assert len(repo.sent) == 1
+
+
+async def test_relay_logs_published_after_a_batch_with_sent_items(
+    fake_clock: FakeClock, caplog_json: JsonLogCapture
+) -> None:
+    """C63: a batch with sent > 0 logs outbox.relay.published {count, duration_ms}."""
+    batch = _items(3, "p")
+    repo = FakeRepo([batch])
+    fake = FakeRedis()
+    fake.fail_items = {1: ValueError("bad")}
+    loop, _ = _loop(repo, fake, fake_clock)
+    assert await loop.relay_once() == 2
+    (event,) = caplog_json.events("outbox.relay.published")
+    assert event["count"] == 2
+    assert isinstance(event["duration_ms"], int)
+    assert await loop.relay_once() == 0
+    assert len(caplog_json.events("outbox.relay.published")) == 1

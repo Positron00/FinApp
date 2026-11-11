@@ -8,7 +8,7 @@ from __future__ import annotations
 from fastapi import APIRouter, status
 from pycommon.errors import Forbidden
 
-from identity.api.deps import AdminActor, Runtime, UserCaller
+from identity.api.deps import AdminActor, ClientIp, Runtime, UserCaller
 from identity.api.responses import errors
 from identity.api.schemas import InviteUserIn, MeOut, UserOut
 from identity.usecases.invites import InviteCommand, invite_user
@@ -41,12 +41,13 @@ async def users_me(principal: UserCaller, rt: Runtime) -> MeOut:
     responses=errors(403, 409, 429),
     summary="Invite a user (admin)",
 )
-async def users_invite(body: InviteUserIn, actor: AdminActor, rt: Runtime) -> UserOut:
+async def users_invite(body: InviteUserIn, actor: AdminActor, rt: Runtime, ip: ClientIp) -> UserOut:
     cmd = InviteCommand(
         company_id=actor.company_id,
         actor_user_id=actor.user_id,
         email=body.email,
         name=body.name,
         roles=[str(r) for r in body.roles],
+        client_ip=ip,
     )
     return await invite_user(rt, cmd)

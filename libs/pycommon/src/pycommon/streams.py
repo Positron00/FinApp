@@ -191,6 +191,7 @@ class _BatchResult:
     sent: int
     failed: int
     error_type: str | None
+    duration_ms: int = 0
 
 
 class RelayLoop:
@@ -230,6 +231,7 @@ class RelayLoop:
         return (await self._relay_batch()).sent
 
     async def _relay_batch(self) -> _BatchResult:
+        started = self._clock.monotonic()
         async with self._sf() as session, session.begin():
             items = list(await self._repo.claim_unsent(session, limit=self._batch_size))
             if not items:
@@ -251,7 +253,16 @@ class RelayLoop:
                 await self._repo.mark_failed(session, group, error_type=error_type)
         failed = len(items) - len(sent)
         first_error = next(iter(failed_by_type), None)
-        return _BatchResult(len(items), len(sent), failed, first_error)
+        duration_ms = int((self._clock.monotonic() - started) * 1000)
+        if sent:
+            log_event(
+                _log,
+                logging.INFO,
+                "outbox.relay.published",
+                count=len(sent),
+                duration_ms=duration_ms,
+            )
+        return _BatchResult(len(items), len(sent), failed, first_error, duration_ms)
 
     def _next_backoff(self) -> float:
         delay = _rng.uniform(0, min(BACKOFF_BASE_S * 2**self._k, self._max_backoff))

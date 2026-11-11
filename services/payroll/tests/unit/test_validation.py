@@ -144,3 +144,30 @@ def test_result_invalid(body: dict[str, Any], issue: str) -> None:
     with pytest.raises(ValidationError) as err:
         ResultIn.model_validate(body)
     assert issue in _issues(err.value)
+
+
+@pytest.mark.parametrize(
+    ("model", "body"),
+    [
+        (EmployeeCreate, employee_body(name="Ada\x00Lovelace")),
+        (CompanySettingsIn, {**SETTINGS, "name": "Ac\x00me"}),
+        (CompanySettingsIn, {**SETTINGS, "timezone": "America/New\x00York"}),
+        (ResultIn, {"attempt": 1, "outcome": "settled", "bank_reference": "BR\x001"}),
+    ],
+    ids=["employee.name", "settings.name", "settings.timezone", "result.bank_reference"],
+)
+def test_nul_character_is_a_validation_error(model: Any, body: dict[str, Any]) -> None:
+    """PAY-602, C63: a NUL in a free-text field is 422 nul_character (Postgres text can't hold
+    it, so it would otherwise be a 500); the value is never echoed."""
+    with pytest.raises(ValidationError) as info:
+        model.model_validate(body)
+    assert "nul_character" in _issues(info.value)
+    assert "\x00" not in str([e.get("msg") for e in info.value.errors()])
+
+
+def test_result_attempt_fits_smallint() -> None:
+    """PAY-405, C63: attempt ≤ 32767 (payout_attempts.attempt is smallint), so it's 422, not 500."""
+    assert ResultIn.model_validate({"attempt": 32767, "outcome": "indeterminate"}).attempt == 32767
+    with pytest.raises(ValidationError) as info:
+        ResultIn.model_validate({"attempt": 32768, "outcome": "indeterminate"})
+    assert _issues(info.value) == {"less_than_equal"}

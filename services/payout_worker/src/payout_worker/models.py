@@ -24,6 +24,7 @@ from pydantic import (
     Field,
     SecretStr,
     ValidationError,
+    field_validator,
     model_validator,
 )
 
@@ -53,6 +54,10 @@ __all__ = [
 
 TRACEPARENT_PATTERN: Final = r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$"
 REASON_PATTERN: Final = r"^[a-z0-9_]{1,100}$"
+ROUTING_PATTERN: Final = r"^\d{9}$"
+ACCOUNT_PATTERN: Final = r"^\d{4,17}$"
+_ROUTING_RE: Final = re.compile(r"[0-9]{9}")
+_ACCOUNT_RE: Final = re.compile(r"[0-9]{4,17}")
 SCHEMA_RELATIVE_PATH: Final = Path("contracts/events/payout.requested.v1.json")
 _TRACEPARENT_RE: Final = re.compile(TRACEPARENT_PATTERN)
 _RECEIVED = ConfigDict(extra="ignore", frozen=True)
@@ -153,7 +158,7 @@ def _partial(raw: object, entry_event_id: bytes | None) -> InvalidMessage:
         if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt >= 1
         else None,
         company_id=_uuid(d.get("company_id")),
-        traceparent=tp if isinstance(tp, str) and _TRACEPARENT_RE.match(tp) else None,
+        traceparent=tp if isinstance(tp, str) and _TRACEPARENT_RE.fullmatch(tp) else None,
     )
 
 
@@ -188,6 +193,23 @@ class Instruction(BaseModel):
     routing: SecretStr  # never logged, never in spans
     account: SecretStr
     requested_at: AwareDatetime
+
+    # The bank's patterns, checked here so a bad snapshot is a malformed payroll response
+    # (``PayrollRejected("malformed_response")``, raised ``from None``) and never a
+    # ValidationError with the digits in its text (C63, PAY-NFR-07). The messages are fixed.
+    @field_validator("routing")
+    @classmethod
+    def _routing(cls, v: SecretStr) -> SecretStr:
+        if not _ROUTING_RE.fullmatch(v.get_secret_value()):
+            raise ValueError("routing must be 9 digits")
+        return v
+
+    @field_validator("account")
+    @classmethod
+    def _account(cls, v: SecretStr) -> SecretStr:
+        if not _ACCOUNT_RE.fullmatch(v.get_secret_value()):
+            raise ValueError("account must be 4 to 17 digits")
+        return v
 
 
 class ResultRequest(BaseModel):
@@ -231,8 +253,8 @@ class TransferRequest(BaseModel):
 
     amount_cents: int = Field(gt=0)  # the instruction's amount, never the event's
     currency: Literal["USD"]
-    routing: str = Field(pattern=r"^\d{9}$")
-    account: str = Field(pattern=r"^\d{4,17}$")
+    routing: str = Field(pattern=ROUTING_PATTERN)
+    account: str = Field(pattern=ACCOUNT_PATTERN)
 
     def __repr_args__(self) -> Any:  # routing and account never reach a repr (PAY-NFR-07)
         for name, value in super().__repr_args__():

@@ -11,8 +11,7 @@ from typing import Any, Self
 
 import pytest
 import redis.exceptions
-from identity.limits import AuthLimits
-from identity.metrics import create_metrics
+from identity.limits import AuthLimits, LoginGate
 from pycommon.errors import ServiceUnavailable
 from pycommon.testing import FakeClock, JsonLogCapture, OtelMemory
 
@@ -76,6 +75,7 @@ class FakeRedis:
         return self.ttl_ms.get(key, -2) if key in self.data else -2
 
     async def get(self, key: str) -> bytes | None:
+        self._check("get")
         return self.data.get(key)
 
     async def set(self, key: str, value: str, nx: bool = False, ex: int | None = None) -> bool:
@@ -95,12 +95,31 @@ class FakeRedis:
 
 
 def make_limits(r: FakeRedis) -> AuthLimits:
-    return AuthLimits(r, make_settings(), create_metrics(), clock=FakeClock())  # type: ignore[arg-type]
+    return AuthLimits(r, make_settings(), clock=FakeClock())  # type: ignore[arg-type]
 
 
 async def exhaust(limits: AuthLimits) -> None:
+    """Five failed attempts (each gate allowed, then counted)."""
     for _ in range(5):
-        assert (await limits.check_login("ip", EK)).allowed
+        gate = await limits.check_login("ip", EK)
+        assert gate.allowed
+        await limits.record_failure(gate)
+
+
+async def test_only_failed_attempts_count_toward_the_account_limit() -> None:
+    """PAY-104, C63: allowed attempts that aren't recorded as failures never lock; the failure
+    counter is pycommon's login_account key for the level-scoped subject."""
+    r = FakeRedis()
+    limits = make_limits(r)
+    for _ in range(10):
+        gate = await limits.check_login("ip-ok", EK)
+        assert gate.allowed
+        assert gate.account_subject == f"{EK}:0"
+    assert AuthLimits.lock_key(EK) not in r.data
+    await limits.record_failure(gate)
+    assert r.data[limits.account_counter_key(f"{EK}:0")] == b"1"
+    await limits.record_failure(LoginGate(False, "login_ip", 5))  # nothing to count
+    assert r.data[limits.account_counter_key(f"{EK}:0")] == b"1"
 
 
 async def test_lock_starts_after_five_and_level_counts_restart() -> None:
@@ -139,7 +158,7 @@ async def test_concurrent_lock_is_reported_not_restarted() -> None:
     )
 
 
-@pytest.mark.parametrize("op", ["pipeline", "set"])
+@pytest.mark.parametrize("op", ["pipeline", "get", "set"])
 async def test_redis_errors_fail_closed(
     op: str, otel_memory: OtelMemory, caplog_json: JsonLogCapture
 ) -> None:
@@ -148,6 +167,7 @@ async def test_redis_errors_fail_closed(
     limits = make_limits(r)
     if op == "set":
         await exhaust(limits)
+
     r.fail.add(op)
     for _ in range(2):
         with pytest.raises(ServiceUnavailable):

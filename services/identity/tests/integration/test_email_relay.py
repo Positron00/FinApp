@@ -6,8 +6,11 @@ import asyncio
 from typing import Any
 from uuid import UUID
 
+import pytest
+from identity import metrics as metrics_mod
 from identity.email.relay import EmailRelay
 from identity.email.smtp import SmtpSender
+from identity.metrics import EMAILS_OLDEST_PENDING_AGE, EMAILS_PENDING
 from pycommon.db import new_id
 from pycommon.testing import JsonLogCapture, OtelMemory
 
@@ -16,6 +19,7 @@ from tests.integration.conftest import (
     FakeSmtp,
     Harness,
     HarnessFactory,
+    free_port,
     text_of,
     token_in,
     wait_until,
@@ -125,8 +129,8 @@ async def test_exhausted_email_is_failed_and_counted(
 async def test_open_breaker_does_not_count_an_attempt(
     harness: HarnessFactory, smtp_server: FakeSmtp, admin_db: Any
 ) -> None:
-    """PAY-110: when the breaker is open the claim's attempt is given back and the row waits
-    BREAKER_RESET_S."""
+    """PAY-110, C31, C63: when the breaker is open the claim's attempt is given back, the row
+    waits BREAKER_RESET_S, and no token is issued (expires_at stays NULL)."""
     async with harness(sender="smtp", breaker_failures=1, breaker_reset_s=300) as h:
         admin = await h.create_user("admin@example.com", password=PW)
         await invite(h, admin)
@@ -145,6 +149,10 @@ async def test_open_breaker_does_not_count_an_attempt(
         second["id"],
     )
     assert 250 < wait <= 300
+    issued = await admin_db.fetchrow(
+        "SELECT token_hash, expires_at FROM identity.invites WHERE id = $1", second["invite_id"]
+    )
+    assert (issued["token_hash"], issued["expires_at"]) == (None, None)
 
 
 async def test_two_relays_never_send_a_row_twice(
@@ -239,3 +247,45 @@ async def test_no_column_holds_the_token_or_link(harness: HarnessFactory, admin_
         )
         assert token not in dump
         assert "#token=" not in dump
+
+
+def gauge(otel_memory: OtelMemory, name: str) -> float:
+    [(_, value)] = otel_memory.metric_points(name)
+    return float(value)
+
+
+async def test_email_gauges_are_computed_at_collection(
+    harness: HarnessFactory,
+    admin_db: Any,
+    otel_memory: OtelMemory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PAY-110, R26, C63: identity_emails_pending and identity_email_oldest_pending_age_seconds
+    are queried at collection time: 0 with an empty outbox, the count and age while emails wait,
+    and 0 again once they're sent."""
+    monkeypatch.setattr(metrics_mod, "STATS_REUSE_S", 0.0)
+    async with harness() as h:
+        assert gauge(otel_memory, EMAILS_PENDING) == 0
+        assert gauge(otel_memory, EMAILS_OLDEST_PENDING_AGE) == 0
+        admin = await h.create_user("admin@example.com", password=PW)
+        await invite(h, admin)
+        await invite(h, admin, email="cy@example.com")
+        await admin_db.execute(
+            "UPDATE identity.email_outbox SET created_at = now() - interval '20 minutes'"
+        )
+        assert gauge(otel_memory, EMAILS_PENDING) == 2
+        assert 1190 < gauge(otel_memory, EMAILS_OLDEST_PENDING_AGE) < 1300
+        await h.rt.relay.run_once()
+        assert gauge(otel_memory, EMAILS_PENDING) == 0
+        assert gauge(otel_memory, EMAILS_OLDEST_PENDING_AGE) == 0
+
+
+async def test_email_gauge_failure_yields_no_point(
+    harness: HarnessFactory, otel_memory: OtelMemory, caplog_json: JsonLogCapture
+) -> None:
+    """PAY-110, R26: when the gauge query fails, that cycle reports nothing and logs
+    metrics.gauge_query_failed (class only)."""
+    async with harness(db_port=free_port(), identity_gauge_query_timeout_ms=500):
+        assert otel_memory.metric_points(EMAILS_PENDING) == []
+    [failed, *_] = caplog_json.events("metrics.gauge_query_failed")
+    assert failed["gauge"] in {EMAILS_PENDING, EMAILS_OLDEST_PENDING_AGE}

@@ -98,6 +98,20 @@ async def test_purge_audit_log_deletes_only_older_rows(migrated: PgBootstrapped)
         await conn.close()
 
 
+async def test_purge_audit_log_clamps_the_cutoff(migrated: PgBootstrapped) -> None:
+    """C50, C63: a future (or any recent) cutoff is clamped to now() - 400 days, so the runtime
+    role can't wipe recent entries through the definer-rights function."""
+    conn = await connect(migrated, "identity_app")
+    try:
+        await _insert_audit(conn, "now() - interval '399 days'")
+        await _insert_audit(conn, "now()")
+        for cutoff in ("'infinity'::timestamptz", "now() + interval '1 day'", "now()"):
+            assert await conn.fetchval(f"SELECT identity.purge_audit_log({cutoff})") == 0
+        assert await conn.fetchval("SELECT count(*) FROM identity.audit_log") == 2
+    finally:
+        await conn.close()
+
+
 async def test_purge_function_is_not_public(admin_db: Any) -> None:
     """C50: only identity_app (and the owner) can execute the purge function."""
     acl = await admin_db.fetchval(

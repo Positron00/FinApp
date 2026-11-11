@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 from typing import Any
 from uuid import UUID
 
@@ -9,7 +10,8 @@ from pycommon.settings import BaseServiceSettings
 from pydantic import SecretStr
 
 COMPANY_ID = UUID("0193a000-0000-7000-8000-000000000001")
-STRONG_SECRET = "s3cr3t-Value-For-Tests-0123456789"
+# Built at runtime (testing.md §9, C63): no credential-shaped literal in the repo.
+STRONG_SECRET = secrets.token_urlsafe(24)
 
 
 class SvcSettings(BaseServiceSettings):

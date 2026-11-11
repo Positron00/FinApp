@@ -100,6 +100,8 @@ def parse_args(argv: Sequence[str]) -> BootstrapArgs:
     name = str(ns.name).strip()
     if not 1 <= len(name) <= 200:
         raise InvalidArgsError("--name must be 1-200 characters")
+    if "\x00" in name:
+        raise InvalidArgsError("--name contains a NUL character")
     pw_env = ns.password_env
     if pw_env is not None and not pw_env.strip():
         raise InvalidArgsError("--password-env is empty")
@@ -153,6 +155,7 @@ async def bootstrap(
             log_event(_log, logging.WARNING, "identity.bootstrap.refused", company_id=str(cid))
             return EXIT_REFUSED, None
         active = password_hash is not None
+        email_id = None
         owner = await users.insert(
             cid=cid,
             email=args.email,
@@ -169,7 +172,7 @@ async def bootstrap(
             mode = "password"
         else:
             invite_id = await InviteRepo(session).insert(cid=cid, user_id=owner.id, created_by=None)
-            await OutboxRepo(session).queue(
+            email_id = await OutboxRepo(session).queue(
                 cid=cid, template="invite", recipient=owner.email, invite_id=invite_id
             )
             mode = "invite"
@@ -187,6 +190,15 @@ async def bootstrap(
         company_id=str(cid),
         mode=mode,
     )
+    if email_id is not None:
+        log_event(
+            _log,
+            logging.INFO,
+            "email.queued",
+            email_id=str(email_id),
+            template="invite",
+            user_id=str(owner.id),
+        )
     return EXIT_OK, owner.id
 
 

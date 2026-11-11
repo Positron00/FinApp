@@ -417,7 +417,9 @@ export interface operations {
     users_invite: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                "X-Client-IP"?: string | null;
+            };
             path?: never;
             cookie?: never;
         };

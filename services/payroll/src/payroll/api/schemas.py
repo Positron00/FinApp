@@ -10,6 +10,7 @@ from typing import Annotated, Any, Literal, Self
 from uuid import UUID
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     EmailStr,
@@ -45,7 +46,16 @@ __all__ = [
 
 IDEM_KEY_PATTERN = r"^[A-Za-z0-9._:-]{1,200}$"
 
-Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+
+def _no_nul(v: str) -> str:
+    """Postgres ``text`` can't hold U+0000: reject it as a 422, never a 500 (PAY-602, C63)."""
+    if "\x00" in v:
+        raise PydanticCustomError("nul_character", "The value must not contain a NUL character.")
+    return v
+
+
+NoNul = AfterValidator(_no_nul)
+Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200), NoNul]
 Email = Annotated[EmailStr, StringConstraints(max_length=320)]
 SalaryCents = Annotated[int, Field(ge=1, le=1_000_000_000)]
 RateCents = Annotated[int, Field(ge=1, le=100_000)]
@@ -78,7 +88,7 @@ class CompanySettingsIn(BaseModel):
     name: Name
     tax_rate_bps: Annotated[int, Field(ge=0, le=5000)]
     retirement_bps: Annotated[int, Field(ge=0, le=2000)]
-    timezone: Annotated[str, StringConstraints(min_length=1, max_length=64)]
+    timezone: Annotated[str, StringConstraints(min_length=1, max_length=64), NoNul]
     biweekly_anchor: date
     require_dual_approval: bool
 
@@ -291,13 +301,13 @@ class InstructionOut(BaseModel):
 
 
 Reason = Annotated[str, StringConstraints(pattern=r"^[a-z0-9_]{1,100}$")]
-BankReference = Annotated[str, StringConstraints(min_length=1, max_length=64)]
+BankReference = Annotated[str, StringConstraints(min_length=1, max_length=64), NoNul]
 
 
 class ResultIn(BaseModel):
     model_config = _REQUEST
 
-    attempt: Annotated[int, Field(ge=1)]
+    attempt: Annotated[int, Field(ge=1, le=32767)]  # payout_attempts.attempt is smallint (C63)
     outcome: Literal["settled", "rejected", "indeterminate", "poison"]
     reason: Reason | None = None
     bank_reference: BankReference | None = None

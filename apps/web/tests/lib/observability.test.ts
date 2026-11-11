@@ -74,6 +74,9 @@ describe("logger (§7.1)", () => {
       token: "t",
       note_len: 4,
       user_id_hash: "abc",
+      password_hash: "ph",
+      token_hash: "th",
+      session_len: 9,
     });
     const line = t.logs.lines.at(-1)! as Record<string, unknown>;
     for (const k of [
@@ -92,6 +95,10 @@ describe("logger (§7.1)", () => {
       "api_key",
       "secret",
       "token",
+      // C63: the allow-list is exact names, not suffixes.
+      "password_hash",
+      "token_hash",
+      "session_len",
     ]) {
       expect(line[k]).toBe(REDACTED);
     }

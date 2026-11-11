@@ -8,9 +8,11 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from identity.domain.ip import ip_hash
+from pycommon.testing import JsonLogCapture
 
-from tests.helpers import COMPANY_ID
-from tests.integration.conftest import Harness, HarnessFactory, token_in
+from tests.helpers import AUDIT_KEY, COMPANY_ID
+from tests.integration.conftest import CLIENT_IP, Harness, HarnessFactory, token_in
 
 PW = "correct horse battery staple"
 NEW_PW = "a brand new passphrase"
@@ -22,7 +24,8 @@ async def invite(
     return await h.client.post(
         "/v1/users/invite",
         json={"email": email, "name": "  Bea  ", "roles": list(roles)},
-        headers=h.user_headers(admin, ("admin",)),
+        # The BFF sends X-Client-IP on every identity call when it knows the IP (C16).
+        headers={**h.user_headers(admin, ("admin",)), "X-Client-IP": CLIENT_IP},
     )
 
 
@@ -36,7 +39,8 @@ async def test_invite_creates_pending_user_invite_and_outbox_row(
     harness: HarnessFactory, admin_db: Any
 ) -> None:
     """PAY-101, C11: 201 UserOut (pending, pending_invite_id), a pending outbox row with no
-    token, and audit user.invited; the invite's expires_at is NULL until sent (C31)."""
+    token, and audit user.invited with the client's ip_hash (PAY-NFR-08); the invite's
+    expires_at is NULL until sent (C31)."""
     async with harness() as h:
         admin = await h.create_user("admin@example.com", password=PW)
         r = await invite(h, admin, roles=("payroll_admin", "approver"))
@@ -59,6 +63,7 @@ async def test_invite_creates_pending_user_invite_and_outbox_row(
     audit = await admin_db.fetchrow("SELECT * FROM identity.audit_log WHERE event = 'user.invited'")
     assert audit["actor_user_id"] == admin
     assert str(audit["target_user_id"]) == body["id"]
+    assert audit["ip_hash"] == ip_hash(CLIENT_IP, AUDIT_KEY.encode())
 
 
 async def test_duplicate_email_is_409_case_insensitive(harness: HarnessFactory) -> None:
@@ -94,12 +99,23 @@ async def test_duplicate_email_is_409_case_insensitive(harness: HarnessFactory) 
             "body.name",
             "string_too_short",
         ),
+        (
+            {"email": "a@b.example", "name": "A\x00B", "roles": ["admin"]},
+            "body.name",
+            "invalid_character",
+        ),
+        (
+            {"email": "a\x00@b.example", "name": "A", "roles": ["admin"]},
+            "body.email",
+            "invalid_character",
+        ),
     ],
 )
 async def test_invite_validation(
     harness: HarnessFactory, body: dict[str, object], field: str, issue: str
 ) -> None:
-    """PAY-101, PAY-602: empty, unknown or duplicate roles, bad email or name → 422."""
+    """PAY-101, PAY-602, C63: empty, unknown or duplicate roles, bad email or name, and NUL
+    characters → 422 (the input is never echoed)."""
     async with harness() as h:
         admin = await h.create_user("admin@example.com", password=PW)
         r = await h.client.post(
@@ -109,8 +125,11 @@ async def test_invite_validation(
     assert {"field": field, "issue": issue} in r.json()["error"]["details"]
 
 
-async def test_non_admin_is_403_even_with_a_stale_admin_jwt(harness: HarnessFactory) -> None:
-    """PAY-101, PAY-601: the admin check reads the DB roles and status, not the JWT."""
+async def test_non_admin_is_403_even_with_a_stale_admin_jwt(
+    harness: HarnessFactory, caplog_json: JsonLogCapture
+) -> None:
+    """PAY-101, PAY-601: the admin check reads the DB roles and status, not the JWT, and each
+    denial logs auth.forbidden (reason db_role)."""
     async with harness() as h:
         approver = await h.create_user("ap@example.com", password=PW, roles=("approver",))
         gone = await h.create_user("gone@example.com", password=PW, status="inactive")
@@ -120,6 +139,8 @@ async def test_non_admin_is_403_even_with_a_stale_admin_jwt(harness: HarnessFact
             r = await invite(h, uid)
             assert r.status_code == 403
             assert r.json()["error"]["code"] == "forbidden_role"
+    denied = caplog_json.events("auth.forbidden")
+    assert [(e["reason"], e["route"]) for e in denied] == [("db_role", "/v1/users/invite")] * 4
 
 
 async def test_accept_activates_and_returns_session_user(
@@ -168,15 +189,18 @@ async def test_resend_moves_expiry_forward(harness: HarnessFactory, admin_db: An
         admin = await h.create_user("admin@example.com", password=PW)
         await invite(h, admin)
         first = await send_and_get_token(h)
-        before = await admin_db.fetchval("SELECT expires_at FROM identity.invites")
+        # Age the first send by a minute instead of sleeping, so the re-send is visibly later.
+        before = await admin_db.fetchval(
+            "UPDATE identity.invites SET token_issued_at = token_issued_at - interval '1 minute', "
+            "expires_at = expires_at - interval '1 minute' RETURNING expires_at"
+        )
         await admin_db.execute(
             "UPDATE identity.email_outbox SET status = 'pending', next_attempt_at = now()"
         )
-        await asyncio.sleep(0.01)
         second = await send_and_get_token(h)
         after = await admin_db.fetchval("SELECT expires_at FROM identity.invites")
         assert second != first
-        assert after > before
+        assert after - before >= timedelta(seconds=59)
         assert (await h.accept(first, NEW_PW)).json()["error"]["code"] == "invite_invalid"
         assert (await h.accept(second, NEW_PW)).status_code == 200
 

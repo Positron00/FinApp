@@ -9,7 +9,8 @@
   },
   "scripts": {
     "generate": "openapi-typescript ../../services/identity/openapi.json -o src/generated/identity.ts && openapi-typescript ../../services/payroll/openapi.json -o src/generated/payroll.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check": "pnpm generate && git diff --exit-code -- src/generated"
   },
   "dependencies": {
     "openapi-fetch": "0.17.0"

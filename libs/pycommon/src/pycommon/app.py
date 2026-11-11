@@ -27,7 +27,13 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from pycommon import otel
 from pycommon.auth import Principal, TokenVerifier, authenticate
 from pycommon.db import create_engine, session_factory
-from pycommon.errors import PayloadTooLarge, error_response, install_handlers, unhandled_response
+from pycommon.errors import (
+    PayloadTooLarge,
+    db_error_response,
+    error_response,
+    install_handlers,
+    unhandled_response,
+)
 from pycommon.health import (
     HEALTH_PATHS,
     HealthCheck,
@@ -122,7 +128,8 @@ class RequestContextMiddleware:
         except Exception as exc:
             if response_started:
                 raise
-            response = unhandled_response(exc)
+            # A driver error that escaped the DB handlers (e.g. a refused connect) is still 503.
+            response = db_error_response(Request(scope), exc) or unhandled_response(exc)
             await response(scope, receive, send_wrapper)
         finally:
             path = scope.get("path", "")
@@ -269,11 +276,10 @@ class _Lifecycle:
     sa_instrumentor: Any = None
 
     def _run_checks(self, app: FastAPI) -> None:
-        checks: list[StartupCheck] = list(self.startup_checks)
-        if self.use_jwt:
-            checks.append(_jwt_keys_check)
+        # A missing JWT keyset refuses start in every env (C63): no route could authenticate.
+        fatal: list[StartupCheck] = [_jwt_keys_check] if self.use_jwt else []
         try:
-            run_startup_checks(self.settings, checks)
+            run_startup_checks(self.settings, self.startup_checks, fatal=fatal)
         except SystemExit as exc:
             app.state.startup_exit_code = exc.code
             raise

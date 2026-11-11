@@ -1,8 +1,8 @@
 # Requirements: PayRun 0.1.0
 
 Each requirement has an ID, a statement, acceptance criteria and a check. All are "must" unless
-marked "should". The source is the [architecture plan](../../plan/architecture-plan.md) (v1.2,
-accepted 2026-11-10); plan sections are cited as "plan §n". Each limit and default lives in
+marked "should". The source is the [architecture plan](../../plan/architecture-plan.md) (v1.3;
+v1.2 accepted 2026-11-10); plan sections are cited as "plan §n". Each limit and default lives in
 exactly one requirement; others refer to it by ID.
 
 **Terms:**
@@ -55,7 +55,7 @@ exactly one requirement; others refer to it by ID.
 - Acceptance:
   - A wrong password or unknown email returns 401 `invalid_credentials`, with the same response shape. argon2 always runs, so the median latency of unknown-email and wrong-password logins differs by no more than 20% (integration `test_login_timing`).
   - An inactive user gets the same 401.
-  - The limits are `AUTH_LOGIN_LIMIT_ACCOUNT` (5 / 15 min) and `AUTH_LOGIN_LIMIT_IP` (20 / 15 min). Past them the response is 429 `rate_limited` with `Retry-After`, and the account locks with exponential backoff (1 min doubling to 60 min).
+  - The limits are `AUTH_LOGIN_LIMIT_ACCOUNT` (5 **failed** attempts / 15 min; a successful sign-in doesn't count) and `AUTH_LOGIN_LIMIT_IP` (20 attempts of any outcome / 15 min) (C63). Past them the response is 429 `rate_limited` with `Retry-After`, and the account locks with exponential backoff (1 min doubling to 60 min).
   - Audit `auth.signin.succeeded` or `auth.signin.failed`, with `ip_hash` (PAY-NFR-08).
 - Check: unit, integration (identity: `test_lockout_production_values`), e2e.
 
@@ -408,9 +408,11 @@ When Redis is unavailable, login, reset and invite-accept fail closed (503 `serv
   - a key ID starts with `dev-` or `test-`;
   - debug or docs are on;
   - `BANK_BASE_URL` points at bank-stub or a placeholder (prod);
-  - the timing invariants on `PAYOUT_CLAIM_MIN_IDLE_MS` and `PAYOUT_REPUBLISH_AFTER_S` fail (plan §2.2).
+  - the timing invariants on `PAYOUT_CLAIM_MIN_IDLE_MS`, `PAYOUT_REPUBLISH_AFTER_S` and `PAYOUT_MARK_REJECTED_MIN_WAIT_S` (> `BANK_TOTAL_DEADLINE_S` + 2 × `PAYOUT_PAYROLL_CALL_DEADLINE_S` + 10 + 30 s; C48) fail (plan §2.2);
+  - bank-stub is started with `ENV=prod` (reason `not_deployable`; C47);
+  - the web gets `TRUSTED_PROXY_HOPS` < 1 (`config.invalid`; C62).
 
-  They log `startup.check_failed` with the failing setting's name (never its value), and exit 2.
+  They log `startup.check_failed` (the web: `config.invalid`) with the failing setting's name (never its value), and exit 2. A missing `INTERNAL_JWT_PUBLIC_KEYS` on a service with JWT routes exits 2 in **every** env, dev included (C63).
 - Acceptance: each listed condition, set in a uat-like env, stops start-up with exit 2; `/readyz` returns 503 within 5 s of the DB or Redis going down.
 - Check: pycommon unit `test_startup_checks.py`, integration (`test_readyz`).
 
@@ -434,12 +436,13 @@ When Redis is unavailable, login, reset and invite-accept fail closed (503 `serv
 - it creates `approver@payrun.example.com` (approver) and `LOAD_USER_EMAIL` (payroll_admin) via invite and accept;
 - it sets the company settings (tax 2000 bps, retirement 500 bps; the migration seeds 0/0);
 - it creates employees: by default 10 (salaried and hourly, one with an account ending `0000`), or 500 with `--employees 500`;
-- `--skeleton` (S8) creates only 5 salaried monthly employees, one calculated monthly run and one draft run, and makes no settings PUT;
-- it prints a JSON summary (user IDs, employee count, run IDs) that k6 and e2e read;
+- `--skeleton` (S8) creates only 5 salaried monthly employees and makes no settings PUT;
+- **both modes** make sure a calculated monthly run for the current month and a draft monthly run for the next month exist (C33, C54);
+- it prints a JSON summary that k6 and e2e read: `mode`, `company_id`, `users` (`owner`, `approver`, `load`), `employees` (the total) and `runs` (`current`, `draft`: the two run IDs);
 - `scripts/mint_token.py` (CLI and importable `mint()`) and the Schemathesis hook `scripts/ci/schemathesis_auth.py` mint a fresh token per request, since tokens expire in 60 s.
 
 The `bootstrap-owner` Compose one-shot runs `bootstrap_owner --if-empty --password-env SEED_OWNER_PASSWORD`, so the dev owner is active, and seed signs in as it.
-- Acceptance: a re-run is a no-op (same counts); it exits 2 when `ENV` isn't dev; the JSON summary validates.
+- Acceptance: a re-run is a no-op (the same user and run IDs and counts); it exits 2 when `ENV` isn't dev; the JSON summary validates, and in skeleton mode `runs.current` is `calculated` and `runs.draft` is `draft`.
 - Check: `tests/platform/test_seed.py` against the stack, plus the e2e global setup.
 
 ## 7. Non-functional
@@ -538,12 +541,12 @@ A deny-list redactor in pycommon and the BFF masks keys named `password`, `token
 - **Images** are built for `linux/amd64` in CI.
 - Check: the `manifests` and `e2e` CI jobs.
 
+**PAY-NFR-14 Accessibility (should).** The main pages (login, dashboard, employees, run detail, payouts) have no serious or critical axe violations.
+- Check: e2e with `@axe-core/playwright`.
+
 **PAY-NFR-15 Recovery and startup (must).**
 - Recovery point objective 5 min (managed Postgres point-in-time recovery in prod) and recovery time objective 1 h.
 - Redis AOF means queued payouts survive a restart.
 - Each service reports ready within 20 s after its migrations finish.
 - Acceptance: in Compose, restarting Redis mid-run loses no payout (the run completes); each service's `/readyz` turns 200 within 20 s of its container start, once the migrations are done.
 - Check: resilience `test_redis_restart.py`; e2e start-up timing recorded by `stack.sh up`.
-
-**PAY-NFR-14 Accessibility (should).** The main pages (login, dashboard, employees, run detail, payouts) have no serious or critical axe violations.
-- Check: e2e with `@axe-core/playwright`.

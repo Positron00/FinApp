@@ -117,6 +117,9 @@ class CapturingSender:
     def __init__(self) -> None:
         self.messages: list[EmailMessage] = []
 
+    def available(self) -> bool:
+        return True
+
     async def send(self, msg: EmailMessage) -> None:
         self.messages.append(msg)
 

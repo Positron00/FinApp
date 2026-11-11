@@ -55,6 +55,7 @@ def build_app(
                 maxlen=s.stream_maxlen,
                 batch_size=s.payroll_outbox_batch,
                 poll_ms=s.payroll_outbox_poll_ms,
+                validate=s.payroll_validate_events,
             )
             if relay
             else None
