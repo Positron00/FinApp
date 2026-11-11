@@ -53,7 +53,7 @@ exactly one requirement; others refer to it by ID.
 
 **PAY-104 Sign in (must).** `POST /api/auth/login {email, password}` makes the BFF call identity `POST /v1/auth/login`. On success the BFF creates a session.
 - Acceptance:
-  - A wrong password or unknown email returns 401 `invalid_credentials`, with the same response shape and timing class (argon2 always runs).
+  - A wrong password or unknown email returns 401 `invalid_credentials`, with the same response shape. argon2 always runs, so the median latency of unknown-email and wrong-password logins differs by no more than 20% (integration `test_login_timing`).
   - An inactive user gets the same 401.
   - The limits are `AUTH_LOGIN_LIMIT_ACCOUNT` (5 / 15 min) and `AUTH_LOGIN_LIMIT_IP` (20 / 15 min). Past them the response is 429 `rate_limited` with `Retry-After`, and the account locks with exponential backoff (1 min doubling to 60 min).
   - Audit `auth.signin.succeeded` or `auth.signin.failed`, with `ip_hash` (PAY-NFR-08).
@@ -70,17 +70,20 @@ exactly one requirement; others refer to it by ID.
 - Check: integration, e2e.
 
 **PAY-106 Sessions (must).**
-- **Storage:** sessions live in Redis at `web:sess:<HMAC-SHA256(SESSION_SECRET, 256-bit cookie id)>` holding `{user_id, cid, roles, roles_version, created_at, last_seen, roles_checked_at}`. The idle TTL is `SESSION_IDLE_TTL_S` (43200) and the absolute TTL `SESSION_ABS_TTL_S` (604800). Each session is also indexed in `web:user-sess:<user_id>`.
+- **Storage:** sessions live in Redis at `web:sess:<HMAC-SHA256(SESSION_SECRET, 256-bit cookie id)>` holding `{user_id, cid, name, roles, roles_version, created_at, last_seen, roles_checked_at}`. The idle TTL is `SESSION_IDLE_TTL_S` (43200) and the absolute TTL `SESSION_ABS_TTL_S` (604800). Each session is also indexed in `web:user-sess:<user_id>`.
 - **Cookie:** `sid` in dev and `__Host-sid` in prod; HttpOnly, Secure, SameSite=Lax.
 - **Rotation:** a new ID at sign-in.
 - **Sign-out** deletes the session.
 - Acceptance:
   - Requests without a session cookie: pages redirect to `/login`, and `/api/*` returns 401 `unauthenticated`.
   - An expired session behaves the same as a missing one.
-- Check: Vitest (`session.test.ts`), e2e.
+  - With Redis unavailable, session-protected routes return 503 `service_unavailable`.
+- Check: Vitest (`session.test.ts`), e2e, resilience (Redis down).
 
 **PAY-107 Role and status re-check (must).** `requireSession()` re-reads `GET /v1/users/me` when `roles_checked_at` is older than `SESSION_ROLE_RECHECK_S` (60). It ends the session when `roles_version` differs or the status isn't `active`.
-- Acceptance: a demoted user's next mutation more than 60 s after the change returns 401 (session ended), or 403 when the roles shrank but the session was refreshed.
+- Acceptance:
+  - While identity is reachable, a user demoted or deactivated at time T gets 401 (session ended) on any request after T + 60 s.
+  - While identity is unreachable, the BFF keeps the cached roles for up to `SESSION_RECHECK_GRACE_S` (300 s) after the last successful check, then returns 503 `service_unavailable` (C37).
 - Check: Vitest, e2e `role-change.spec.ts`.
 
 **PAY-108 User administration (must).**
@@ -219,6 +222,7 @@ The run snapshots `tax_bps`, `retirement_bps` and `require_dual_approval`, sets 
   - A repeat with the same key and body returns the stored response; the same key with a different body returns 422 `idempotency_key_reused`.
   - A second approve with a new key returns 409 `pay_run_not_approvable`.
   - Of two concurrent approves, exactly one succeeds.
+  - 409 `employee_bank_details_missing` when an employee in the run has purged or missing bank details.
   - Audit `payrun.approved`.
 - Check: unit, integration `test_approve_concurrency.py`.
 
@@ -299,6 +303,7 @@ It writes a new outbox row with a fresh `event_id`, increments `publish_count` a
 - Check: integration.
 
 **PAY-410 Key safe window (must).** For an attempt whose `requested_at` is older than `BANK_KEY_SAFE_WINDOW_S` (86400), the worker only calls `GET /v1/transfers/{key}`. If found, that transfer's status is the answer. A 404 makes the worker report `poison` with reason `key_window_expired`, so the attempt becomes `needs_operator`. It never POSTs.
+- Acceptance: with a 25-hour-old attempt and no transfer at the bank, the bank receives no POST and the attempt ends `needs_operator`; with a transfer present, its status is recorded.
 - Check: unit, integration.
 
 **PAY-411 Internal instruction endpoint (must).** `GET /v1/internal/payouts/{id}/instruction?attempt=n` (iss `payout-worker`, sub `service:payout-worker`, and the payout must belong to the token's `cid`) returns `{payout_id, attempt, amount_cents, currency, routing, account, requested_at}`. Routing and account are decrypted from the attempt's snapshot.
@@ -323,6 +328,7 @@ It writes a new outbox row with a fresh `event_id`, increments `publish_count` a
 - Check: unit, integration.
 
 **PAY-413 Live progress (must).** The run page polls `GET /api/pay-runs/{id}` every 2 s while the status is `processing`, showing counts by payout status and, per payout, `awaiting bank` (indeterminate) or `blocked` (needs_operator).
+- Acceptance: polling stops once the run is final; the `counts` from PAY-303 are shown; the badges appear for the matching attempt statuses.
 - Check: Vitest, e2e.
 
 ## 5. Recover failed payouts (J5)
@@ -346,8 +352,8 @@ It writes a new outbox row with a fresh `event_id`, increments `publish_count` a
 - Check: integration, e2e.
 
 **PAY-502 Operator resolution (must).** `POST /v1/pay-runs/{id}/payouts/{payout_id}/resolve {action, note}` (approver; `note` is 1–500 characters) applies only to a payout whose current attempt is `needs_operator`:
-- `redrive` sets the attempt back to `requested`, resets `publish_count` to 0, and writes a new outbox row. Use it after the cause is fixed, for example payroll is back or the DLQ has been inspected.
-- `mark_rejected` sets the attempt to `rejected` (`failure_reason = "operator_rejected"`) and the payout to `failed`, so the normal retry (PAY-500) opens. The runbook `PayoutNeedsOperator.md` requires checking the bank first (`GET /v1/transfers/{key}` shows no settled transfer).
+- `redrive` sets the attempt back to `requested`, sets `publish_count` to 1 (with `republish_seq` 0 and `last_published_at` now), and writes a new outbox row. Use it after the cause is fixed, for example payroll is back or the DLQ has been inspected.
+- `mark_rejected` sets the attempt to `rejected` (`failure_reason = "operator_rejected"`) and the payout to `failed`, so the normal retry (PAY-500) opens. It's refused with 409 `resolve_too_early` (and `Retry-After`) until `PAYOUT_MARK_REJECTED_MIN_WAIT_S` (120 s) after the attempt entered `needs_operator`. That's longer than the worker's bound on in-flight bank POSTs (`HANDLER_DEADLINE_S`, 35 s), so no earlier POST can still settle (C48). The runbook `PayoutNeedsOperator.md` requires checking the bank first (`GET /v1/transfers/{key}` shows no settled transfer).
 - Either action recomputes the run status. Audit `payout.operator_resolved`, with the action and the note's length (not its text).
 - Acceptance:
   - 409 `payout_not_blocked` when the attempt isn't `needs_operator`;
@@ -403,8 +409,9 @@ When Redis is unavailable, login, reset and invite-accept fail closed (503 `serv
   - `BANK_BASE_URL` points at bank-stub or a placeholder (prod);
   - the timing invariants on `PAYOUT_CLAIM_MIN_IDLE_MS` and `PAYOUT_REPUBLISH_AFTER_S` fail (plan §2.2).
 
-  They log the failing setting's name, never its value.
-- Check: pycommon unit `test_startup_checks.py`.
+  They log `startup.check_failed` with the failing setting's name (never its value), and exit 2.
+- Acceptance: each listed condition, set in a uat-like env, stops start-up with exit 2; `/readyz` returns 503 within 5 s of the DB or Redis going down.
+- Check: pycommon unit `test_startup_checks.py`, integration (`test_readyz`).
 
 **PAY-606 Data ownership (must).** The schemas are `identity`, `payroll`, `payouts` and `bank_stub`, each with a migrator role and a runtime role. Neither role has rights in another schema. Bootstrap SQL in `deploy/compose/init/` is shared by Compose, Testcontainers and the Kubernetes Job.
 - Acceptance: a runtime role querying another schema gets `permission denied`.
@@ -419,16 +426,20 @@ When Redis is unavailable, login, reset and invite-accept fail closed (503 `serv
 - `IDEMPOTENCY_TTL_H` (24);
 - `RETENTION_BANK_DETAILS_DAYS` (30 after deactivation): employee bank fields and the final attempts' snapshots are nulled when the employee has no non-final attempt;
 - emails 7 days after they're sent or failed.
+- Acceptance: rows past each window are gone after one maintenance tick, younger rows remain, and two replicas never run the same tick (advisory lock).
 - Check: integration `test_maintenance.py`.
 
 **PAY-609 Seed data (must).** `scripts/seed.py` (dev and CI only; it refuses to run when `ENV` isn't dev) works through the APIs and Mailpit:
 - it creates `approver@payrun.local` (approver) and `LOAD_USER_EMAIL` (payroll_admin) via invite and accept;
 - it sets the company settings (tax 2000 bps, retirement 500 bps; the migration seeds 0/0);
 - it creates employees: by default 10 (salaried and hourly, one with an account ending `0000`), or 500 with `--employees 500`;
-- `scripts/mint_token.py` and a Schemathesis auth hook mint a fresh token per request, since tokens expire in 60 s.
+- `--skeleton` (S8) creates only 5 salaried monthly employees, one calculated monthly run and one draft run, and makes no settings PUT;
+- it prints a JSON summary (user IDs, employee count, run IDs) that k6 and e2e read;
+- `scripts/mint_token.py` (CLI and importable `mint()`) and the Schemathesis hook `scripts/ci/schemathesis_auth.py` mint a fresh token per request, since tokens expire in 60 s.
 
-The `bootstrap-owner` Compose one-shot runs `bootstrap_owner --if-empty --password-env SEED_OWNER_PASSWORD`.
-- Check: used by e2e and k6 in CI.
+The `bootstrap-owner` Compose one-shot runs `bootstrap_owner --if-empty --password-env SEED_OWNER_PASSWORD`, so the dev owner is active, and seed signs in as it.
+- Acceptance: a re-run is a no-op (same counts); it exits 2 when `ENV` isn't dev; the JSON summary validates.
+- Check: `tests/platform/test_seed.py` against the stack, plus the e2e global setup.
 
 ## 7. Non-functional
 
@@ -458,7 +469,7 @@ No `float` in `payroll.domain`; a lint test bans it.
 
 **PAY-NFR-05 Latency SLO (must).** BFF p95 < 300 ms for reads and simple writes, and p95 < 1.5 s for calculate and approve on 500 employees.
 - PR k6 smoke: 5 VUs × 30 s, p95 < 300 ms, errors < 1%.
-- Nightly: 30 req/s for 10 min, plus a soak at 5 req/s for 30 min.
+- Nightly: 30 req/s for 10 min, plus a soak at 5 req/s for 30 min, with no memory growth (RSS slope < 5% over the soak) and no consumer-lag growth.
 - Check: `load/smoke.js`, `load/full.js`.
 
 **PAY-NFR-06 Settlement SLO (must).** A 500-employee run on the healthy-bank path has all payouts final within 60 s of approval at p95.
@@ -506,6 +517,10 @@ A deny-list redactor in pycommon and the BFF masks keys named `password`, `token
 - **Audits:** pip-audit and pnpm audit high.
 - **Kubernetes:** kubeconform passes for every overlay.
 - **Secrets:** gitleaks finds nothing.
+- **Alert rules:** `promtool check rules`, `promtool test rules` and `amtool check-config` pass.
+- **Fault smoke tests:** 1–2 Toxiproxy tests in the PR e2e job (slow DB, identity down).
+- **Trivy ignores:** a `.trivyignore` entry needs a reason, an owner and `exp:YYYY-MM-DD`, also recorded in `SECURITY_DEPENDENCIES.md`.
+- **Nightly:** a failed nightly run opens or updates a GitHub issue with the failing step's log.
 - Check: CI `ci.yml` jobs; recorded in `docs/TESTING.md`.
 
 **PAY-NFR-13 Deployability (must).**
@@ -521,6 +536,13 @@ A deny-list redactor in pycommon and the BFF masks keys named `password`, `token
   - versioned migration Jobs and a db-bootstrap Job.
 - **Images** are built for `linux/amd64` in CI.
 - Check: the `manifests` and `e2e` CI jobs.
+
+**PAY-NFR-15 Recovery and startup (must).**
+- Recovery point objective 5 min (managed Postgres point-in-time recovery in prod) and recovery time objective 1 h.
+- Redis AOF means queued payouts survive a restart.
+- Each service reports ready within 20 s after its migrations finish.
+- Acceptance: in Compose, restarting Redis mid-run loses no payout (the run completes); each service's `/readyz` turns 200 within 20 s of its container start, once the migrations are done.
+- Check: resilience `test_redis_restart.py`; e2e start-up timing recorded by `stack.sh up`.
 
 **PAY-NFR-14 Accessibility (should).** The main pages (login, dashboard, employees, run detail, payouts) have no serious or critical axe violations.
 - Check: e2e with `@axe-core/playwright`.

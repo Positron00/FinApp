@@ -69,10 +69,14 @@ There's one `route.ts` per path. Each exported method is built with `route()` (�
 | `api/pay-runs/[id]/payslips/[payslipId]/route.ts` | GET |
 | `api/pay-runs/[id]/payouts/route.ts` | GET |
 | `api/pay-runs/[id]/payouts/[payoutId]/retry/route.ts` | POST |
+| `api/pay-runs/[id]/payouts/[payoutId]/resolve/route.ts` | POST (PAY-502) |
 | `api/audit/auth/route.ts` | GET |
 | `api/audit/payroll/route.ts` | GET |
 | `api/telemetry/route.ts` | POST |
-| `api/livez/route.ts`, `api/readyz/route.ts` | GET (liveness: no dependencies; readiness: Redis `PING` within `REDIS_SOCKET_TIMEOUT_MS`) |
+| `api/livez/route.ts`, `api/readyz/route.ts` | GET (liveness: no dependencies; readiness: Redis `PING` within `REDIS_SOCKET_TIMEOUT_MS`). These are the web's only health routes (C4): the Compose healthcheck and the Kubernetes readiness probe use `http://127.0.0.1:3000/api/readyz`, the liveness probe uses `/api/livez`, and `seed.py` waits on `/api/readyz` |
+| `api/[...path]/route.ts` | Every method: 404 `not_found` as JSON, through `route()` so the standard headers are set (C15) |
+
+Every route file also exports the standard methods it doesn't implement (GET, POST, PUT, PATCH, DELETE) as `methodNotAllowed(allowed)` from `lib/route.ts`. That handler returns 405 `method_not_allowed` with an `Allow` header and the standard headers, and records the request metric; it runs no session, limiter or body step.
 
 ### 1.3 Server libraries (`src/lib/`)
 
@@ -81,17 +85,17 @@ Every module here starts with `import "server-only"`, except the ones marked *sh
 | Module | Responsibility |
 |---|---|
 | `lib/config.ts` | Parses `process.env` with Zod into a frozen `Config` (§8) and runs the web startup checks. Loaded lazily, so `next build` runs without secrets |
-| `lib/redis.ts` | The `ioredis` singleton: user `web`, `commandTimeout = REDIS_SOCKET_TIMEOUT_MS`, `enableOfflineQueue: false`, `maxRetriesPerRequest: 1`, `lazyConnect`. With these settings a Redis outage fails fast instead of queueing |
+| `lib/redis.ts` | The `ioredis` singleton built from `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME` (`web`) and `REDIS_PASSWORD` (C12): `commandTimeout = REDIS_SOCKET_TIMEOUT_MS`, `enableOfflineQueue: false`, `maxRetriesPerRequest: 1`, `lazyConnect`. With these settings a Redis outage fails fast instead of queueing |
 | `lib/session.ts` | The session store: `createSession`, `loadSession`, `touchSession`, `markRolesChecked`, `deleteSession`, `revokeUserSessions`, plus the cookie helpers (§4) |
 | `lib/require-session.ts` | `requireSession(roles?)` for route handlers and `requireSessionForPage(roles?)` for pages (§4.3) |
 | `lib/internal-jwt.ts` | `internalToken()`: EdDSA minting (§3.4.1) |
 | `lib/api/resilient-fetch.ts` | `resilientFetch(target, opts)`: timeouts, GET retries, breaker, metrics, `X-Request-ID` (§3.4.2) |
 | `lib/api/breaker.ts` | A per-process circuit breaker per target |
-| `lib/api/identity.ts` | `identityClient(ctx)`: an `openapi-fetch` client over `IdentityPaths`, with a middleware that adds `Authorization: Bearer <jwt aud=identity>`, `X-Request-ID` and `X-Client-IP` (Issues #4) |
+| `lib/api/identity.ts` | `identityClient(ctx)`: an `openapi-fetch` client over `IdentityPaths`, with a middleware that adds `Authorization: Bearer <jwt aud=identity>`, `X-Request-ID`, and `X-Client-IP` when the client IP is known. When `clientIp()` returns `null` the header is **omitted**, and identity puts the request in its shared `unknown` per-IP bucket (R18, C16) |
 | `lib/api/payroll.ts` | `payrollClient(ctx)`: the same over `PayrollPaths` (`aud=payroll`) |
-| `lib/route.ts` | The `route()` wrapper: the request pipeline (§3.1) |
+| `lib/route.ts` | The `route()` wrapper: the request pipeline (§3.1); `methodNotAllowed(allowed)` (§1.2) |
 | `lib/rate-limit.ts` | Sliding-window limiter on Redis (§5.1) |
-| `lib/client-ip.ts` | `clientIp(headers, hops)` from `X-Forwarded-For` and `TRUSTED_PROXY_HOPS` (§5.2) |
+| `lib/client-ip.ts` | `clientIp(headers, hops)` from `X-Forwarded-For` and `TRUSTED_PROXY_HOPS`; `null` when unknown (§5.2) |
 | `lib/origin.ts` | `checkOrigin(req)` for mutations (§5.4) |
 | `lib/body.ts` | `readJson(req, schema, limit)`: a size-capped body read plus Zod parsing (§5.3) |
 | `lib/errors.ts` | `BffError`, the error catalog and `mapUpstreamError()` (§3.3); `toErrorResponse()` |
@@ -111,7 +115,7 @@ Every module here starts with `import "server-only"`, except the ones marked *sh
 
 | Module | Responsibility |
 |---|---|
-| `src/instrumentation.ts` | `register()`: on `nodejs` only, runs `loadConfig()` (exits in uat and prod on a failed check), then `registerOTel` (§7.4). `onRequestError` logs `web.server_error` |
+| `src/instrumentation.ts` | `register()`: on `nodejs` only, runs `loadConfig()` (on a failed check: logs `config.invalid` and exits 2; C29), then `registerOTel` (§7.4). `onRequestError` logs `web.server_error` |
 | `src/proxy.ts` | Cookie-presence gate, CSP nonce, `x-request-id` (§5.5) |
 | `src/components/ui/*` | shadcn/ui primitives (Button, Dialog, AlertDialog, Table, Tabs, Badge, Form, Input, Select, Checkbox, Toast, Skeleton) |
 | `src/components/app-shell.tsx`, `nav.tsx` | Layout, skip link, nav items filtered by role, user menu with sign-out |
@@ -120,7 +124,7 @@ Every module here starts with `import "server-only"`, except the ones marked *sh
 | `src/components/web-vitals.tsx` | `useReportWebVitals` → `navigator.sendBeacon("/api/telemetry")`; a `window.onerror` / `unhandledrejection` reporter |
 | `src/components/money.tsx`, `data-table.tsx`, `cursor-pager.tsx`, `error-banner.tsx`, `confirm-dialog.tsx`, `live-region.tsx`, `forbidden.tsx` | Shared UI |
 | `src/components/forms/{login-form,accept-form,reset-request-form,reset-confirm-form,employee-form,settings-form,invite-dialog,user-edit-dialog,run-create-form}.tsx` | Forms using react-hook-form with the shared Zod schemas |
-| `src/components/runs/{run-header,run-actions,run-status-badge,payslips-tab,hours-editor,payslip-dialog,payouts-tab,payout-status-badge,attempt-history,approve-button,retry-button}.tsx` | The run page (§6.3) |
+| `src/components/runs/{run-header,run-actions,run-status-badge,payslips-tab,hours-editor,payslip-dialog,payouts-tab,payout-status-badge,attempt-history,approve-button,retry-button,resolve-dialog}.tsx` | The run page (§6.3) |
 | `src/components/audit/{auth-audit-table,payroll-audit-table}.tsx` | Audit tabs |
 
 ## 2. Data models
@@ -129,28 +133,20 @@ Every module here starts with `import "server-only"`, except the ones marked *sh
 
 | Key | Type | Fields / members | TTL | Requirement |
 |---|---|---|---|---|
-| `web:sess:<k>` | hash | `user_id` (uuid), `cid` (uuid), `roles` (JSON array of `admin`/`payroll_admin`/`approver`), `roles_version` (int), `created_at`, `last_seen`, `roles_checked_at` (epoch ms, int) | `min(SESSION_IDLE_TTL_S, created_at + SESSION_ABS_TTL_S − now)`, refreshed by the touch (§4.2) | PAY-106 |
+| `web:sess:<k>` | hash | `user_id` (uuid), `cid` (uuid), `name` (string, the display name from `SessionUser`, refreshed on each `/me` re-check; C10), `roles` (JSON array of `admin`/`payroll_admin`/`approver`), `roles_version` (int), `created_at`, `last_seen`, `roles_checked_at` (epoch ms, int) | `min(SESSION_IDLE_TTL_S, created_at + SESSION_ABS_TTL_S − now)`, refreshed by the touch (§4.2) | PAY-106 |
 | `web:user-sess:<user_id>` | set | the `<k>` of each live session of that user | `SESSION_ABS_TTL_S`, reset on every `SADD` | PAY-106, 107 |
 | `web:rl:<scope>:<subject>:<window>` | string (counter) | `scope` ∈ `ip`, `sess`, `tel`; `subject` = 16 hex chars of `HMAC-SHA256(SESSION_SECRET, ip or k)`; `window` = `floor(now_s / 60)` | 120 s | PAY-603 |
 
-- `<k>` = `HMAC-SHA256(SESSION_SECRET, <session id>)` as 64 hex chars. The cookie holds the raw ID (256 random bits, base64url, 43 chars). Redis holds only the HMAC, so a Redis dump or `MONITOR` output yields no usable cookie (Issues #16).
+- `<k>` = `HMAC-SHA256(SESSION_SECRET, <session id>)` as 64 hex chars. The cookie holds the raw ID (256 random bits, base64url, 43 chars). Redis holds only the HMAC, so a Redis dump or `MONITOR` output yields no usable cookie (R23, PAY-106).
 - **The JWT `sid` claim** is the first 32 hex chars of `<k>`. It's stable per session, can't be turned back into the cookie, and lets service logs be correlated with a session.
-- **ACL** (provisioned with the other ACL users in the deploy bootstrap):
-
-  ```
-  user web on >${REDIS_WEB_PASSWORD} ~web:* -@all
-    +get +set +del +incr +expire +pexpire +pttl +hset +hget +hgetall
-    +sadd +srem +smembers +multi +exec +ping
-  ```
-
-  So web can't touch `stream:*`, `identity:*` or `payroll:*`, and can't `XADD` (PAY-607).
+- **ACL.** The ACL user `web` is defined by the platform design and provisioned in the deploy bootstrap; its password is the `.env`/secret value `REDIS_WEB_PASSWORD`, which the web container receives as `REDIS_PASSWORD` (C12). Its key pattern is `~web:*`, with no stream, scripting, pub/sub or admin commands. The web uses only these commands: `GET SET DEL EXISTS INCR EXPIRE PEXPIRE PTTL HSET HGET HGETALL SADD SREM SMEMBERS MULTI EXEC PING`. So web can't touch `stream:*`, `identity:*` or `payroll:*`, and can't `XADD` (PAY-607).
 
 ### 2.2 Session types (`lib/session.ts`)
 
 ```ts
 export type Role = "admin" | "payroll_admin" | "approver";
-export interface SessionRecord {            // the Redis hash, parsed
-  user_id: string; cid: string; roles: Role[]; roles_version: number;
+export interface SessionRecord {            // the Redis hash, parsed (PAY-106)
+  user_id: string; cid: string; name: string; roles: Role[]; roles_version: number;
   created_at: number; last_seen: number; roles_checked_at: number;
 }
 export interface Session extends SessionRecord {
@@ -162,7 +158,7 @@ export interface Session extends SessionRecord {
 **Cookie:**
 - Name `SESSION_COOKIE_NAME`: `sid` in dev, `__Host-sid` in uat and prod.
 - Attributes: `HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=SESSION_ABS_TTL_S`, with no `Domain`.
-- Browsers treat `localhost` and `127.0.0.1` as secure contexts, so `Secure` works over plain http in dev and e2e.
+- Browsers treat `127.0.0.1` as a secure context, so `Secure` works over plain http in dev and e2e. The dev origin is `http://127.0.0.1:${WEB_PORT}` (C12); every test and browser uses `127.0.0.1`, never `localhost`, because the cookie and the Origin check (§5.4) are per host.
 
 ### 2.3 Request schemas (`lib/schemas/`, shared with the forms)
 
@@ -171,10 +167,10 @@ These are common to all of them:
 - `Password = z.string().min(12).max(256)` (12 is PAY-103; the BFF checks it early so the user gets instant feedback, and identity stays authoritative)
 - `Uuid = z.string().uuid()`
 - `IsoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/)`
-- `Cursor = z.string().max(512).optional()`
+- `Cursor = z.string().max(512).regex(/^[A-Za-z0-9_-]+$/).optional()`: opaque base64url, passed through unchanged (R4)
 - `Limit = z.coerce.number().int().min(1).max(100).default(50)`
 
-Every object schema is `.strict()`: an unknown key gives 422.
+Every object schema is `.strict()`: an unknown key gives 422 `validation_error`. Validation `details` are always `[{field, issue}]` (`field` is the dotted path, `issue` the Zod issue code) and never echo the submitted value (C14).
 
 | Schema | Shape | Requirement |
 |---|---|---|
@@ -182,18 +178,21 @@ Every object schema is `.strict()`: an unknown key gives 422.
 | `AcceptBody` | `{token: z.string().regex(/^[A-Za-z0-9_-]{20,128}$/), password: Password}` | PAY-103 |
 | `ResetRequestBody` | `{email: Email}` | PAY-105 |
 | `ResetConfirmBody` | `{token: <as AcceptBody>, password: Password}` | PAY-105 |
-| `ListQuery` | `{cursor: Cursor, limit: Limit}` | PAY-108, 202, 303 |
+| `ListQuery` | `{cursor: Cursor, limit: Limit}`. Used by every list route; the BFF passes both to the service unchanged (C8) | PAY-108, 109, 202, 303, 501, 602 |
 | `InviteBody` | `{email: Email, name: z.string().trim().min(1).max(200), roles: z.array(RoleEnum).min(1).max(3)}`, with roles required to be unique | PAY-101 |
-| `UserPatchBody` | `{roles?: RoleEnum[] (min 1, unique), status?: z.enum(["active","inactive"])}`; at least one field | PAY-108 |
+| `UserPatchBody` | `{roles?: RoleEnum[] (min 1, max 3, unique), status?: z.literal("inactive")}`; at least one field. There is no user reactivation in 0.1.0 (R37, C25), so `"active"` is a 422 | PAY-108 |
 | `SettingsBody` | `{name: 1–200, tax_rate_bps: int 0–5000, retirement_bps: int 0–2000, timezone: one of Intl.supportedValuesOf("timeZone"), biweekly_anchor: IsoDate that is a Monday, require_dual_approval: boolean}` | PAY-200 |
 | `EmployeeCreateBody` | A discriminated union on `pay_type`. Common fields: `name` 1–200, `email: Email`, `schedule: "biweekly"\|"monthly"`, `bank_routing: /^\d{9}$/` with the ABA checksum, `bank_account: /^\d{4,17}$/`. Then `salaried` with `annual_salary_cents: int 1–1_000_000_000`, or `hourly` with `hourly_rate_cents: int 1–100_000` | PAY-201 |
-| `EmployeePatchBody` | Every field of `EmployeeCreateBody` optional, plus `status?: "active"\|"inactive"`; at least one field | PAY-203 |
+| `EmployeePatchBody` | Every field of `EmployeeCreateBody` optional, plus `status?: "active"\|"inactive"`; at least one field. Employee reactivation stays in scope (PAY-203); reactivating an employee whose bank details were purged needs `bank_routing` and `bank_account` in the same PATCH (payroll returns 422 otherwise) | PAY-203 |
 | `EmployeeListQuery` | `ListQuery & {status?: "active"\|"inactive"}` | PAY-202 |
+| `PayRunListQuery` | `ListQuery & {status?: "draft"\|"calculated"\|"processing"\|"paid"\|"partially_failed"}` | PAY-303 |
+| `PayoutListQuery` | `ListQuery & {status?: "requested"\|"paid"\|"failed"}` | PAY-501 |
 | `PayRunCreateBody` | `{schedule: "biweekly"\|"monthly", period_start: IsoDate}` | PAY-300 |
 | `HoursBody` | `{entries: z.array({employee_id: Uuid, hours_hundredths: int 0–74_400}).min(1).max(500)}`, with unique `employee_id`. The per-schedule bound (33,600 biweekly) is payroll's (PAY-301) | PAY-301 |
-| `IdempotencyKeyHeader` | `Uuid`. The browser generates it with `crypto.randomUUID()` | PAY-400 |
+| `IdempotencyKeyHeader` | `Uuid`. The browser generates it with `crypto.randomUUID()`. A **missing** header gives **400 `idempotency_key_required`**; a present but malformed one gives 422 `validation_error` with `field = "Idempotency-Key"` (C34) | PAY-400 |
+| `ResolveBody` | `{action: z.enum(["redrive","mark_rejected"]), note: z.string().trim().min(1).max(500)}` | PAY-502 |
 | `TelemetryBody` | A discriminated union. `{type: "vital", name: "CLS"\|"FCP"\|"INP"\|"LCP"\|"TTFB", value: number ≥ 0, rating: "good"\|"needs-improvement"\|"poor", route: string ≤ 100}`, or `{type: "error", message: string ≤ 500, route: string ≤ 100}` | §7.5 |
-| `IdParam` | `{id: Uuid}` (and `payslipId`, `payoutId`) | all `[id]` routes |
+| `IdParam` | `{id: Uuid}`; `RunPayslipParam = {id: Uuid, payslipId: Uuid}`; `RunPayoutParam = {id: Uuid, payoutId: Uuid}` | all `[id]` routes |
 
 Forms enter money, rates and hours as text. `lib/money.ts` converts them with string-integer parsing:
 - money: `^\d{1,8}(\.\d{1,2})?$` → cents;
@@ -204,23 +203,34 @@ There's no float anywhere on the path (ADR 0006).
 
 ### 2.4 Response schemas
 
-The generated types in `packages/api-client` are the contract. The Zod schemas below mirror them. A type-level test (`expectTypeOf<z.infer<typeof X>>().toEqualTypeOf<...>()`) fails when they drift. The BFF parses every service response it returns, because these responses are shown to users (`architecture.md` §4).
+The generated types in `packages/api-client` are the contract. **The Zod schemas below mirror the service Out models field for field** (C5): same names, same nullability, same enums. A type-level test (`expectTypeOf<z.infer<typeof X>>().toEqualTypeOf<...>()`) fails when they drift. The BFF parses every service response it returns, because these responses are shown to users (`architecture.md` §4).
 - **Default mode is strip:** unknown keys are dropped.
-- **`Employee` and `Payout` are `.strict()`.** Any unexpected key (for example a `bank_account` field) fails parsing. The BFF then returns 500 `internal_error` and logs `bff.response_invalid`, so a full bank number can't leak through the BFF (PAY-202, PAY-501, PAY-NFR-08).
+- **`Employee`, `Payout` and `Attempt` are `.strict()`** (C5: strict stays, to block leaks). Any unexpected key (for example a `bank_account` or `routing` field) fails parsing. The BFF then returns 500 `internal_error` and logs `bff.response_invalid`, so a full bank number can't leak through the BFF (PAY-202, PAY-501, PAY-NFR-08).
+- **Types:** `Uuid` as in §2.3; `DateTime = z.string().datetime({ offset: true })`; `Date = IsoDate`; `Cents = z.number().int()`; `Role` and `Schedule` as in §2.3; `PayType = z.enum(["salaried","hourly"])`.
 
-| Schema | Fields | Requirement |
-|---|---|---|
-| `Page<T>` | `{items: T[], next_cursor: string \| null}` (Issues #20) | PAY-108, 202, 303 |
-| `User` | `{id, email, name, roles: Role[], status: "pending"\|"active"\|"inactive", roles_version: int, invite_id: uuid \| null}` (Issues #10) | PAY-101, 108 |
-| `Me` | `User` without `invite_id` | PAY-107 |
-| `Settings` | the `SettingsBody` fields | PAY-200 |
-| `Employee` | `{id, name, email, pay_type, annual_salary_cents: int\|null, hourly_rate_cents: int\|null, schedule, account_last4: /^\d{4}$/, status, bank_updated_at: datetime\|null, deactivated_at: datetime\|null, created_at, updated_at}` | PAY-201–203 |
-| `PayRun` | `{id, schedule, period_start, period_end, pay_date, period_index, status: "draft"\|"calculated"\|"processing"\|"paid"\|"partially_failed", totals: {gross_cents, tax_cents, retirement_cents, net_cents, funding_required_cents} \| null, payout_counts: {requested, paid, failed}, calculated_by: uuid\|null, approved_by: uuid\|null, approved_at: datetime\|null, processing_since: datetime\|null, created_at}` | PAY-303, 413 |
-| `Payslip` | `{id, employee_id, employee_name, pay_type, schedule, annual_salary_cents\|null, hourly_rate_cents\|null, hours_hundredths: int\|null, gross_cents, tax_cents, retirement_cents, net_cents}` | PAY-303 |
-| `Payout` | `{id, employee_name, status: "requested"\|"paid"\|"failed", no_transfer: boolean, current_attempt: int, attempts: [{attempt, status: "requested"\|"indeterminate"\|"needs_operator"\|"settled"\|"rejected", failure_reason: string\|null, bank_reference: string\|null, requested_at, final_at: datetime\|null}]}` (Issues #11) | PAY-501, 413 |
-| `AuthAuditEvent` | `{id, at, actor_user_id\|null, event, target_user_id\|null, ip_hash\|null}` | PAY-109 |
-| `PayrollAuditEvent` | `{id, at, actor_user_id, event, entity_type, entity_id, changes: Record<string, unknown> \| null}` (Issues #19) | plan §8 |
-| `ErrorBody` | `{error: {code: string, message: string, request_id: string, details?: unknown}}` | PAY-602 |
+| Schema | Mirrors | Fields | Requirement |
+|---|---|---|---|
+| `Page<T>` | payroll `Page[T]`, identity `UserListOut` / `AuditListOut` | `{items: T[], next_cursor: string \| null}` (R4, C8). Every list route returns it, payslips and payouts included | PAY-108, 109, 202, 303, 501, 602 |
+| `SessionUser` | identity `SessionUser` | `{user_id: Uuid, company_id: Uuid, email: string, name: string, roles: Role[], roles_version: int, status: "active"}` (C6). Returned by identity's login and accept only; never sent to the browser | PAY-103, 104, 106 |
+| `User` | identity `UserOut` | `{id: Uuid, email: string, name: string, roles: Role[], roles_version: int, status: "pending"\|"active"\|"inactive", created_at: DateTime, updated_at: DateTime, activated_at: DateTime\|null, deactivated_at: DateTime\|null, pending_invite_id: Uuid\|null}`. `pending_invite_id` is set only for `pending` users (R21, C11) | PAY-101, 107, 108 |
+| `UserMe` | identity `MeOut` (`GET /v1/users/me`) | `User` fields plus `company_id: Uuid` (R19). Used by the re-check only | PAY-107 |
+| `PendingInvite` | identity `PendingInviteOut` (resend response) | `{id: Uuid, expires_at: DateTime\|null, email_status: "pending"\|"sent"\|"failed"\|"cancelled"\|null}`. `expires_at` is null until the relay sends (R17, C31) | PAY-102 |
+| `Me` | BFF only | `{id: Uuid, email: string, name: string, roles: Role[], roles_version: int, status: "pending"\|"active"\|"inactive"}`. Built by `toMe()`: from a `SessionUser` with `id = user_id` (`company_id` goes into the session as `cid`, not into `Me`; C6), or from a `UserMe` by picking these fields | PAY-104, 106, 107 |
+| `ResetConfirmResult` | identity `ResetConfirmOut` | `{user_id: Uuid, roles_version: int}`. Used by the BFF only (R19) | PAY-105 |
+| `Settings` | payroll `CompanySettingsOut` | `{name: string, tax_rate_bps: int, retirement_bps: int, timezone: string, biweekly_anchor: Date, require_dual_approval: boolean, updated_at: DateTime, updated_by: string\|null}` | PAY-200 |
+| `Employee` (strict) | payroll `EmployeeOut` | `{id: Uuid, name: string, email: string, pay_type: PayType, annual_salary_cents: int\|null, hourly_rate_cents: int\|null, schedule: Schedule, account_last4: /^\d{4}$/\|null, has_bank_details: boolean, bank_updated_at: DateTime\|null, bank_updated_by: string\|null, status: "active"\|"inactive", deactivated_at: DateTime\|null, created_at: DateTime, updated_at: DateTime}`. `account_last4` is null after the bank-detail purge (C5) | PAY-201–203, 608 |
+| `RunTotals` | payroll `RunTotalsOut` | `{gross_cents, tax_cents, retirement_cents, net_cents, funding_required_cents}` (all `Cents`) | PAY-303 |
+| `RunCounts` | payroll `PayRunOut.counts` | `{requested, awaiting_bank, blocked, paid, no_transfer, failed}` (all int ≥ 0). `requested` includes `awaiting_bank` (current attempt `indeterminate`) and `blocked` (current attempt `needs_operator`); `paid` includes `no_transfer` (C9) | PAY-303, 413 |
+| `PayRun` | payroll `PayRunOut` | `{id: Uuid, schedule: Schedule, period_start: Date, period_end: Date, pay_date: Date, period_index: int, periods_per_year: int, status: "draft"\|"calculated"\|"processing"\|"paid"\|"partially_failed", employee_count: int, tax_bps: int\|null, retirement_bps: int\|null, require_dual_approval: boolean\|null, totals: RunTotals\|null, counts: RunCounts, created_by: string, created_at: DateTime, calculated_by: string\|null, calculated_by_name: string\|null, calculated_at: DateTime\|null, approved_by: string\|null, approved_by_name: string\|null, approved_at: DateTime\|null, processing_since: DateTime\|null, updated_at: DateTime}`. `require_dual_approval`, `tax_bps` and `retirement_bps` are the calculate-time snapshots (null while `draft`) (R21, C9) | PAY-303, 413 |
+| `Hours` | payroll `HoursOut` | `{pay_run_id: Uuid, status: "draft", entries: [{employee_id: Uuid, hours_hundredths: int}]}` (C7) | PAY-301 |
+| `Payslip` | payroll `PayslipOut` | `{id: Uuid, pay_run_id: Uuid, employee_id: Uuid, employee_name: string, pay_type: PayType, annual_salary_cents: int\|null, hourly_rate_cents: int\|null, hours_hundredths: int\|null, status: "pending"\|"calculated", gross_cents: Cents\|null, tax_cents: Cents\|null, retirement_cents: Cents\|null, net_cents: Cents\|null}`. No `schedule`; the amounts are null while `pending` (C5) | PAY-303 |
+| `Attempt` (strict) | payroll `AttemptOut` | `{attempt: int ≥ 1, status: "requested"\|"indeterminate"\|"needs_operator"\|"settled"\|"rejected", failure_reason: string\|null, bank_reference: string ≤ 64\|null, account_last4: /^\d{4}$/, requested_at: DateTime, final_at: DateTime\|null}` (C5, C26) | PAY-501 |
+| `Payout` (strict) | payroll `PayoutOut` | `{id: Uuid, pay_run_id: Uuid, payslip_id: Uuid, employee_id: Uuid, employee_name: string, amount_cents: Cents, currency: "USD", status: "requested"\|"paid"\|"failed", no_transfer: boolean, current_attempt: int ≥ 0, attempts: Attempt[]}`. `attempts` is ascending by `attempt`, and `[]` when `no_transfer` (R21, C5) | PAY-500, 501, 502, 413 |
+| `AuthAuditEvent` | identity `AuditEntryOut` | `{id: Uuid, at: DateTime, actor_user_id: Uuid\|null, event: string, target_user_id: Uuid\|null, ip_hash: string\|null, details: Record<string, unknown>}` | PAY-109 |
+| `PayrollAuditEvent` | payroll `AuditEventOut` | `{id: Uuid, at: DateTime, actor_id: string, event: string, entity_type: "company_settings"\|"employee"\|"pay_run"\|"payout", entity_id: Uuid, details: Record<string, unknown>}` (C5) | plan §8 |
+| `ValidationDetails` | the C14 shape | `z.array(z.object({field: z.string().max(200), issue: z.string().max(100)})).max(100)` | PAY-602 |
+| `EmployeeIdsDetails` | payroll domain errors | `{employee_ids: z.array(Uuid).max(500)}` | PAY-300–302 |
+| `ErrorBody` | PAY-602 | `{error: {code: string, message: string, request_id: string, details?: ValidationDetails \| EmployeeIdsDetails}}` | PAY-602 |
 
 ## 3. Interfaces
 
@@ -239,7 +249,7 @@ interface RouteDef<B, Q, P> {
 }
 interface RouteCtx<B, Q, P> {
   req: NextRequest; body: B; query: Q; params: P;
-  session: Session | null; requestId: string; log: pino.Logger; ip: string;
+  session: Session | null; requestId: string; log: pino.Logger; ip: string | null;   // null = unknown (§5.2)
   identity: IdentityClient; payroll: PayrollClient;   // built for this request (user token, or service:web)
 }
 export function route<B, Q, P>(def: RouteDef<B, Q, P>):
@@ -258,9 +268,9 @@ export function route<B, Q, P>(def: RouteDef<B, Q, P>):
    - `"optional"` → load the session if the cookie is present; never throw 401.
    - `"public"` → skip.
 5. **Session rate limit** (`scope=sess`, `BFF_RATE_LIMIT_SESSION` per minute), when there's a session. It fails open.
-6. **Params and query:** Zod. A failure gives 422 `validation_error` with `details: [{field, issue}]`. A malformed `[id]` also gives 422.
+6. **Params, query and headers:** Zod. A failure gives 422 `validation_error` with `details: [{field, issue}]` and no input values (C14). A malformed `[id]` also gives 422. A route that requires `Idempotency-Key` returns 400 `idempotency_key_required` when it is missing (C34).
 7. **Body:** `readJson(req, def.body, def.bodyLimit)` (§5.3): 413 `payload_too_large`, 400 `invalid_json`, or 422 `validation_error`.
-8. **Clients.** Build `identity` and `payroll` with a token provider bound to the session: `sub=user_id`, the session's roles, `cid`, `sid`. Public routes use `sub=service:web`.
+8. **Clients.** Build `identity` and `payroll` with a token provider bound to the session: `sub=user_id`, the session's `name`, roles, `cid` and `sid` (C10). Public routes use `sub=service:web` with no `name` or `sid` (R9).
 9. **Handler.**
 10. **Finish.**
     - Map any thrown error with `toErrorResponse()` (§3.3).
@@ -272,13 +282,13 @@ export function route<B, Q, P>(def: RouteDef<B, Q, P>):
 
 Conventions for the table:
 - **"Origin ✓"** means step 3 applies.
-- **JWT:** `U` = a user token (`sub=<user_id>`, the session's roles, `cid` and `sid`). `S` = a service token (`sub=service:web`, `roles=[]`, `cid=COMPANY_ID`; Issues #1).
+- **JWT:** `U` = a user token (`sub=<user_id>`, the session's `name`, roles, `cid` and `sid`). `S` = a service token (`sub=service:web`, `roles=[]`, `cid=COMPANY_ID`, no `name`, no `sid`; R9).
 - **Timeouts:** every call uses connect 1 s and read 3 s, except calculate and approve, which read for 10 s (§3.4.2).
-- **Pass-through responses** are the parsed §2.4 schema. Lists are `Page<T>`.
+- **Pass-through responses** are the parsed §2.4 schema. **Lists** take `cursor` and `limit` (§2.3 `ListQuery`, plus the filters shown), pass them to the service unchanged, and return `Page<T>` (C8).
 - **Error mapping:** every route also maps these:
   - 401 `unauthenticated` (no or ended session);
   - 403 `forbidden_role` (BFF or service);
-  - 403 `bad_origin`, 413 `payload_too_large`, 422 `validation_error`, 429 `rate_limited`;
+  - 400 `invalid_json`, 400 `bad_request` (service), 403 `bad_origin`, 404 `not_found` (service), 405 `method_not_allowed`, 413 `payload_too_large`, 422 `validation_error`, 429 `rate_limited`;
   - 503 `service_unavailable` (upstream down, timeout, breaker open or Redis down), and 503 `db_timeout` / `db_unavailable` forwarded as 503 `service_unavailable`;
   - 500 `internal_error`.
 
@@ -288,63 +298,65 @@ Conventions for the table:
 
 | Method, path | Session / role | Origin | Request (Zod) | Service call(s) | Response | Route-specific errors (status code) | Req |
 |---|---|---|---|---|---|---|---|
-| POST `/api/auth/login` | public; IP limit **fails closed** | ✓ | `LoginBody` | identity `POST /v1/auth/login` (S) | 200 `{user: Me}` + `Set-Cookie`. An existing session cookie on the request is deleted first; the new session gets a fresh ID (§4.4) | 401 `invalid_credentials`; 429 `rate_limited` (identity's account/IP lockout, `Retry-After` forwarded) | PAY-104, 106 |
+| POST `/api/auth/login` | public; IP limit **fails closed** | ✓ | `LoginBody` | identity `POST /v1/auth/login` (S; `X-Client-IP` when known) → 200 `SessionUser` | 200 `{user: Me}` (`toMe(SessionUser)`, C6) + `Set-Cookie`. An existing session cookie on the request is deleted first; the new session gets a fresh ID (§4.1) | 401 `invalid_credentials`; 429 `rate_limited` (identity's account/IP lockout, `Retry-After` forwarded) | PAY-104, 106 |
 | POST `/api/auth/logout` | optional | ✓ | none | none | 204, cookie cleared (`Max-Age=0`). Deletes `web:sess:<k>` and `SREM web:user-sess:<user_id> <k>`. Idempotent without a session | — | PAY-106 |
-| POST `/api/auth/accept` | public; **fails closed** | ✓ | `AcceptBody` | identity `POST /v1/invites/accept` (S) | 200 `{user: Me}` + `Set-Cookie` (new session) | 400 `invite_invalid`; 422 `password_too_weak` | PAY-103, 106 |
-| POST `/api/auth/reset/request` | public; **fails closed** | ✓ | `ResetRequestBody` | identity `POST /v1/auth/password-reset/request` (S) | 202 `{}`, always (no account enumeration) | 429 `rate_limited` | PAY-105 |
-| POST `/api/auth/reset/confirm` | public; **fails closed** | ✓ | `ResetConfirmBody` | identity `POST /v1/auth/password-reset/confirm` (S); then `revokeUserSessions(user_id, "password_reset")` when identity returns `user_id` (Issues #3) | 204; the current cookie is cleared | 400 `reset_invalid`; 422 `password_too_weak` | PAY-105 |
-| GET `/api/auth/me` | any role | — | none | identity `GET /v1/users/me` (U). This is also a forced re-check: the §4.3 rules apply, and `roles_checked_at` is updated | 200 `Me` | — | PAY-106, 107 |
+| POST `/api/auth/accept` | public; **fails closed** | ✓ | `AcceptBody` | identity `POST /v1/invites/accept` (S; `X-Client-IP` when known) → 200 `SessionUser` | 200 `{user: Me}` (`toMe(SessionUser)`) + `Set-Cookie` (new session) | 400 `invite_invalid`; 422 `password_too_weak`; 429 `rate_limited` | PAY-103, 106 |
+| POST `/api/auth/reset/request` | public; **fails closed** | ✓ | `ResetRequestBody` | identity `POST /v1/auth/password-reset/request` (S; `X-Client-IP` when known) → 202 | 202 `{}`, always (no account enumeration) | 429 `rate_limited` | PAY-105 |
+| POST `/api/auth/reset/confirm` | public; **fails closed** | ✓ | `ResetConfirmBody` | identity `POST /v1/auth/password-reset/confirm` (S; `X-Client-IP` when known) → 200 `ResetConfirmResult`; then **at once** `revokeUserSessions(user_id, "password_reset")`, deleting every session in `web:user-sess:<user_id>` (R19) | 204; the current cookie is cleared | 400 `reset_invalid`; 422 `password_too_weak`; 429 `rate_limited` | PAY-105 |
+| GET `/api/auth/me` | any role | — | none | identity `GET /v1/users/me` (U) → 200 `UserMe`. This is also a forced re-check: the §4.3 rules apply, and `roles_checked_at`, `roles` and `name` are updated | 200 `Me` (`toMe(UserMe)`) | — (identity's 404 `user_not_found` ends the session: 401) | PAY-106, 107 |
 
 #### Users and invites (admin)
 
 | Method, path | Role | Origin | Request | Service call | Response | Route-specific errors | Req |
 |---|---|---|---|---|---|---|---|
-| GET `/api/users` | admin | — | `ListQuery` | identity `GET /v1/users` (U) | 200 `Page<User>` | — | PAY-108 |
-| POST `/api/users/invite` | admin | ✓ | `InviteBody` | identity `POST /v1/users/invite` (U) | 201 `User` | 409 `user_email_taken`; 422 (unknown or empty roles) | PAY-101 |
-| PATCH `/api/users/[id]` | admin | ✓ | `IdParam`, `UserPatchBody` | identity `PATCH /v1/users/{id}` (U); on 200, `revokeUserSessions(id, "role_change" \| "deactivated")` | 200 `User` | 409 `cannot_modify_self`; 409 `last_admin`; 404 `user_not_found` (Issues #8) | PAY-107, 108 |
-| POST `/api/invites/[id]/resend` | admin | ✓ | `IdParam` | identity `POST /v1/invites/{id}/resend` (U) | 200 `{}` | 409 `invite_not_pending`; 404 `invite_not_found` (Issues #8) | PAY-102 |
+| GET `/api/users` | admin | — | `ListQuery` | identity `GET /v1/users?cursor&limit` (U) | 200 `Page<User>` | — | PAY-108 |
+| POST `/api/users/invite` | admin | ✓ | `InviteBody` | identity `POST /v1/users/invite` (U) | 201 `User` (`pending`, with `pending_invite_id`) | 409 `user_email_taken`; 422 `validation_error` (unknown, empty or duplicate roles) | PAY-101 |
+| PATCH `/api/users/[id]` | admin | ✓ | `IdParam`, `UserPatchBody` (`status` may only be `"inactive"`; C25) | identity `PATCH /v1/users/{id}` (U); on 200, `revokeUserSessions(id, "role_change" \| "deactivated")` | 200 `User` | 409 `cannot_modify_self`; 409 `last_admin`; 404 `user_not_found` | PAY-107, 108 |
+| POST `/api/invites/[id]/resend` | admin | ✓ | `IdParam` (the user's `pending_invite_id`) | identity `POST /v1/invites/{id}/resend` (U) | 200 `PendingInvite` | 409 `invite_not_pending`; 404 `invite_not_found` | PAY-102 |
 
 #### Settings
 
 | Method, path | Role | Origin | Request | Service call | Response | Route-specific errors | Req |
 |---|---|---|---|---|---|---|---|
-| GET `/api/settings` | any | — | none | payroll `GET /v1/company/settings` (U) | 200 `Settings` | — | PAY-200 |
-| PUT `/api/settings` | admin | ✓ | `SettingsBody` | payroll `PUT /v1/company/settings` (U) | 200 `Settings` | 422 (out of range) | PAY-200 |
+| GET `/api/settings` | any | — | none | payroll `GET /v1/company/settings` (U) | 200 `Settings` | 404 `company_settings_not_found` | PAY-200 |
+| PUT `/api/settings` | admin | ✓ | `SettingsBody` | payroll `PUT /v1/company/settings` (U) | 200 `Settings` | 409 `anchor_locked` (R33); 404 `company_settings_not_found`; 422 `validation_error` (out of range) | PAY-200 |
 
 #### Employees
 
 | Method, path | Role | Origin | Request | Service call | Response | Route-specific errors | Req |
 |---|---|---|---|---|---|---|---|
-| GET `/api/employees` | any | — | `EmployeeListQuery` | payroll `GET /v1/employees` (U) | 200 `Page<Employee>` | — | PAY-202 |
-| POST `/api/employees` | payroll_admin | ✓ | `EmployeeCreateBody` | payroll `POST /v1/employees` (U) | 201 `Employee` | 409 `employee_email_taken`; 422 (fields in `details`) | PAY-201 |
+| GET `/api/employees` | any | — | `EmployeeListQuery` | payroll `GET /v1/employees?status&cursor&limit` (U) | 200 `Page<Employee>` | — | PAY-202 |
+| POST `/api/employees` | payroll_admin | ✓ | `EmployeeCreateBody` | payroll `POST /v1/employees` (U) | 201 `Employee` | 409 `employee_email_taken`; 422 `validation_error` (fields in `details`) | PAY-201 |
 | GET `/api/employees/[id]` | any | — | `IdParam` | payroll `GET /v1/employees/{id}` (U) | 200 `Employee` | 404 `employee_not_found` | PAY-202 |
-| PATCH `/api/employees/[id]` | payroll_admin | ✓ | `IdParam`, `EmployeePatchBody` | payroll `PATCH /v1/employees/{id}` (U) | 200 `Employee` | 404 `employee_not_found`; 409 `employee_email_taken`; 422 | PAY-203 |
+| PATCH `/api/employees/[id]` | payroll_admin | ✓ | `IdParam`, `EmployeePatchBody` | payroll `PATCH /v1/employees/{id}` (U) | 200 `Employee` | 404 `employee_not_found`; 409 `employee_email_taken`; 422 `validation_error` (including reactivation without bank details after a purge) | PAY-203 |
 
 #### Pay runs, payslips, payouts
 
 | Method, path | Role | Origin | Request | Service call | Response | Route-specific errors | Req |
 |---|---|---|---|---|---|---|---|
-| GET `/api/pay-runs` | any | — | `ListQuery` | payroll `GET /v1/pay-runs` (U) | 200 `Page<PayRun>` | — | PAY-303 |
+| GET `/api/pay-runs` | any | — | `PayRunListQuery` | payroll `GET /v1/pay-runs?status&cursor&limit` (U) | 200 `Page<PayRun>` (newest period first) | — | PAY-303 |
 | POST `/api/pay-runs` | payroll_admin | ✓ | `PayRunCreateBody` | payroll `POST /v1/pay-runs` (U) | 201 `PayRun` | 409 `pay_run_exists`; 422 `invalid_period_start`; 409 `no_employees`; 409 `employee_in_overlapping_run` (`details.employee_ids` forwarded) | PAY-300 |
-| GET `/api/pay-runs/[id]` | any | — | `IdParam` | payroll `GET /v1/pay-runs/{id}` (U) | 200 `PayRun`. Polled every 2 s while `processing` | 404 `pay_run_not_found` (Issues #8) | PAY-303, 413 |
+| GET `/api/pay-runs/[id]` | any | — | `IdParam` | payroll `GET /v1/pay-runs/{id}` (U) | 200 `PayRun`. Polled every 2 s while `processing`; `counts.awaiting_bank` and `counts.blocked` drive the run banner (R21) | 404 `pay_run_not_found` | PAY-303, 413 |
 | DELETE `/api/pay-runs/[id]` | payroll_admin | ✓ | `IdParam` | payroll `DELETE /v1/pay-runs/{id}` (U) | 204 | 409 `pay_run_locked`; 404 `pay_run_not_found` | PAY-304 |
-| PUT `/api/pay-runs/[id]/hours` | payroll_admin | ✓ | `IdParam`, `HoursBody` | payroll `PUT /v1/pay-runs/{id}/hours` (U) | 200 `PayRun` (now `draft`) | 409 `pay_run_locked`; 422 `not_hourly`; 422 (bounds) | PAY-301 |
-| POST `/api/pay-runs/[id]/calculate` | payroll_admin | ✓ | `IdParam` | payroll `POST /v1/pay-runs/{id}/calculate` (U; **read 10 s**) | 200 `PayRun` (`calculated`) | 422 `hours_missing` (`details.employee_ids` forwarded); 409 `pay_run_locked` | PAY-302 |
-| POST `/api/pay-runs/[id]/approve` | approver | ✓ | `IdParam`; header `Idempotency-Key: IdempotencyKeyHeader` (required: missing or not a UUID gives 422 `validation_error`) | payroll `POST /v1/pay-runs/{id}/approve` (U; **read 10 s**; `Idempotency-Key` forwarded unchanged; never retried by the BFF) | 200 `PayRun` (`processing` or `paid`) | 409 `pay_run_not_approvable`; 403 `approver_must_differ` (approve message); 422 `idempotency_key_reused` | PAY-400, 401 |
-| GET `/api/pay-runs/[id]/payslips` | any | — | `IdParam` | payroll `GET /v1/pay-runs/{id}/payslips` (U) | 200 `{items: Payslip[]}` | 404 `pay_run_not_found` | PAY-303 |
-| GET `/api/pay-runs/[id]/payslips/[payslipId]` | any | — | `IdParam` + `payslipId` | payroll `GET /v1/pay-runs/{id}/payslips/{payslip_id}` (U) | 200 `Payslip` | 404 `payslip_not_found` (Issues #8) | PAY-303 |
-| GET `/api/pay-runs/[id]/payouts` | any | — | `IdParam` | payroll `GET /v1/pay-runs/{id}/payouts` (U) | 200 `{items: Payout[]}` | 404 `pay_run_not_found` | PAY-501, 413 |
-| POST `/api/pay-runs/[id]/payouts/[payoutId]/retry` | approver | ✓ | `IdParam` + `payoutId` | payroll `POST /v1/pay-runs/{id}/payouts/{payout_id}/retry` (U; never retried) | 200 `Payout` | 409 `payout_not_retryable`; 409 `retry_limit_reached`; 409 `employee_bank_details_missing`; 403 `approver_must_differ` (retry message); 404 `payout_not_found` | PAY-500 |
+| PUT `/api/pay-runs/[id]/hours` | payroll_admin | ✓ | `IdParam`, `HoursBody` | payroll `PUT /v1/pay-runs/{id}/hours` (U) → 200 `HoursOut` | 200 `Hours` (C7). The run is now `draft`; the UI refetches the run and its payslips | 404 `pay_run_not_found`; 409 `pay_run_locked`; 422 `not_hourly` and 422 `employee_not_in_run` (both with `details.employee_ids` forwarded); 422 `validation_error` (bounds) | PAY-301 |
+| POST `/api/pay-runs/[id]/calculate` | payroll_admin | ✓ | `IdParam` | payroll `POST /v1/pay-runs/{id}/calculate` (U; **read 10 s**) | 200 `PayRun` (`calculated`) | 404 `pay_run_not_found`; 422 `hours_missing` (`details.employee_ids` forwarded); 409 `pay_run_locked` | PAY-302 |
+| POST `/api/pay-runs/[id]/approve` | approver | ✓ | `IdParam`; header `Idempotency-Key: IdempotencyKeyHeader` (required: **missing → 400 `idempotency_key_required`**, not a UUID → 422 `validation_error`; C34) | payroll `POST /v1/pay-runs/{id}/approve` (U; **read 10 s**; `Idempotency-Key` forwarded unchanged; never retried by the BFF) | 200 `PayRun` (`processing` or `paid`) | 404 `pay_run_not_found`; 409 `pay_run_not_approvable`; 403 `approver_must_differ` (approve message); 409 `employee_bank_details_missing` (approve message; R34); 422 `idempotency_key_reused` | PAY-400, 401 |
+| GET `/api/pay-runs/[id]/payslips` | any | — | `IdParam`, `ListQuery` | payroll `GET /v1/pay-runs/{id}/payslips?cursor&limit` (U) | 200 `Page<Payslip>` (by employee name; C8) | 404 `pay_run_not_found` | PAY-303 |
+| GET `/api/pay-runs/[id]/payslips/[payslipId]` | any | — | `RunPayslipParam` | payroll `GET /v1/pay-runs/{id}/payslips/{payslip_id}` (U) | 200 `Payslip` | 404 `pay_run_not_found`; 404 `payslip_not_found` | PAY-303 |
+| GET `/api/pay-runs/[id]/payouts` | any | — | `IdParam`, `PayoutListQuery` | payroll `GET /v1/pay-runs/{id}/payouts?status&cursor&limit` (U) | 200 `Page<Payout>` (by employee name; C8) | 404 `pay_run_not_found` | PAY-501, 413 |
+| POST `/api/pay-runs/[id]/payouts/[payoutId]/retry` | approver | ✓ | `RunPayoutParam`; header `Idempotency-Key` (a UUID per click, as for approve; C52) | payroll `POST /v1/pay-runs/{id}/payouts/{payout_id}/retry` (U; `Idempotency-Key` forwarded; never retried by the BFF) | 200 `Payout` | 409 `payout_not_retryable`; 409 `retry_limit_reached`; 409 `employee_bank_details_missing` (retry message); 403 `approver_must_differ` (retry message); 404 `pay_run_not_found`; 404 `payout_not_found` | PAY-500 |
+| POST `/api/pay-runs/[id]/payouts/[payoutId]/resolve` | approver | ✓ | `RunPayoutParam`, `ResolveBody` | payroll `POST /v1/pay-runs/{id}/payouts/{payout_id}/resolve` (U; read 3 s; never retried). The BFF forwards `{action, note}` unchanged and never logs `note` (only its length) | 200 `Payout` (`redrive`: current attempt `requested`, run `processing`; `mark_rejected`: attempt `rejected` with `failure_reason = "operator_rejected"`, payout `failed`, so Retry opens) | 409 `payout_not_blocked`; 404 `pay_run_not_found`; 404 `payout_not_found`; 422 `validation_error` (unknown action, missing or long note) | PAY-502 |
 
 #### Audit and infrastructure
 
 | Method, path | Role | Origin | Request | Service call | Response | Route-specific errors | Req |
 |---|---|---|---|---|---|---|---|
-| GET `/api/audit/auth` | admin | — | `ListQuery` | identity `GET /v1/audit-log` (U) | 200 `Page<AuthAuditEvent>` | — | PAY-109 |
-| GET `/api/audit/payroll` | admin | — | `ListQuery` | payroll `GET /v1/audit-events` (U) | 200 `Page<PayrollAuditEvent>` | — | plan §8 |
+| GET `/api/audit/auth` | admin | — | `ListQuery` | identity `GET /v1/audit-log?cursor&limit` (U) | 200 `Page<AuthAuditEvent>` (newest first) | — | PAY-109 |
+| GET `/api/audit/payroll` | admin | — | `ListQuery` | payroll `GET /v1/audit-events?cursor&limit` (U) | 200 `Page<PayrollAuditEvent>` (newest first) | — | plan §8 |
 | POST `/api/telemetry` | optional; own limit `BFF_TELEMETRY_RATE_LIMIT_IP`, failing open | ✓ | `TelemetryBody`, limit 8 KB | none | 204 | 429 `rate_limited` | §7.5 |
 | GET `/api/livez` | public, no limit | — | none | none | 200 `{status:"ok"}` | — | PAY-605 (web) |
-| GET `/api/readyz` | public, no limit | — | none | Redis `PING` | 200, or 503 `service_unavailable` | — | PAY-605 (web) |
+| GET `/api/readyz` | public, no limit | — | none | Redis `PING` | 200 `{status:"ok"}`, or 503 `service_unavailable` | — | PAY-605 (web) |
+| any method, unknown `/api/*` path | public, IP limit | — | none | none | — | 404 `not_found` | PAY-602 |
 
 **Approve idempotency (PAY-400).**
 - `approve-button.tsx` creates `crypto.randomUUID()` in the click handler, once per click. The key is stored in the mutation's variables, so a re-render can't change it.
@@ -360,7 +372,9 @@ Every error response is `{error: {code, message, request_id, details?}}` (PAY-60
 - **Unknown codes:**
   - an unknown 4xx keeps its status and becomes code `request_failed` with a generic message, logged as `bff.unmapped_error` at warning;
   - an unknown 5xx becomes 500 `internal_error`.
-- **`details`** is forwarded only for 422 `validation_error` (field names, with the problem but never the submitted value), `employee_in_overlapping_run` and `hours_missing` (`employee_ids`).
+- **`details`** is forwarded only in these cases, and always re-parsed first; if it doesn't parse, the response has no `details`:
+  - 422 `validation_error`: parsed as `ValidationDetails` (`[{field, issue}]`; C14). Extra keys are stripped, so no submitted value can pass through;
+  - `not_hourly`, `employee_not_in_run`, `employee_in_overlapping_run` and `hours_missing`: parsed as `EmployeeIdsDetails`, and only `employee_ids` is forwarded (C15).
 - **Internals are never forwarded:** no upstream message, stack trace, URL or SQL.
 
 | Code | Status | User-facing message | Source |
@@ -369,8 +383,12 @@ Every error response is `{error: {code, message, request_id, details?}}` (PAY-60
 | `forbidden_role` | 403 | "You don't have permission to do that." | BFF, services (PAY-601) |
 | `bad_origin` | 403 | "This request was blocked for your security. Reload the page and try again." | BFF (PAY-604) |
 | `payload_too_large` | 413 | "That request is too large." | BFF, services (PAY-604) |
-| `invalid_json` | 400 | "The request couldn't be read." | BFF |
-| `validation_error` | 422 | "Some fields need attention." (plus `details`) | BFF; also service 422s without a specific code (Issues #9) |
+| `invalid_json` | 400 | "The request couldn't be read." | BFF (R3) |
+| `bad_request` | 400 | "The request couldn't be processed." | services (C15) |
+| `not_found` | 404 | "That page or item wasn't found." | BFF (unknown `/api/*` path), services (C15) |
+| `method_not_allowed` | 405 | "That action isn't supported here." | BFF, services (C15) |
+| `idempotency_key_required` | 400 | "This approval was sent without its safety key. Reload the page and try again." | BFF, payroll (C34, PAY-400) |
+| `validation_error` | 422 | "Some fields need attention." (plus `details`) | BFF and services (R3, C14) |
 | `rate_limited` | 429 | "Too many requests. Try again in {Retry-After} seconds." (`Retry-After` forwarded) | BFF, identity, services (PAY-603, PAY-104) |
 | `service_unavailable` | 503 | "The service is temporarily unavailable. Please try again." | BFF (upstream down, timeout, breaker, Redis) (PAY-602, PAY-603) |
 | `db_timeout`, `db_unavailable` (upstream) | 503 → `service_unavailable` | as `service_unavailable` | payroll, identity (PAY-605) |
@@ -384,7 +402,9 @@ Every error response is `{error: {code, message, request_id, details?}}` (PAY-60
 | `invite_not_pending` | 409 | "This user has already accepted their invite." | identity (PAY-102) |
 | `cannot_modify_self` | 409 | "You can't change your own roles or status. Ask another admin." | identity (PAY-108) |
 | `last_admin` | 409 | "The company must keep at least one active admin." | identity (PAY-108) |
-| `user_not_found`, `invite_not_found` | 404 | "That user wasn't found." / "That invite wasn't found." | identity (Issues #8) |
+| `user_not_found`, `invite_not_found` | 404 | "That user wasn't found." / "That invite wasn't found." | identity (R3, PAY-602) |
+| `company_settings_not_found` | 404 | "Company settings haven't been set up yet. Ask an admin." | payroll (C15, PAY-200) |
+| `anchor_locked` | 409 | "The biweekly anchor can't change after biweekly runs exist." | payroll (R33, PAY-200) |
 | `employee_email_taken` | 409 | "An employee with this email already exists." | payroll (PAY-201) |
 | `employee_not_found` | 404 | "That employee wasn't found." | payroll (PAY-202) |
 | `pay_run_exists` | 409 | "A pay run already exists for this schedule and period." | payroll (PAY-300) |
@@ -392,7 +412,8 @@ Every error response is `{error: {code, message, request_id, details?}}` (PAY-60
 | `no_employees` | 409 | "No active employees are on this schedule." | payroll (PAY-300) |
 | `employee_in_overlapping_run` | 409 | "{n} employee(s) are already in another run that covers these dates." (lists them) | payroll (PAY-300) |
 | `pay_run_locked` | 409 | "This run is locked because it has been approved." | payroll (PAY-301, 302, 304) |
-| `not_hourly` | 422 | "Hours can only be entered for hourly employees." | payroll (PAY-301) |
+| `not_hourly` | 422 | "Hours can only be entered for hourly employees." (the rows in `details.employee_ids` are highlighted) | payroll (PAY-301) |
+| `employee_not_in_run` | 422 | "{n} employee(s) aren't in this run. Reload the run and try again." | payroll (C15, PAY-301) |
 | `hours_missing` | 422 | "Enter hours for every hourly employee before calculating ({n} missing)." | payroll (PAY-302) |
 | `pay_run_not_approvable` | 409 | "This run can't be approved: it has already been approved, or it isn't calculated." | payroll (PAY-400) |
 | `idempotency_key_reused` | 422 | "This approval was already submitted with different details. Reload and try again." | payroll (PAY-400) |
@@ -400,8 +421,10 @@ Every error response is `{error: {code, message, request_id, details?}}` (PAY-60
 | `approver_must_differ` (retry route) | 403 | **"Dual approval is on: you can't retry this payout because you last changed this employee's bank details. Ask another approver."** | payroll (PAY-500, ADR 0005) |
 | `payout_not_retryable` | 409 | "Only failed payouts can be retried. Payouts awaiting the bank or blocked can't be retried." | payroll (PAY-500) |
 | `retry_limit_reached` | 409 | "This payout has reached the limit of 5 attempts." | payroll (PAY-500) |
-| `employee_bank_details_missing` | 409 | "This employee is inactive or has no bank details. Update the employee first." | payroll (PAY-500) |
-| `pay_run_not_found`, `payslip_not_found`, `payout_not_found` | 404 | "That pay run / payslip / payout wasn't found." | payroll (Issues #8) |
+| `employee_bank_details_missing` (approve route) | 409 | "Some employees in this run have no bank details. Add their bank details, then approve." | payroll (PAY-400, R34) |
+| `employee_bank_details_missing` (retry route) | 409 | "This employee is inactive or has no bank details. Update the employee first." | payroll (PAY-500) |
+| `payout_not_blocked` | 409 | "This payout isn't blocked any more. Refresh the page." | payroll (PAY-502) |
+| `pay_run_not_found`, `payslip_not_found`, `payout_not_found` | 404 | "That pay run / payslip / payout wasn't found." | payroll (R3, PAY-602) |
 | `request_failed` | as upstream (4xx) | "The request couldn't be completed." | BFF fallback |
 
 `mapUpstreamError(target, res | err, routeName)` is a pure function with one Vitest case per row.
@@ -418,8 +441,10 @@ let keyPromise: ReturnType<typeof importPKCS8> | undefined;          // lazy: `n
 const signingKey = () => (keyPromise ??= importPKCS8(config().INTERNAL_JWT_PRIVATE_KEY, "EdDSA"));
 
 export async function internalToken(aud: Aud, p:
-  { sub: string; roles: Role[]; cid: string; sid?: string }): Promise<string> {
-  return new SignJWT({ roles: p.roles, cid: p.cid, ...(p.sid ? { sid: p.sid } : {}) })
+  { sub: string; roles: Role[]; cid: string; sid?: string; name?: string }): Promise<string> {
+  return new SignJWT({ roles: p.roles, cid: p.cid,
+      ...(p.sid !== undefined ? { sid: p.sid } : {}),
+      ...(p.name !== undefined ? { name: p.name } : {}) })            // user tokens only (R9, C10)
     .setProtectedHeader({ alg: "EdDSA", kid: config().INTERNAL_JWT_KID, typ: "JWT" })
     .setIssuer("web").setAudience(aud).setSubject(p.sub)   // user id, or "service:web" on public flows
     .setIssuedAt().setExpirationTime("60s").setJti(crypto.randomUUID())
@@ -427,16 +452,17 @@ export async function internalToken(aud: Aud, p:
 }
 ```
 
-- **Claims:** exactly `iss=web`, `aud` (`identity` or `payroll`), `sub`, `roles`, `cid`, `sid` (user tokens only), `iat`, `exp = iat + 60`, `jti` (PAY-600).
+- **Claims:** exactly `iss=web`, `aud` (`identity` or `payroll`), `sub`, `roles`, `cid`, `sid` and `name` (user tokens only), `iat`, `exp = iat + 60`, `jti` (PAY-600).
 - **A fresh token per upstream call.** Ed25519 signing costs about 50 µs. There's no cache, so a token never outlives its request by much.
-- **User tokens:** `sub=<user_id>`, roles and `cid` from the session, `sid` = `session.sid`.
-- **Public flows** (login, accept, reset request and confirm): `sub=service:web`, `roles=[]`, `cid=COMPANY_ID` (Issues #1).
+- **User tokens:** `sub=<user_id>`; `name`, roles and `cid` from the session; `sid` = `session.sid`. payroll stores `name` as `calculated_by_name` / `approved_by_name` (R9, C10).
+- **Public flows** (login, accept, reset request and confirm): `sub=service:web`, `roles=[]`, `cid=COMPANY_ID`, and no `name` or `sid` (R9).
+- **Test and CI tokens** are minted outside the app by `scripts/mint_token.py` (C35), never by a test-only route in the web.
 - **Never logged.** The `authorization` key is redacted (§7.1), and a test asserts that no captured log line contains the token.
 - **Key rotation** (`auth.md`): add the new public key to every service's `INTERNAL_JWT_PUBLIC_KEYS` first, then change `INTERNAL_JWT_PRIVATE_KEY` and `INTERNAL_JWT_KID`, then remove the old key after 60 s.
 
 #### 3.4.2 Timeouts, retries and breaker (`lib/api/resilient-fetch.ts`, `lib/api/breaker.ts`)
 
-`openapi-fetch` clients are created per request with `createClient<IdentityPaths>({ baseUrl: IDENTITY_BASE_URL, fetch: resilientFetch("identity", opts) })`; payroll is the same. A middleware (`client.use`) adds `Authorization`, `X-Request-ID` and `X-Client-IP`.
+`openapi-fetch` clients are created per request with `createClient<IdentityPaths>({ baseUrl: IDENTITY_BASE_URL, fetch: resilientFetch("identity", opts) })`; payroll is the same. A middleware (`client.use`) adds `Authorization` and `X-Request-ID`, and adds `X-Client-IP` only when `ctx.ip` isn't null (C16).
 
 | Policy | Value | Source |
 |---|---|---|
@@ -456,14 +482,14 @@ Each attempt:
 
 ### 4.1 Creating a session (login and accept)
 
-1. identity returns 200 with the user. The design needs `id`, `roles`, `roles_version`, `status` and `company_id` (Issues #2).
+1. identity returns 200 `SessionUser {user_id, company_id, email, name, roles, roles_version, status}` (R19, C6). The BFF parses it with the `SessionUser` Zod schema; a parse failure is 500 `internal_error` plus `bff.response_invalid`, and no session is created.
 2. **Rotation.** If the request carried a session cookie, delete that session (`DEL web:sess:<old k>`, `SREM`). Then generate a new ID: `randomBytes(32).toString("base64url")`. A session ID is never reused across a sign-in (PAY-106; prevents fixation).
 3. `k = HMAC(SESSION_SECRET, id)`, `now = Date.now()`. Run as one `MULTI`:
-   - `HSET web:sess:<k> user_id … cid … roles … roles_version … created_at now last_seen now roles_checked_at now`;
+   - `HSET web:sess:<k> user_id <user_id> cid <company_id> name <name> roles <JSON roles> roles_version <n> created_at now last_seen now roles_checked_at now`;
    - `EXPIRE web:sess:<k> SESSION_IDLE_TTL_S`;
    - `SADD web:user-sess:<user_id> <k>`;
    - `EXPIRE web:user-sess:<user_id> SESSION_ABS_TTL_S`.
-4. Set the cookie (§2.2). Log `auth.session.created {user_id_hash}` and increment `bff_sessions_created_total`.
+4. Set the cookie (§2.2). Log `auth.session.created {user_id_hash}` and increment `bff_sessions_created_total`. Respond `{user: toMe(sessionUser)}`.
 5. If Redis fails at step 3: 503 `service_unavailable`, with no cookie set. This route was already fail-closed at its limiter.
 
 ### 4.2 TTLs and the touch
@@ -491,13 +517,14 @@ Algorithm (PAY-106, PAY-107, PAY-601, PAY-603):
 3. Parse with the `SessionRecord` Zod schema. If it's corrupt → delete it, then 401.
 4. **Absolute check** (§4.2) → 401 if past.
 5. **Role and status re-check**, when `now − roles_checked_at ≥ SESSION_ROLE_RECHECK_S × 1000` (60 s):
-   - Call identity `GET /v1/users/me` with a user token (`sub=user_id`, the session's roles, `cid`, `sid`). This is single-flighted per `k` within the process, so parallel requests from one page share one call.
-   - **200, and `status === "active"` and `roles_version === session.roles_version`** → `HSET roles_checked_at now`, also writing `roles` from the response.
-   - **200 with a different `roles_version`, or a status other than `active`** → `revokeUserSessions(user_id, "roles_version_mismatch" | "inactive")`, log `auth.session.revoked`, then **401 `unauthenticated`**. The user signs in again and gets a new session with the new roles. If those roles no longer include the one an action needs, that action then returns 403 `forbidden_role`. This gives exactly PAY-107's "401 (session ended), or 403 when the roles shrank but the session was refreshed".
+   - Call identity `GET /v1/users/me` with a user token (`sub=user_id`, the session's `name`, roles, `cid`, `sid`) and parse the 200 body as `UserMe`. This is single-flighted per `k` within the process, so parallel requests from one page share one call.
+   - **200, and `id === session.user_id`, `company_id === session.cid`, `status === "active"` and `roles_version === session.roles_version`** → `HSET roles_checked_at now roles <JSON roles> name <name>`, writing `roles` and `name` from the response (C10).
+   - **200 with a different `roles_version`, or a status other than `active`** → `revokeUserSessions(user_id, "roles_version_mismatch" | "inactive")`, log `auth.session.revoked`, then **401 `unauthenticated`**. The user signs in again and gets a new session with the new roles. If those roles no longer include the one an action needs, that action then returns 403 `forbidden_role`. So a demotion or deactivation always ends the session with 401 (PAY-107), and 403 can follow only after the user signs in again with fewer roles.
+   - **200 with a different `id` or `company_id`** (should never happen) → log `bff.response_invalid`, revoke this session, then 401.
    - **401 or 404 from identity** (user gone, token rejected) → revoke this session, then 401.
    - **identity unavailable** (503, timeout or breaker open):
      - If `now − roles_checked_at < SESSION_RECHECK_GRACE_S × 1000` (300 s), **fail open**: keep the cached roles, don't update `roles_checked_at`, and log `auth.session.recheck_deferred` (warning). This keeps signed-in journeys working while identity is down (plan §12.1, "other journeys still work for signed-in users"). It's safe because no role change or reset can happen while identity is down.
-     - **Past the grace** → 503 `service_unavailable`. A change made just before identity went down then takes effect at most `SESSION_RECHECK_GRACE_S` later (Issues #17).
+     - **Past the grace** → 503 `service_unavailable` (C37, PAY-107). A change made just before identity went down then takes effect at most `SESSION_RECHECK_GRACE_S` later. While identity is reachable, a demotion or deactivation at time T gives 401 on any request after T + 60 s (PAY-107).
 6. **Touch** (§4.2). A Redis error here is ignored and logged once, at warning.
 7. **Roles.** If `roles` is given and the session holds none of them → 403 `forbidden_role`. The session stays valid.
 8. Return the `Session` (with `sid = k.slice(0, 32)`) and put it on the request context.
@@ -515,7 +542,7 @@ export async function revokeUserSessions(userId: string, reason: RevokeReason): 
 
 It's called:
 - after a successful `PATCH /api/users/[id]` that changes `roles` or `status` (the target user's sessions; the next request is 401 at once, without waiting for the 60 s re-check);
-- after a successful reset confirm, when identity returns `user_id` (Issues #3);
+- after a successful reset confirm, with the `user_id` from `ResetConfirmResult`, at once (R19);
 - by `requireSession` on a `roles_version` mismatch or a non-active status.
 
 Sign-out removes only the current session (`DEL` plus `SREM`).
@@ -534,7 +561,7 @@ Sign-out removes only the current session (`DEL` plus `SREM`).
 | Any route that needs a session (all `/api/*` except public ones) | `requireSession` → 503 `service_unavailable`; pages show the error boundary ("temporarily unavailable, try again") | `session.backend_error`, `bff_session_backend_errors_total` |
 | login, accept, reset request, reset confirm | The IP limiter **fails closed** → 503 `service_unavailable`, before identity is called | `ratelimit.backend_error`, `rate_limiter_errors_total{component="web"}` |
 | Session and IP limits on authenticated routes; the telemetry limit | **Fail open** (counted). In practice an authenticated route still 503s at the session lookup; the fail-open matters only when the limiter call fails and the session read succeeds (a flapping connection) | `rate_limiter_errors_total{component="web"}` |
-| `/api/readyz` | 503, so Kubernetes stops routing to the pod (`/livez` stays 200, so it isn't restarted) | — |
+| `/api/readyz` | 503, so Kubernetes stops routing to the pod (`/api/livez` stays 200, so it isn't restarted) | — |
 | logout | Best effort: the cookie is cleared, a Redis error is logged, and the response is 204 | `session.backend_error` |
 
 The `ioredis` options (`enableOfflineQueue: false`, `commandTimeout` 500 ms) bound each failure to about 500 ms, so a Redis outage gives fast 503s rather than hung requests.
@@ -554,29 +581,29 @@ export async function limit(scope: "ip" | "sess" | "tel", subject: string, perMi
   3. If `estimate > perMinute`, deny with `Retry-After = 60 − (now_s mod 60)` (rounded up, at least 1).
 
   It's shared across replicas through Redis. Plain `INCR` and `GET` mean no `EVAL` is needed (ACL §2.1).
-- **Subjects:** `ip` → `HMAC16(clientIp)`; `sess` → `HMAC16(k)`; `tel` → `HMAC16(clientIp)`. No raw IP is stored in Redis.
+- **Subjects:** `ip` → `HMAC16(clientIp ?? "unknown")`; `sess` → `HMAC16(k)`; `tel` → `HMAC16(clientIp ?? "unknown")`. No raw IP is stored in Redis. Requests with an unknown IP share one bucket.
 - **Limits:**
   - `BFF_RATE_LIMIT_IP` (300/min) on every `/api/*` route except health and telemetry;
   - `BFF_RATE_LIMIT_SESSION` (120/min) after the session check;
   - `BFF_TELEMETRY_RATE_LIMIT_IP` (60/min) on telemetry only.
 
-  The test environment (`compose.test.yaml`) raises the first two to 100000 so k6 at 30 req/s from one IP isn't throttled. A Vitest integration test proves that the production values limit.
+  The test environment (`compose.test.yaml`) raises the first two to 1000000 so k6 at 30 req/s from one IP isn't throttled. A Vitest integration test proves that the production values limit.
 - **Denied** → 429 `rate_limited` with `Retry-After`. Increment `rate_limited_total{scope}` and log `ratelimit.limited` (info: scope, route).
 - **Redis error** → see §4.5. Each route sets `fail_closed` or `fail_open`.
-- **The polling budget:** one run page polls two queries every 2 s while processing (§6.3), which is 60 requests a minute and fits inside 120. Two open run pages in one session reach the limit; the 429 is shown as "Live updates paused", and polling resumes after `Retry-After`.
-- **Login abuse limits** (`AUTH_LOGIN_LIMIT_ACCOUNT` / `_IP`, lockout) are identity's (PAY-104). The BFF forwards identity's 429 and `Retry-After` unchanged. identity needs the client IP for the per-IP limit and `ip_hash` (Issues #4).
+- **The polling budget:** one run page polls the run every 2 s while processing (30 requests a minute), plus the visible payouts page every 2 s while the Payouts tab is open (§6.3), so at most 60 a minute, inside 120. Two open run pages on the Payouts tab in one session reach the limit; the 429 is shown as "Live updates paused", and polling resumes after `Retry-After`.
+- **Login abuse limits** (`AUTH_LOGIN_LIMIT_ACCOUNT` / `_IP`, lockout) are identity's (PAY-104). The BFF forwards identity's 429 and `Retry-After` unchanged. identity takes the client IP for the per-IP limit and `ip_hash` from `X-Client-IP` (R18), which the BFF omits when the IP is unknown (C16).
 
 ### 5.2 Client IP (`lib/client-ip.ts`)
 
 ```ts
-export function clientIp(h: Headers, hops: number): string
+export function clientIp(h: Headers, hops: number): string | null     // null = unknown
 ```
 
 - Split `X-Forwarded-For` on commas and trim each entry. With `n` entries, return entry `n − 1 − hops`; the right-most entry has index `n − 1`.
-- If `n − 1 − hops < 0`, or the header is missing, return `"unknown"`, which shares one limiter bucket and is logged once per minute as `security.client_ip_unknown` (warning).
+- If `n − 1 − hops < 0`, or the header is missing, return `null`. Unknown IPs share one limiter bucket (§5.1), the identity client **omits `X-Client-IP`** (C16), and it's logged at most once per minute as `security.client_ip_unknown` (warning).
 - The left-most value is never trusted on its own (`architecture.md` §9).
-- **The dev value is 0 (no proxy).** This relies on the Next.js standalone server appending the socket peer address to `X-Forwarded-For` (Issues #5). `TRUSTED_PROXY_HOPS = 1` in uat and prod (one ingress).
-- An entry that isn't a valid IPv4 or IPv6 address is treated as `"unknown"`.
+- **The dev value is 0 (no proxy).** This relies on the Next.js standalone server appending the socket peer address to `X-Forwarded-For`. Task S7 runs a short spike to confirm this on Next 16 (R36). If the peer address isn't available, local dev uses the `X-Forwarded-For` set by the Next server, and the outcome is recorded in the spec README. `TRUSTED_PROXY_HOPS = 1` in uat and prod (one ingress).
+- An entry that isn't a valid IPv4 or IPv6 address is treated as unknown (`null`).
 
 ### 5.3 Body limits (`lib/body.ts`, PAY-604)
 
@@ -594,7 +621,7 @@ Routes without a body schema reject a non-empty body with 422. Telemetry uses `l
 ### 5.4 Origin check (`lib/origin.ts`, PAY-604)
 
 - Mutations are POST, PUT, PATCH and DELETE.
-- `Origin` must equal `new URL(PUBLIC_BASE_URL).origin` exactly: scheme, host and port.
+- `Origin` must equal `new URL(PUBLIC_BASE_URL).origin` exactly: scheme, host and port. In dev and CI that is `http://127.0.0.1:${WEB_PORT}` (C12), so a browser on `http://localhost:4100` gets 403.
 - A missing `Origin`, `Origin: null`, or any other value gives 403 `bad_origin` and logs `security.bad_origin` (route, plus the origin's host only).
 - This runs for public mutations too (login, accept, reset, telemetry, logout).
 - Together with `SameSite=Lax` it is the CSRF defence (plan §8). k6 and the Playwright `page.request` helpers send `Origin: BASE_URL`.
@@ -625,7 +652,7 @@ export const config = {
 
 `buildCsp(nonce, env)` returns:
 
-```
+```text
 default-src 'self';
 script-src 'self' 'nonce-<nonce>' 'strict-dynamic'[ 'unsafe-eval' in dev only];
 style-src 'self' 'unsafe-inline';
@@ -671,7 +698,10 @@ The route wrapper adds `Cache-Control: no-store` to every `/api/*` response. Pag
 - **Formatting:**
   - `formatCents` uses integer division into dollars and cents, then `Intl.NumberFormat("en-US", { style: "currency", currency: "USD" })` on the parts;
   - basis points display as `xx.xx%`, hours as `h.hh`;
-  - dates are shown as calendar dates with no timezone conversion (period dates are `date` values in the company timezone, plan §2.1), and timestamps in the browser's locale.
+  - dates are shown as calendar dates with no timezone conversion (period dates are `date` values in the company timezone, plan §2.1), and timestamps in the browser's locale;
+  - a null amount (a `pending` payslip) shows as "—".
+- **Paging (C8).** Every list is paged with `<CursorPager>`: it keeps a stack of the cursors seen, so "Next" sends `cursor=next_cursor` and "Previous" pops the stack; "Next" is disabled when `next_cursor` is null. Page size is 50 unless stated. The cursor is opaque and kept in component state, not in the URL. Changing a filter resets the stack.
+- **User references.** `created_by`, `calculated_by`, `approved_by`, `bank_updated_by` and `actor_id` are user IDs as strings. They show as "you" when equal to `Me.id`; otherwise the `*_name` field where the model has one, else the first 8 characters of the ID.
 - **Role gating.** `<RoleGate roles>` hides controls the user can't use, and the BFF still enforces. A page the user can't open at all renders `<Forbidden/>` (status 403 text, a link to the dashboard).
 
 ### 6.2 Pages
@@ -681,37 +711,53 @@ The route wrapper adds `Cache-Control: no-store` to every `/api/*` response. Pag
 | `/login` | Sign in | — | Submit `POST /api/auth/login`, then go to `next` (only a same-origin path that starts with `/` and not `//`), else `/dashboard`. 401 → "Email or password is incorrect."; 429 → countdown from `Retry-After`; 503 → "try again". A "Forgot password?" link goes to `/reset` | public | PAY-104 |
 | `/accept` | Accept an invite | — | On mount, read `location.hash` (`#token=…`), keep it in component state, and call `history.replaceState(null, "", "/accept")`, so the token leaves the address bar and history. The token is never put in a query string, log or telemetry. Fields: password and confirm (≥ 12). Submit `POST /api/auth/accept`, then `/dashboard`. 400 `invite_invalid` → its message, with no form | public | PAY-103, NFR-07 |
 | `/reset` | Request or confirm a reset | — | **No `#token`:** an email form → `POST /api/auth/reset/request` → always "If an account exists for that email, we've sent a reset link." **With `#token`:** read and strip it as on `/accept`; new password and confirm → `POST /api/auth/reset/confirm` → `/login` with the notice "Password changed. Sign in with your new password." | public | PAY-105 |
-| `/dashboard` | The landing page after sign-in | `GET /api/auth/me`, `GET /api/pay-runs?limit=10`, `GET /api/employees?status=active&limit=1` (shows "50+" or the exact count when it has no `next_cursor`) | Cards: runs in `processing` (link), runs `partially_failed` (link, "needs attention"), the latest runs. Quick actions: "New pay run" and "Add employee" (payroll_admin) | any | PAY-303, 413 |
-| `/employees` | The employee list | `GET /api/employees?status&cursor&limit=50` | Filter by status (active/inactive). Columns: name, email, pay type, pay basis (annual salary or hourly rate), schedule, bank `••••<account_last4>`, status. Cursor pager. "Add employee" (payroll_admin) | any; add: payroll_admin | PAY-202, J2 |
+| `/dashboard` | The landing page after sign-in | `GET /api/auth/me`; `GET /api/pay-runs?status=processing&limit=10`; `GET /api/pay-runs?status=partially_failed&limit=10`; `GET /api/pay-runs?limit=10`; `GET /api/employees?status=active&limit=50` (shows the exact count when `next_cursor` is null, else "50+") | Cards: runs in `processing` (link; "{counts.blocked} blocked" when non-zero), runs `partially_failed` (link, "needs attention"), the latest runs. Quick actions: "New pay run" and "Add employee" (payroll_admin) | any | PAY-303, 413 |
+| `/employees` | The employee list | `GET /api/employees?status&cursor&limit=50` | Filter by status (active/inactive). Columns: name, email, pay type, pay basis (annual salary or hourly rate), schedule, bank (`••••<account_last4>`, or "No bank details" when `has_bank_details` is false), status. Cursor pager. "Add employee" (payroll_admin) | any; add: payroll_admin | PAY-202, J2 |
 | `/employees/new` | Create an employee | `GET /api/settings` (for the schedule hint) | Form per `EmployeeCreateBody`: pay type switches between the salary and rate fields; inline ABA checksum; account 4–17 digits. Submit → `/employees/[id]`. 409 `employee_email_taken` shown on the email field | payroll_admin (others get `<Forbidden/>`) | PAY-201 |
-| `/employees/[id]` | View and edit | `GET /api/employees/[id]` | View for every role. Edit (payroll_admin): the fields as on create. **Bank details are a separate "Change bank details" dialog** that takes a full new routing and account number and never shows the existing ones (only `••••last4`). Deactivate or reactivate with a confirm dialog. Shows `bank_updated_at` | view any; edit: payroll_admin | PAY-202, 203, ADR 0004 |
-| `/settings` | Company settings | `GET /api/settings` | Read-only for non-admins. Admin form: name, tax rate (%), retirement rate (%), timezone (select), biweekly anchor (date; Mondays only), "Require dual approval" switch. Turning it off asks for confirmation: "Runs already calculated keep dual approval." Save → `PUT /api/settings` | view any; edit: admin | PAY-200, ADR 0005 |
-| `/users` | Users and invites | `GET /api/users` | Table: name, email, roles, status (pending, active, inactive). "Invite user" dialog (email, name, role checkboxes; at least one) → `POST /api/users/invite`. Per row: "Edit roles", "Deactivate" or "Reactivate" (confirm) → `PATCH /api/users/[id]`, with these controls disabled on the admin's own row (`cannot_modify_self`). "Resend invite" for pending users → `POST /api/invites/[invite_id]/resend` | admin | PAY-101, 102, 108 |
-| `/pay-runs` | The run list | `GET /api/pay-runs` | Columns: period, schedule, pay date, status badge, net total, payout counts. Newest period first; cursor pager. "New pay run" (payroll_admin) | any | PAY-303 |
+| `/employees/[id]` | View and edit | `GET /api/employees/[id]` | View for every role. Edit (payroll_admin): the fields as on create. **Bank details are a separate "Change bank details" dialog** that takes a full new routing and account number and never shows the existing ones (only `••••last4`). Deactivate or reactivate with a confirm dialog; when `has_bank_details` is false, the reactivate dialog also requires a new routing and account number and sends them in the same PATCH (PAY-203, PAY-608). Shows `bank_updated_at` and `bank_updated_by` | view any; edit: payroll_admin | PAY-202, 203, ADR 0004 |
+| `/settings` | Company settings | `GET /api/settings` | Read-only for non-admins. Admin form: name, tax rate (%), retirement rate (%), timezone (select), biweekly anchor (date; Mondays only), "Require dual approval" switch. Turning it off asks for confirmation: "Runs already calculated keep dual approval." Save → `PUT /api/settings`; 409 `anchor_locked` shows its message on the anchor field. Shows `updated_at` and `updated_by`. A 404 `company_settings_not_found` shows its message instead of the form | view any; edit: admin | PAY-200, ADR 0005 |
+| `/users` | Users and invites | `GET /api/users?cursor&limit=50` | Table: name, email, roles, status (pending, active, inactive). Cursor pager. "Invite user" dialog (email, name, role checkboxes; at least one) → `POST /api/users/invite`. Per row: "Edit roles", and "Deactivate" (confirm) on active users → `PATCH /api/users/[id]`, with these controls disabled on the admin's own row (`cannot_modify_self`). **There is no "Reactivate"**: inactive users are read-only (R37, C25). "Resend invite" for pending users → `POST /api/invites/[pending_invite_id]/resend` (R21, C11) | admin | PAY-101, 102, 108 |
+| `/pay-runs` | The run list | `GET /api/pay-runs?cursor&limit=50` | Columns: period, schedule, pay date, status badge, net total, payout counts (paid / failed / requested from `counts`). Newest period first; cursor pager. "New pay run" (payroll_admin) | any | PAY-303 |
 | `/pay-runs/new` | Create a run | `GET /api/settings` | Schedule select. `period_start` date input with suggestions: monthly → the next first-of-month dates; biweekly → `biweekly_anchor + 14k` dates. The read-only derived `period_end` is shown for information; payroll derives the real value. Submit → `/pay-runs/[id]`. Errors: `pay_run_exists` (links to the existing run when it can be found in the list), `invalid_period_start`, `no_employees`, `employee_in_overlapping_run` (listing the employees) | payroll_admin | PAY-300 |
-| `/pay-runs/[id]` | Run detail (§6.3) | `GET /api/pay-runs/[id]`, `/payslips`, `/payouts` | Hours, calculate, delete, approve, retry | view any; actions by role | PAY-301–304, 400, 401, 413, 500, 501 |
-| `/audit` | Audit logs | `GET /api/audit/auth`, `GET /api/audit/payroll` | Two tabs; cursor paging; event, actor and target IDs, time. `ip_hash` is shown truncated. Changes on the payroll tab show field names only | admin | PAY-109, plan §8 |
+| `/pay-runs/[id]` | Run detail (§6.3) | `GET /api/pay-runs/[id]`, `/payslips`, `/payouts` | Hours, calculate, delete, approve, retry, resolve | view any; actions by role | PAY-301–304, 400, 401, 413, 500, 501, 502 |
+| `/audit` | Audit logs | `GET /api/audit/auth?cursor&limit=50`, `GET /api/audit/payroll?cursor&limit=50` | Two tabs, each with its own cursor pager. Auth tab: time, event, actor and target IDs, `ip_hash` truncated. Payroll tab: time, event, `actor_id`, `entity_type`, `entity_id`. On both tabs `details` shows its key names only, never values | admin | PAY-109, plan §8 |
 
 ### 6.3 The run page (`/pay-runs/[id]`)
 
 **Header (`run-header.tsx`).**
 - Period, schedule, pay date and status badge (`draft`, `calculated`, `processing`, `paid`, `partially_failed`), each with a text label and icon, not colour alone.
-- Totals: gross, tax, retirement, net, and **funding required**.
-- Payout counts (requested, paid, failed).
-- `calculated_by` and `approved_by`, shown as "you" when the ID equals the session user, else a short ID (Issues #13). `approved_at`.
+- Totals: gross, tax, retirement, net, and **funding required** (from `totals`; "—" while `draft`). Employee count (`employee_count`).
+- Payout counts from `counts` (C9): paid (with "{no_transfer} with no transfer" when non-zero), failed, requested, and within requested, awaiting bank and blocked.
+- "Calculated by {calculated_by_name}" and "Approved by {approved_by_name}" (R21), each shown as "you" when the ID equals `Me.id`, with `calculated_at` and `approved_at`. A null name falls back to the short ID (§6.1).
+- When `require_dual_approval` is true: a "Dual approval" label (the calculate-time snapshot).
 
 **Actions (`run-actions.tsx`).**
 
 | Action | Shown when | Role | Call |
 |---|---|---|---|
-| Save hours | `draft` or `calculated`, and the run has hourly payslips | payroll_admin | `PUT /api/pay-runs/[id]/hours`. A calculated run goes back to draft; the UI says so before saving |
+| Save hours | `draft` or `calculated`, and the run has hourly payslips | payroll_admin | `PUT /api/pay-runs/[id]/hours` → `Hours`. A calculated run goes back to draft; the UI says so before saving. On success the run and payslips queries are invalidated and refetched (C7). 422 `not_hourly` / `employee_not_in_run` highlight the rows in `details.employee_ids` |
 | Calculate | `draft` or `calculated` | payroll_admin | `POST …/calculate`. 422 `hours_missing` highlights the missing rows |
 | Delete | `draft` or `calculated` | payroll_admin | Confirm dialog, then `DELETE`, then `/pay-runs` |
-| Approve | `calculated` | approver | `approve-button.tsx` (§3.2). The confirm dialog shows the funding total and payout count. If `calculated_by === me`, a hint above the button says "You calculated this run. With dual approval on, another approver must approve it." The button stays enabled, because the snapshot decides (Issues #14). On 403 `approver_must_differ`, an inline `role="alert"` shows the dual-approval message (§3.3) |
+| Approve | `calculated` | approver | `approve-button.tsx` (§3.2). The confirm dialog shows the funding total and the employee count. If `require_dual_approval` is true and `calculated_by === Me.id`, a hint above the button says "You calculated this run. With dual approval on, another approver must approve it." The button stays enabled, because payroll also applies the bank-change rule, which the UI can't see. On 403 `approver_must_differ`, an inline `role="alert"` shows the dual-approval message (§3.3); 409 `employee_bank_details_missing` shows the approve message |
 
 **Tabs** (shadcn Tabs; `?tab=payslips|payouts`; the default is `payslips` before approval and `payouts` after):
-- **Payslips** (`payslips-tab.tsx`, `hours-editor.tsx`). One row per payslip: employee, pay type, hours (an editable input for hourly rows in `draft`/`calculated` for payroll_admin; text otherwise), gross, tax, retirement, net. Clicking a row opens `payslip-dialog.tsx` (`GET …/payslips/[payslipId]`). The table footer shows the totals from the run summary, never sums computed in the browser.
-- **Payouts** (`payouts-tab.tsx`, PAY-501). One row per payout: employee, badge, failure reason, attempt number, and a "History" disclosure (`attempt-history.tsx`) listing every attempt with its status, reason, bank reference, `requested_at` and `final_at`. A "Retry" button (`retry-button.tsx`, approver) appears on `failed` rows only. On 403 `approver_must_differ` it shows the retry message (§3.3). The other 409s show their messages.
+- **Payslips** (`payslips-tab.tsx`). `GET …/payslips?cursor&limit=50` with a cursor pager (C8). One row per payslip: employee, pay type, hours, gross, tax, retirement, net (amounts "—" while `pending`). Clicking a row opens `payslip-dialog.tsx` (`GET …/payslips/[payslipId]`). The table footer shows the totals from the run summary, never sums computed in the browser.
+- **Hours editor** (`hours-editor.tsx`; payroll_admin, `draft`/`calculated` only). It loads **every** payslip by following `next_cursor` (`limit=100`) until it is null (C8), and lists the `hourly` ones with an input each (prefilled from `hours_hundredths`). Save sends one `HoursBody` with the changed rows (max 500 per request; more are sent in sequential requests of 500).
+- **Payouts** (`payouts-tab.tsx`, PAY-501). `GET …/payouts?cursor&limit=50` with a cursor pager and a status filter (all, requested, paid, failed). One row per payout: employee, amount (`amount_cents`), bank `••••<account_last4>` of the current attempt, badge, failure reason, attempt number, and a "History" disclosure (`attempt-history.tsx`) listing every attempt with its status, reason, bank reference, `••••account_last4`, `requested_at` and `final_at`. Rows link to their payslip by `payslip_id`.
+  - A "Retry" button (`retry-button.tsx`, approver) appears on `failed` rows only. On 403 `approver_must_differ` it shows the retry message (§3.3). The other 409s show their messages.
+  - A "Resolve" button (approver) appears on **Blocked** rows only (current attempt `needs_operator`) and opens `resolve-dialog.tsx` (PAY-502, R8; below).
+
+**Resolve dialog (`resolve-dialog.tsx`, PAY-502).**
+- Title "Resolve blocked payout"; it shows the employee, amount, attempt number and `••••account_last4`.
+- **A warning at the top, before the choices:** "Check the bank first. Look up this transfer with the bank (runbook `PayoutNeedsOperator.md`: `GET /v1/transfers/{key}`) before you choose. Don't mark it rejected if the bank shows it settled."
+- **Two radio choices** (no default selected, so the user must choose):
+  - "Send again (redrive)": "Use when the bank has no record of the transfer, or it is pending, and the cause is fixed. The same attempt is sent again." → `action: "redrive"`;
+  - "Mark rejected": "Use when the bank shows no settled transfer. The payout becomes failed, and Retry becomes available." → `action: "mark_rejected"`.
+- **A required note** (`<textarea>`, 1–500 characters, with a live counter), labelled "Note for the audit log (what you checked at the bank)". Only its length is audited.
+- The submit button reads "Resolve" and is disabled until a choice and a note are present, and while the mutation is pending. Submit → `POST /api/pay-runs/[id]/payouts/[payoutId]/resolve` with `ResolveBody` (never retried, `retry: 0`).
+- **On 200:** close the dialog, toast "Payout resent" or "Payout marked rejected", and invalidate the run and payouts queries. A redrive moves the run back to `processing`, which restarts polling.
+- **On 409 `payout_not_blocked`:** show its message in the dialog's `role="alert"` and refetch the payouts. 422 errors show inline on the note or the choice. Other errors follow §6.1.
+- Built on Radix `AlertDialog`: focus starts on the warning heading, is trapped, and returns to the Resolve button on close.
 
 **Payout badge (`lib/payout-badge.ts`).** The input is the payout plus its current attempt (`attempts` where `attempt === current_attempt`).
 
@@ -722,25 +768,25 @@ The route wrapper adds `Cache-Control: no-store` to every `/api/*` response. Pag
 | `failed` | `rejected` | — | "Failed" + reason | Retry shown (approver) |
 | `requested` | `requested` | — | "Processing" | |
 | `requested` | `indeterminate` | — | **"Awaiting bank"** | PAY-413 |
-| `requested` | `needs_operator` | — | **"Blocked"** | PAY-413, PAY-409. Tooltip: "An operator must resolve this payout. It can't be retried." |
+| `requested` | `needs_operator` | — | **"Blocked"** | PAY-413, PAY-409. Tooltip: "An operator must resolve this payout. It can't be retried." Resolve shown (approver; PAY-502) |
 
-Failure reasons display as: `account_closed` → "Account closed", `insufficient_funds_at_bank` → "Insufficient funds at the bank". Anything else shows its code.
+Failure reasons display as: `account_closed` → "Account closed", `insufficient_funds_at_bank` → "Insufficient funds at the bank", `operator_rejected` → "Rejected by an operator". Anything else shows its code.
 
 **Polling (PAY-413).**
-- `useQuery(["pay-run", id], …, { refetchInterval: (q) => q.state.data?.status === "processing" ? 2000 : false, refetchIntervalInBackground: false })`.
-- The payouts query uses the same interval, keyed off the run query's status, while the Payouts tab is open or a run-level banner needs it. Payout counts come from the run summary; attempt-level states (awaiting bank, blocked) come from the payouts list (Issues #12).
-- **Polling stops** as soon as the status is `paid` or `partially_failed`. Both queries then refetch once, so the final state is complete.
-- **Run-level banner while `processing`:**
-  - "Paying employees: {paid} of {total} paid" (from counts);
-  - plus "{n} awaiting bank", when any current attempt is `indeterminate`;
-  - plus "{n} blocked: an operator must resolve these", when any is `needs_operator`.
-- A retry moves the run back to `processing`, which restarts polling.
+- `useQuery(["pay-run", id], …, { refetchInterval: (q) => q.state.data?.status === "processing" ? 2000 : false, refetchIntervalInBackground: false })`. This one endpoint carries every number the header and banner need, including `counts.awaiting_bank` and `counts.blocked` (R21, C9).
+- The **payouts query** (the visible page only) uses the same interval, keyed off the run query's status, **only while the Payouts tab is open**, for the per-row badges.
+- **Polling stops** as soon as the status is `paid` or `partially_failed`. The run query and, if mounted, the payouts query then refetch once, so the final state is complete.
+- **Run-level banner while `processing`** (all from `counts`):
+  - "Paying employees: {paid} of {paid + failed + requested} paid";
+  - plus "{awaiting_bank} awaiting bank", when non-zero;
+  - plus "{blocked} blocked: an operator must resolve these", when non-zero, with a link that opens the Payouts tab filtered to `requested`.
+- A retry or a redrive moves the run back to `processing`, which restarts polling.
 
 **Accessibility notes (PAY-NFR-14):**
 - **Status changes** are announced through a polite `aria-live` region (`live-region.tsx`). It speaks only when the status or a count changes (for example "Run paid: 498 paid, 2 failed"), never on every poll.
 - **Badges** carry text; colour is never the only signal. Contrast is at least 4.5:1 in the theme tokens.
 - **Errors.** The dual-approval and other action errors render in `role="alert"`, linked to the button with `aria-describedby`. Form fields use `aria-invalid` and `aria-describedby` for their errors. After a failed submit, focus moves to the first invalid field.
-- **Dialogs** (Radix) trap focus and return it to the trigger. Destructive confirms use `AlertDialog`.
+- **Dialogs** (Radix) trap focus and return it to the trigger. Destructive confirms and the resolve dialog use `AlertDialog`; the resolve choices are a labelled radio group, and the note's counter is announced politely.
 - **Tables** use `<th scope="col">` and a `<caption>` (visually hidden where needed). The hours inputs have labels like "Hours for {employee}".
 - **Tabs** follow the WAI-ARIA tabs pattern (Radix), with arrow keys.
 - **Navigation:** every page has a unique `<title>` and one `<h1>`; a skip link goes to `<main>`.
@@ -750,7 +796,7 @@ Failure reasons display as: `account_closed` → "Account closed", `insufficient
 
 ### 7.1 Logs (`lib/logger.ts`, pino)
 
-- **Output:** JSON lines to stdout, and to OTLP through `pino-opentelemetry-transport` to Loki. Level `LOG_LEVEL`.
+- **Output:** JSON lines to stdout, and to OTLP through `pino-opentelemetry-transport` to Loki. Level `LOG_LEVEL`, read case-insensitively (the docs write it in uppercase; C24) and lower-cased for pino.
 - **Base fields:** `service: "web"`, `env`, `version` (`APP_VERSION`).
 - **Added per line:**
   - `ts` (ISO, `pino.stdTimeFunctions.isoTime`), `level` (label), `logger`, `event`, `msg`;
@@ -760,7 +806,7 @@ Failure reasons display as: `account_closed` → "Account closed", `insufficient
   These match the Python field names (`observability.md` §1).
 - **Redaction** (PAY-NFR-07). A custom `formatters.log` walks the object to depth 6 and masks with `"[REDACTED]"` any key whose lower-cased name **contains** one of:
   - the shared deny-list: `password`, `token`, `authorization`, `cookie`, `account`, `routing`, `api_key`;
-  - web additions: `set-cookie`, `secret`, `private_key`, `session`, `sid`, `idempotency`, `email`, `name`, `cents`, `salary`, `rate`.
+  - web additions: `set-cookie`, `secret`, `private_key`, `session`, `sid`, `idempotency`, `email`, `name`, `note`, `cents`, `salary`, `rate`.
 
   The custom formatter is used because pino's path-based `redact` can't match keys at any depth. The `email` and `name` additions keep personal data and amounts out of logs, which carry IDs and counts only (plan §11). `account` also masks `account_last4`, which is acceptable.
 - **User-entered text** (client error messages) is logged as its length outside dev.
@@ -788,7 +834,8 @@ Failure reasons display as: `account_closed` → "Account closed", `insufficient
 | `web.vitals` | info | `name`, `value`, `rating`, `route` | Telemetry | §7.5 |
 | `web.client_error` | warning | `route`, `message` (dev) or `message_len` (uat, prod) | Telemetry | §7.5, NFR-07 |
 | `web.server_error` | error | `route`, `digest`, `exc` | `onRequestError` | PAY-602 |
-| `config.invalid` | error | `setting` (name only, never the value) | Startup check fails (the process then exits 1) | PAY-605 |
+| `bff.payout_resolve` | info | `action`, `note_len`, `status` | §3.2 resolve route, after payroll answers (never the note text) | PAY-502 |
+| `config.invalid` | error | `setting` (name only, never the value) | Startup check fails (the process then exits 2; C29) | PAY-605 |
 
 ### 7.2 Metrics (`lib/metrics.ts`, meter `web`)
 
@@ -805,6 +852,8 @@ Failure reasons display as: `account_closed` → "Account closed", `insufficient
 | `bff_sessions_created_total` | counter | `via` (login, accept) | §4.1 | PAY-106 |
 | `bff_sessions_revoked_total` | counter | `reason` | §4.4 | PAY-107 |
 
+**SLI exclusion.** The SLI recording rules drop the health and telemetry routes with `route!~"/api/livez|/api/readyz|/api/telemetry"` (C4). The histogram still records them, so they appear in dashboards.
+
 **Export.** The metrics leave through an OTLP HTTP metric exporter to the Collector. With the Collector's Prometheus exporter they appear with `service_name="web"`.
 - The histogram instrument is created as name `bff_request_duration`, unit `s`, so the exporter's unit suffix produces `bff_request_duration_seconds` exactly. `lib/metrics.test.ts` asserts the exported name.
 - Counters likewise drop `_total` from the instrument name, so the exporter's suffix produces the names above.
@@ -816,7 +865,7 @@ Failure reasons display as: `account_closed` → "Account closed", `insufficient
   - passed to handlers as a request header;
   - sent to services as `X-Request-ID`;
   - returned on every BFF response and in `error.request_id`.
-- **`x-trace-id`:** the active span's trace ID (32 hex), set in `route()` step 10 on every BFF response, error responses included (PAY-604). In prod, with 10% parent-based sampling, the ID is present even when the trace isn't stored. The e2e trace test runs in the test stack at sampler 1.0.
+- **`x-trace-id`:** the active span's trace ID (32 hex), set in `route()` step 10 on every BFF response, error responses included (PAY-604). The web sends every span (`parentbased_always_on`; C23). In prod the Collector's `tail_sampling` keeps all errors, traces slower than 300 ms and 10% of the rest (R27), so the ID is always present but a fast, successful trace may not be stored. The test stack keeps every trace, which the e2e trace test relies on.
 
 ### 7.4 Tracing (`src/instrumentation.ts`)
 
@@ -825,7 +874,7 @@ import { registerOTel } from "@vercel/otel";
 export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
   const { loadConfig } = await import("./lib/config");
-  const cfg = loadConfig();                                   // uat/prod: logs config.invalid and exits 1
+  const cfg = loadConfig();                                   // a failed check: logs config.invalid and exits 2 (C29)
   const { IORedisInstrumentation } = await import("@opentelemetry/instrumentation-ioredis");
   const { PeriodicExportingMetricReader } = await import("@opentelemetry/sdk-metrics");
   const { OTLPMetricExporter } = await import("@opentelemetry/exporter-metrics-otlp-http");
@@ -840,11 +889,10 @@ export async function register() {
 export { onRequestError } from "./lib/on-request-error";
 ```
 
-- **`propagateContextUrls`** is built from `IDENTITY_BASE_URL` and `PAYROLL_BASE_URL` themselves (`originRegex` escapes the origin and anchors it as `^<origin>/`). So the test override that routes them through `toxiproxy:<port>` still propagates `traceparent`. A missing host would silently break the J4 trace (PAY-NFR-09); `trace.spec.ts` catches that.
-- **Endpoint:** `OTEL_EXPORTER_OTLP_ENDPOINT` → the Collector on port 4318 (HTTP/protobuf). Sampler: `OTEL_TRACES_SAMPLER=parentbased_traceidratio`, `OTEL_TRACES_SAMPLER_ARG`.
+- **`propagateContextUrls`** is built from `IDENTITY_BASE_URL` and `PAYROLL_BASE_URL` themselves (`originRegex` escapes the origin and anchors it as `^<origin>/`). So the test override that routes payroll through `toxiproxy:18001` still propagates `traceparent`. A missing host would silently break the J4 trace (PAY-NFR-09); `trace.spec.ts` catches that.
+- **Endpoint:** `OTEL_EXPORTER_OTLP_ENDPOINT` → the Collector on port 4318 (HTTP/protobuf). Sampler: `OTEL_TRACES_SAMPLER=parentbased_always_on` in every environment; there is no `OTEL_TRACES_SAMPLER_ARG` (C23). Prod sampling is the Collector's job (R27).
 - **If the pinned `@vercel/otel` has no `metricReader` option,** `lib/metrics.ts` creates its own `MeterProvider` with the same reader and sets it globally.
-- **Manual spans:** `bff.session.require` (attribute `session.recheck: boolean`) and `bff.session.recheck`.
-- **Span hygiene:**
+- **Manual spans:** `bff.session.require` (attribute `session.recheck: boolean`) and `bff.session.recheck`.- **Span hygiene:**
   - span attributes carry route templates, never raw query strings;
   - `url.full` on fetch spans to services contains only IDs (no tokens, which are never in URLs: PAY-103);
   - the ioredis serializer drops arguments, so no session key or IP hash appears in spans;
@@ -860,7 +908,8 @@ export { onRequestError } from "./lib/on-request-error";
 ## 8. Configuration
 
 All keys are read once by `lib/config.ts` (Zod).
-- **Startup checks** run in uat and prod and refuse to start, logging `config.invalid` with the setting's name only (PAY-605, ADR 0008), when:
+- **Parsing** runs in every environment: a missing or malformed key logs `config.invalid` and exits 2.
+- **Startup checks** run in uat and prod and refuse to start, logging `config.invalid` with the setting's name only and exiting 2 (PAY-605, C29, ADR 0008), when:
   - a required secret is missing or still has its dev default;
   - `INTERNAL_JWT_KID` starts with `dev-` or `test-`;
   - `PUBLIC_BASE_URL` isn't `https`;
@@ -873,40 +922,49 @@ All keys are read once by `lib/config.ts` (Zod).
 |---|---|---|---|---|
 | `ENV` | `dev`\|`uat`\|`prod` | dev / uat / prod | Drives the startup checks, HSTS and CSP dev relaxations | PAY-605 |
 | `APP_VERSION` | string | git SHA (build arg) | `service.version`, log `version` | NFR-09 |
-| `PORT` | int | 4100 | Container port (HLD §1); host 4100 in Compose | NFR-13 |
-| `PUBLIC_BASE_URL` | URL | `http://localhost:4100` / per env (https) / per env (https) | Origin check, open-redirect guard, CSP `upgrade-insecure-requests` | PAY-604 |
-| `IDENTITY_BASE_URL` | URL | `http://identity:8000` (test override: via Toxiproxy) | Also feeds `propagateContextUrls` | NFR-09 |
-| `PAYROLL_BASE_URL` | URL | `http://payroll:8000` (test override: via Toxiproxy) | Same | NFR-09 |
-| `COMPANY_ID` | uuid | fixed dev UUID / per env | `cid` on `service:web` tokens (Issues #1) | PAY-600 |
+| `PORT` | int | 3000 | The port inside the container in every environment. Compose publishes host `127.0.0.1:${WEB_PORT}` (4100) → 3000; Kubernetes probes and the Service target 3000 (C4) | NFR-13 |
+| `PUBLIC_BASE_URL` | URL | `http://127.0.0.1:${WEB_PORT}` (`http://127.0.0.1:4100`) / per env (https) / per env (https) | Origin check, open-redirect guard, CSP `upgrade-insecure-requests`. identity's `IDENTITY_PUBLIC_BASE_URL` (the invite and reset link base) is set to the same value (R24, C12) | PAY-604 |
+| `IDENTITY_BASE_URL` | URL | `http://identity:8000` (direct in every environment, the test stack included) | Also feeds `propagateContextUrls` | NFR-09 |
+| `PAYROLL_BASE_URL` | URL | `http://payroll:8000` (test override: `http://toxiproxy:18001`) | Same | NFR-09 |
+| `COMPANY_ID` | uuid | `0193a000-0000-7000-8000-000000000001` (dev, C28) / per env / per env | `cid` on `service:web` tokens (R9) | PAY-600 |
 | `INTERNAL_JWT_PRIVATE_KEY` | secret (PKCS8 PEM, Ed25519) | `.env` / External Secrets | Signs BFF tokens | PAY-600 |
 | `INTERNAL_JWT_KID` | string | `dev-web-1` / non-`dev-` / non-`dev-` | JWT header `kid` | PAY-600 |
-| `REDIS_URL` | URL | `redis://web@redis:6379/0` | Username `web` (ACL user); no password in the URL | PAY-607 |
-| `REDIS_WEB_PASSWORD` | secret | `.env` / External Secrets | Passed to ioredis as `password` | PAY-607 |
+| `REDIS_HOST` | string | `redis` (test override: `toxiproxy`) | C1, C12 | PAY-607 |
+| `REDIS_PORT` | int | 6379 (test override: 16379) | C1, C12 | PAY-607 |
+| `REDIS_USERNAME` | string | `web` | The ACL user (§2.1) | PAY-607 |
+| `REDIS_PASSWORD` | secret | `.env` / External Secrets: the value of `REDIS_WEB_PASSWORD` | Passed to ioredis as `password` | PAY-607 |
 | `REDIS_SOCKET_TIMEOUT_MS` | int | 500 | ioredis `commandTimeout` and `connectTimeout` | PAY-603 |
 | `SESSION_SECRET` | secret (≥ 32 bytes) | `.env` / External Secrets | HMAC for session keys, limiter subjects, `user_id_hash` | PAY-106 |
 | `SESSION_COOKIE_NAME` | string | `sid` / `__Host-sid` / `__Host-sid` | | PAY-106 |
 | `SESSION_IDLE_TTL_S` | int | 43200 | | PAY-106 |
 | `SESSION_ABS_TTL_S` | int | 604800 | | PAY-106 |
 | `SESSION_ROLE_RECHECK_S` | int | 60 | | PAY-107 |
-| `SESSION_RECHECK_GRACE_S` | int | 300 | New: fail-open window when identity is down (§4.3; Issues #17) | PAY-107 |
-| `SESSION_TOUCH_INTERVAL_S` | int | 60 | New: minimum gap between idle-TTL refreshes | PAY-106 |
-| `BFF_RATE_LIMIT_SESSION` | int per min | 120 (test env 100000) | | PAY-603 |
-| `BFF_RATE_LIMIT_IP` | int per min | 300 (test env 100000) | | PAY-603 |
-| `BFF_TELEMETRY_RATE_LIMIT_IP` | int per min | 60 | New | §7.5 |
-| `BFF_BODY_LIMIT_BYTES` | int | 65536 | | PAY-604 |
-| `TRUSTED_PROXY_HOPS` | int ≥ 0 | 0 / 1 / 1 | §5.2 | PAY-603 |
-| `UPSTREAM_CONNECT_TIMEOUT_MS` | int | 1000 | New key for the plan §4 value | plan §4 |
+| `SESSION_RECHECK_GRACE_S` | int | 300 | Fail-open window while identity is unreachable, then 503 (§4.3; R24, C37) | PAY-107 |
+| `SESSION_TOUCH_INTERVAL_S` | int | 60 | Minimum gap between idle-TTL refreshes (R24) | PAY-106 |
+| `BFF_RATE_LIMIT_SESSION` | int per min | 120 (test env 1000000) | | PAY-603 |
+| `BFF_RATE_LIMIT_IP` | int per min | 300 (test env 1000000) | | PAY-603 |
+| `BFF_TELEMETRY_RATE_LIMIT_IP` | int per min | 60 | R24 | §7.5 |
+| `BFF_BODY_LIMIT_BYTES` | int | 65536 | R24 | PAY-604 |
+| `TRUSTED_PROXY_HOPS` | int ≥ 0 | 0 / 1 / 1 | §5.2; the dev value is confirmed by the S7 spike (R36) | PAY-603 |
+| `UPSTREAM_CONNECT_TIMEOUT_MS` | int | 1000 | `UPSTREAM_*` keys hold the plan §4 values (R24) | plan §4 |
 | `UPSTREAM_READ_TIMEOUT_MS` | int | 3000 | Same | plan §4 |
 | `UPSTREAM_SLOW_READ_TIMEOUT_MS` | int | 10000 | Calculate and approve | plan §4, NFR-05 |
 | `UPSTREAM_GET_RETRIES` | int | 2 | | plan §4 |
 | `UPSTREAM_GET_DEADLINE_MS` | int | 5000 | No retry is started after this | plan §4 |
 | `BREAKER_FAILURES` / `BREAKER_RESET_S` | int | 5 / 30 | Shared names with the services (plan §2.2) | plan §2.2 |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | URL | `http://otel-collector:4318` | HTTP/protobuf | NFR-09 |
-| `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` | string / float | `parentbased_traceidratio` / 1.0 (dev, uat), 0.1 (prod) | plan §2.2 | NFR-09 |
-| `LOG_LEVEL` | string | debug / info / info | | NFR-07 |
+| `OTEL_TRACES_SAMPLER` | string | `parentbased_always_on` in every environment; no `OTEL_TRACES_SAMPLER_ARG` (C23) | Prod sampling is the Collector's `tail_sampling` (R27) | NFR-09 |
+| `LOG_LEVEL` | string, case-insensitive | `DEBUG` / `INFO` / `INFO` (C24) | | NFR-07 |
 | `NEXT_TELEMETRY_DISABLED` | `1` | 1 | No Next.js telemetry egress | — |
 
-Test-only (Playwright and k6, from `.env`; never read by the app): `BASE_URL`, `SEED_OWNER_EMAIL`, `SEED_OWNER_PASSWORD`, `SEED_APPROVER_PASSWORD`, `LOAD_USER_EMAIL`, `LOAD_USER_PASSWORD`, `SESSION_COOKIE`, `MAILPIT_URL` (`http://127.0.0.1:4102`), `TEMPO_URL` (`:4130`), `LOKI_URL` (`:4131`), `TOXIPROXY_URL` (`:4134`), `IDENTITY_DIRECT_URL` (`:4110`), `INTERNAL_JWT_PRIVATE_KEY`, `INTERNAL_JWT_KID` (for `e2e/helpers/mint-token.ts`).
+**Test-only** (Playwright and k6, from `.env` and the shell; never read by the app):
+- `BASE_URL` = `http://127.0.0.1:${WEB_PORT}` (`http://127.0.0.1:4100`; C12);
+- `SEED_OWNER_EMAIL`, `SEED_OWNER_PASSWORD`, `SEED_APPROVER_PASSWORD`, `LOAD_USER_EMAIL` (role `payroll_admin` only; R22, C27), `LOAD_USER_PASSWORD`, `SESSION_COOKIE`;
+- `SEED_JSON`: the path of the JSON summary that `seed.py --out` wrote (`ci-logs/seed.json`; C33; §9.2, §9.3). Its keys are the platform design's: `mode`, `company_id`, `users.{owner, approver, load}`, `employees`, `runs.{current, draft}`;
+- `MAILPIT_URL` (`http://127.0.0.1:4102`), `TEMPO_URL` (`http://127.0.0.1:4130`), `LOKI_URL` (`http://127.0.0.1:4131`), `TOXIPROXY_URL` (`http://127.0.0.1:4134`);
+- `IDENTITY_DIRECT_URL` (`http://127.0.0.1:${IDENTITY_PORT}`, 4110) for `role-change.spec.ts`;
+- **`PAYROLL_PORT`** (4111), giving `http://127.0.0.1:${PAYROLL_PORT}` for the blocked case in `recover.spec.ts` (C44);
+- `INTERNAL_JWT_PRIVATE_KEY`, `INTERNAL_JWT_KID` and **`PAYOUT_WORKER_JWT_PRIVATE_KEY`** (with its kid), read by `scripts/mint_token.py` when the e2e helper runs it (C35, C44).
 
 ## 9. Tests
 
@@ -922,45 +980,49 @@ The web gates are ESLint, Prettier, `tsc --noEmit` and Vitest coverage ≥ 80% l
 
 | Test file | Covers | Req |
 |---|---|---|
-| `tests/lib/session.test.ts` | Create (fields, `HMAC` key, index `SADD`, TTL = idle); rotation deletes the old session at sign-in; touch only after 60 s; `PEXPIRE` = `min(idle, abs remaining)`; absolute expiry → null and deleted; sign-out `DEL` + `SREM`; `revokeUserSessions` deletes all and the index; a corrupt record → deleted | PAY-106 |
-| `tests/lib/require-session.test.ts` | No cookie → 401; unknown → 401 and cookie cleared; Redis error → 503 (never allow); re-check skipped < 60 s and called at ≥ 60 s (fake timers); `roles_version` mismatch → all sessions revoked + 401; status inactive → 401; same version → `roles_checked_at` updated; identity down within grace → allowed + `recheck_deferred`; past grace → 503; single-flight (5 parallel calls → 1 `/me`); roles mismatch → 403 with the session kept | PAY-106, 107, 601, 603 |
-| `tests/lib/internal-jwt.test.ts` | Header `alg=EdDSA`, `kid`; claims `iss=web`, `aud` per target, `sub`, `roles`, `cid`, `sid` (user only), `exp − iat = 60`, unique `jti`; verifies with the public key via `jose.jwtVerify`; public flow `sub=service:web`, `roles=[]`, `cid=COMPANY_ID`; a missing key throws only on first use (build-safe) | PAY-600 |
+| `tests/lib/session.test.ts` | Create from a `SessionUser` (fields including `name` and `cid = company_id`, `HMAC` key, index `SADD`, TTL = idle); rotation deletes the old session at sign-in; touch only after 60 s; `PEXPIRE` = `min(idle, abs remaining)`; absolute expiry → null and deleted; sign-out `DEL` + `SREM`; `revokeUserSessions` deletes all and the index; a corrupt record → deleted | PAY-106 |
+| `tests/lib/require-session.test.ts` | No cookie → 401; unknown → 401 and cookie cleared; Redis error → 503 (never allow); re-check skipped < 60 s and called at ≥ 60 s (fake timers); `roles_version` mismatch → all sessions revoked + 401; status inactive → 401; identity 404 → 401; same version → `roles_checked_at`, `roles` and `name` updated (C10); identity down within `SESSION_RECHECK_GRACE_S` → allowed + `recheck_deferred`; at 300 s past the last check → 503 (C37); single-flight (5 parallel calls → 1 `/me`); roles mismatch → 403 with the session kept | PAY-106, 107, 601, 603 |
+| `tests/lib/internal-jwt.test.ts` | Header `alg=EdDSA`, `kid`; claims `iss=web`, `aud` per target, `sub`, `roles`, `cid`, `sid` and `name` (user tokens only; R9, C10), `exp − iat = 60`, unique `jti`; verifies with the public key via `jose.jwtVerify`; public flow `sub=service:web`, `roles=[]`, `cid=COMPANY_ID`, and no `name` or `sid` claim; a missing key throws only on first use (build-safe) | PAY-600 |
 | `tests/lib/api/resilient-fetch.test.ts` | Connect and read timeouts → 503; 10 s for calculate and approve; GET retried twice on 429/502/503/504 and connect errors, not on 500/4xx/read timeout; POST, PUT, PATCH and DELETE never retried; `Retry-After` ≤ 1 s honoured, > 1 s not retried; deadline 5 s; `X-Request-ID` and `Authorization` sent; metrics outcome labels | plan §4 |
 | `tests/lib/api/breaker.test.ts` | Opens after 5 consecutive failures; fails fast with no fetch while open; half-open after 30 s lets one probe through; success closes, failure re-opens; 4xx and 500 don't count; `circuit_breaker_state` values | plan §4 |
-| `tests/lib/errors.test.ts` | One case per §3.3 row: status, code and message; context-specific `approver_must_differ` messages; unknown 4xx → `request_failed`; unknown 5xx → 500; `invalid_token` → 500 + `bff.upstream_auth_failed`; `details` forwarded only for the listed codes; no upstream message leaks | PAY-602 |
+| `tests/lib/errors.test.ts` | One case per §3.3 row, including the C15 additions (`employee_not_in_run`, `idempotency_key_required`, `company_settings_not_found`, `payslip_not_found`, `not_found`, `method_not_allowed`, `bad_request`, `payout_not_blocked`, `anchor_locked`): status, code and message; context-specific `approver_must_differ` and `employee_bank_details_missing` messages; unknown 4xx → `request_failed`; unknown 5xx → 500; `invalid_token` → 500 + `bff.upstream_auth_failed`; `validation_error` details re-parsed to `[{field, issue}]` with extra keys (for example `input`) stripped (C14); `details.employee_ids` forwarded only for `not_hourly`, `employee_not_in_run`, `employee_in_overlapping_run` and `hours_missing`; no upstream message leaks | PAY-602 |
 | `tests/lib/rate-limit.test.ts` | Sliding-window estimate across a window boundary; deny at limit + 1 with `Retry-After`; subjects are hashed (no raw IP in keys); fail-closed vs fail-open per route mode; `rate_limiter_errors_total` | PAY-603 |
 | `tests/lib/rate-limit.int.test.ts` | Real Redis: **two limiter instances share counts**; **production values** 120/min per session and 300/min per IP limit (the 121st and 301st requests are 429) | PAY-603 |
 | `tests/lib/session.int.test.ts` | Real Redis: TTLs as set (`PTTL`), absolute cap, revocation across "two replicas"; the `web` ACL user can't `XADD stream:payout.requested` or `GET identity:*` (NOPERM) | PAY-106, 607 |
-| `tests/lib/client-ip.test.ts` | hops 0/1/2 with 1–4 XFF entries; too few entries → `unknown`; invalid IP → `unknown`; never the left-most value when hops < n−1 | PAY-603 |
+| `tests/lib/client-ip.test.ts` | hops 0/1/2 with 1–4 XFF entries; too few entries → `null`; invalid IP → `null`; never the left-most value when hops < n−1; with `null`, the identity client sends **no** `X-Client-IP` header (C16) and the limiter uses the shared `unknown` subject | PAY-603 |
 | `tests/lib/origin.test.ts` | Same origin passes; other scheme, host or port, `null`, or missing → 403 `bad_origin`; GET not checked | PAY-604 |
-| `tests/lib/body.test.ts` | Content-Length > 64 KB → 413 without reading; a chunked body over the limit → 413; bad JSON → 400; wrong content type → 422; schema errors → 422 with field paths and no values | PAY-604 |
+| `tests/lib/body.test.ts` | Content-Length > 64 KB → 413 without reading; a chunked body over the limit → 413; bad JSON → 400; wrong content type → 422; schema errors → 422 with `[{field, issue}]` and no values | PAY-604, 602 |
 | `tests/lib/csp.test.ts`, `tests/proxy.test.ts` | CSP string per env (nonce, `strict-dynamic`, `unsafe-eval` dev only); unique nonce per request; `x-nonce` and CSP on the request headers; open paths pass without a cookie; `/api/*` without a cookie → 401 JSON; page → 307 `/login?next=`; with a cookie → passes **with no Redis access** (the redis module is not imported by `proxy.ts`) | PAY-604, 106, 601 |
 | `tests/lib/logger.test.ts` | Inside a span: JSON line with `trace_id`, `span_id`, `request_id`, `event`; deep redaction of every deny-list key (nested, mixed case); a token, cookie and JWT set during a full route call never appear in captured output | PAY-NFR-07, NFR-09 |
 | `tests/lib/metrics.test.ts` | `InMemoryMetricReader`: `bff_request_duration_seconds{route,status}` recorded once per request with the template route; failure paths increment `rate_limited_total{scope}`, `rate_limiter_errors_total{component="web"}`, `bff_upstream_requests_total{outcome}`; the exported Prometheus name is exact | PAY-NFR-04, 05, 10 |
-| `tests/lib/config.test.ts` | Startup checks: each refused setting in uat/prod logs its name only (not the value) and exits; dev defaults accepted in dev | PAY-605 |
+| `tests/lib/config.test.ts` | Startup checks: each refused setting in uat/prod logs `config.invalid` with its name only (not the value) and exits **2** (C29); a missing key exits 2 in every env; dev defaults accepted in dev; the C12 Redis keys are required and `REDIS_URL` isn't read; `LOG_LEVEL` accepts `INFO` and `info` (C24) | PAY-605 |
 | `tests/lib/money.test.ts` | String → cents, percent → bps, hours → hundredths: boundaries, no float (property test with `fast-check` against BigInt arithmetic); `formatCents` | ADR 0006 |
 | `tests/lib/payout-badge.test.ts` | Every row of the §6.3 badge table | PAY-413, 501 |
-| `tests/schemas/*.test.ts` | Valid and invalid fixtures per request schema (§2.3) and response schema (§2.4); `Employee` and `Payout` `.strict()` reject `bank_account`/`routing`; `expectTypeOf` against `@payrun/api-client` types | PAY-201, 202, 501, 602 |
-| `tests/api/auth.routes.test.ts` | login: Origin, fail-closed limiter on Redis error, `service:web` token with `aud=identity`, session created and rotated, cookie attributes per env, 401/429 mapping with `Retry-After`; logout; accept (`invite_invalid`, `password_too_weak`); reset request always 202; reset confirm revokes sessions; `/me` re-check | PAY-103–107 |
-| `tests/api/users.routes.test.ts` | Admin only (403 for others); invite 201/409/422; PATCH revokes the target's sessions on roles or status; `cannot_modify_self`, `last_admin`; resend `invite_not_pending` | PAY-101, 102, 107, 108 |
-| `tests/api/settings.routes.test.ts`, `employees.routes.test.ts` | Role matrix (GET any, writes admin/payroll_admin); `aud=payroll`; validation; `employee_email_taken`, `employee_not_found`; a response containing `bank_account` → 500 `internal_error` + `bff.response_invalid` | PAY-200–203, 601 |
-| `tests/api/pay-runs.routes.test.ts` | Create/hours/calculate/delete role and error mapping (`pay_run_exists`, `invalid_period_start`, `no_employees`, `employee_in_overlapping_run` details, `pay_run_locked`, `not_hourly`, `hours_missing`); calculate uses the 10 s timeout; approve: approver only, missing or invalid `Idempotency-Key` → 422, key forwarded unchanged, never retried, `pay_run_not_approvable`, `approver_must_differ` approve message, `idempotency_key_reused` | PAY-300–304, 400, 401 |
-| `tests/api/payouts.routes.test.ts` | Payslips and payouts pass-through; retry: approver only, never retried, `payout_not_retryable`, `retry_limit_reached`, `employee_bank_details_missing`, `approver_must_differ` retry message | PAY-500, 501 |
-| `tests/api/audit.routes.test.ts`, `telemetry.route.test.ts`, `health.routes.test.ts` | Admin-only audit; telemetry 204, 8 KB limit, own rate limit, logs `web.vitals`/`web.client_error` (length only outside dev); `/api/readyz` 503 when Redis is down | PAY-109, NFR-07, PAY-605 |
+| `tests/schemas/*.test.ts` | Valid and invalid fixtures per request schema (§2.3) and response schema (§2.4). Response fixtures are copied from the service Out models (C5): `Employee` with `has_bank_details`, `bank_updated_by` and a null `account_last4`; `Payslip` pending with null amounts and no `schedule`; `Payout` and `Attempt` with every `PayoutOut`/`AttemptOut` field; `PayRun` with all six `counts` and the `*_name` fields; `User` with `pending_invite_id`; `SessionUser` → `Me` mapping (`id = user_id`; C6). `Employee`, `Payout` and `Attempt` `.strict()` reject `bank_account`/`routing`; `UserPatchBody` rejects `status: "active"` (C25); `expectTypeOf` against `@payrun/api-client` types | PAY-201, 202, 303, 501, 602 |
+| `tests/api/auth.routes.test.ts` | login: Origin, fail-closed limiter on Redis error, `service:web` token with `aud=identity` and no `name`/`sid`, `X-Client-IP` sent when known and omitted when unknown, `SessionUser` parsed and returned as `{user: Me}`, session created (with `name`) and rotated, cookie attributes per env, 401/429 mapping with `Retry-After`; logout; accept (`invite_invalid`, `password_too_weak`); reset request always 202; reset confirm deletes every session of `user_id` at once (R19); `/me` re-check returns `Me` | PAY-103–107 |
+| `tests/api/users.routes.test.ts` | Admin only (403 for others); list passes `cursor`/`limit` and returns `Page<User>` with `pending_invite_id`; invite 201/409/422; PATCH revokes the target's sessions on roles or status; PATCH `status: "active"` → 422 (C25); `cannot_modify_self`, `last_admin`, `user_not_found`; resend 200 `PendingInvite`, `invite_not_pending`, `invite_not_found` | PAY-101, 102, 107, 108 |
+| `tests/api/settings.routes.test.ts`, `employees.routes.test.ts` | Role matrix (GET any, writes admin/payroll_admin); `aud=payroll` with the `name` claim; validation; settings `anchor_locked`, `company_settings_not_found`; `employee_email_taken`, `employee_not_found`; list pass-through of `status`, `cursor`, `limit`; a response containing `bank_account` → 500 `internal_error` + `bff.response_invalid` | PAY-200–203, 601 |
+| `tests/api/pay-runs.routes.test.ts` | Create/hours/calculate/delete role and error mapping (`pay_run_exists`, `invalid_period_start`, `no_employees`, `employee_in_overlapping_run` details, `pay_run_locked`, `not_hourly` and `employee_not_in_run` with `employee_ids`, `hours_missing`, `pay_run_not_found`); hours returns `Hours` (C7); list passes `status`/`cursor`/`limit`; calculate uses the 10 s timeout; approve: approver only, **missing `Idempotency-Key` → 400 `idempotency_key_required`, a non-UUID key → 422 `validation_error`** (C34), key forwarded unchanged, never retried, `pay_run_not_approvable`, `approver_must_differ` approve message, `employee_bank_details_missing` approve message, `idempotency_key_reused` | PAY-300–304, 400, 401 |
+| `tests/api/payouts.routes.test.ts` | Payslips and payouts: `cursor`, `limit` (and payout `status`) passed through, `Page<T>` returned (C8); retry: approver only, never retried, `payout_not_retryable`, `retry_limit_reached`, `employee_bank_details_missing`, `approver_must_differ` retry message | PAY-500, 501 |
+| `tests/api/resolve.route.test.ts` | Approver only (403 for payroll_admin-only); Origin; `ResolveBody` validation (unknown action, empty note, 501-character note → 422 with no value echoed); `{action, note}` forwarded unchanged with `aud=payroll`; never retried; 200 `Payout`; 409 `payout_not_blocked`; 404 `pay_run_not_found` / `payout_not_found`; the note text never appears in captured logs (`bff.payout_resolve` has `note_len`) | PAY-502 |
+| `tests/api/audit.routes.test.ts`, `telemetry.route.test.ts`, `health.routes.test.ts` | Admin-only audit with `Page<AuthAuditEvent>` and `Page<PayrollAuditEvent>` (`actor_id`, `details`); telemetry 204, 8 KB limit, own rate limit, logs `web.vitals`/`web.client_error` (length only outside dev); `/api/livez` 200 with Redis down; `/api/readyz` 503 when Redis is down | PAY-109, NFR-07, PAY-605 |
+| `tests/api/fallback.routes.test.ts` | Unknown `/api/*` path → 404 `not_found`; an unexported method on a known route → 405 `method_not_allowed` with `Allow`; both carry the standard headers | PAY-602, 604 |
 | `tests/api/headers.test.ts` | Every BFF response (success and error, 401 included) has `x-request-id`, `x-trace-id` and `Cache-Control: no-store` | PAY-604 |
-| `tests/components/run-page.test.tsx` | MSW on `/api/*`: polls every 2 s while `processing` (fake timers), stops at `paid`/`partially_failed`, restarts after a retry; "awaiting bank" and "blocked" badges and the banner counts; the live region announces only on change; actions disabled when a refetch fails | PAY-413 |
+| `tests/components/run-page.test.tsx` | MSW on `/api/*`: polls the run every 2 s while `processing` (fake timers), polls payouts only while the Payouts tab is open, stops at `paid`/`partially_failed`, restarts after a retry or redrive; banner counts from `counts.awaiting_bank`/`counts.blocked` with no payouts request; "Awaiting bank" and "Blocked" badges; `calculated_by_name`/`approved_by_name` and "you"; the live region announces only on change; actions disabled when a refetch fails | PAY-303, 413 |
 | `tests/components/approve-button.test.tsx` | A new UUID per click, the same key within one click's mutation; disabled while pending; the dual-approval message in `role="alert"`; network error → refetch run → success state if `processing` | PAY-400, 401 |
-| `tests/components/retry-button.test.tsx`, `payouts-tab.test.tsx` | Retry only on failed rows for approvers; retry messages; attempt history rows | PAY-500, 501 |
+| `tests/components/retry-button.test.tsx`, `payouts-tab.test.tsx` | Retry only on failed rows for approvers; Resolve only on Blocked rows for approvers; retry messages; amount and `••••account_last4` columns; attempt history rows; cursor pager follows `next_cursor` and disables Next on null | PAY-500, 501, 502 |
+| `tests/components/resolve-dialog.test.tsx` | The bank-check warning is shown before the choices; no default choice; submit disabled until a choice and a 1–500 character note exist and while pending; sends `ResolveBody`; 409 `payout_not_blocked` in `role="alert"` and a payouts refetch; success invalidates the run and payouts; focus management | PAY-502, NFR-14 |
 | `tests/components/accept-form.test.tsx`, `reset-forms.test.tsx`, `login-form.test.tsx` | Token read from the fragment and stripped with `replaceState`; never sent in a URL; 12-character rule; mapped errors; `next` open-redirect guard | PAY-103–105 |
-| `tests/components/employee-form.test.tsx`, `hours-editor.test.tsx`, `settings-form.test.tsx`, `users-page.test.tsx`, `role-gate.test.tsx` | Field validation and inline 422 details; ABA checksum; bank fields never prefilled; role-gated controls hidden | PAY-200–203, 301, 108, 601 |
+| `tests/components/employee-form.test.tsx`, `hours-editor.test.tsx`, `settings-form.test.tsx`, `users-page.test.tsx`, `role-gate.test.tsx` | Field validation and inline 422 details; ABA checksum; bank fields never prefilled; reactivating an employee without bank details requires new ones; the hours editor follows `next_cursor` across 3 pages before showing rows, then refetches the run after save (C7, C8); `anchor_locked` on the anchor field; the users page shows Deactivate but **no Reactivate** (C25) and uses `pending_invite_id` for Resend; role-gated controls hidden | PAY-200–203, 301, 108, 601 |
 
 ### 9.2 Playwright (`apps/web/e2e/`)
 
-- **Stack:** `scripts/stack.sh up` (profiles `core,obs,test` with `compose.test.yaml`), then `scripts/seed.py` (owner, `approver@payrun.local`, `LOAD_USER_EMAIL`, 10 employees including one account ending `0000`).
-- **Projects:** one Chromium project; `baseURL = BASE_URL` (`http://127.0.0.1:4100`).
+- **Stack:** `scripts/stack.sh up` (profiles `core,obs,test` with `compose.test.yaml`), then `scripts/seed.py` (owner, `approver@payrun.local`, `LOAD_USER_EMAIL` as `payroll_admin`, tax 2000 bps and retirement 500 bps, 10 employees including one account ending `0000`; R22, C27). In full mode it also sets tax 2000 bps and retirement 500 bps; until task F3 the e2e job runs `seed.py --skeleton` (5 salaried monthly employees, no settings PUT; C33). Its JSON summary is written to `ci-logs/seed.json`, passed as `SEED_JSON`.
+- **Projects:** one Chromium project; `baseURL = BASE_URL` (`http://127.0.0.1:4100`; never `localhost`, C12).
+- **Global setup** (`e2e/global-setup.ts`; part of PAY-609's check with `tests/platform/test_seed.py`, C45): reads `SEED_JSON` and validates it with a Zod schema (`mode`, `company_id` = `COMPANY_ID`, `users.owner`/`approver`/`load` UUIDs, `employees` ≥ 5, `runs.current`/`draft` UUIDs); waits for `GET /api/readyz` = 200; signs in once as the owner and as `approver@payrun.local` and stores each `storageState`. Any failure stops the run before the first spec.
 - **Helpers:**
   - `e2e/fixtures.ts`:
-    - `asOwner` and `asApprover` page fixtures (separate browser contexts, signed in through the UI once and stored with `storageState`);
+    - `asOwner` and `asApprover` page fixtures (separate browser contexts, using the `storageState` files written by the global setup);
     - a console listener that **fails the test on any CSP violation** (`securitypolicyviolation` event or a console message containing "Content Security Policy"; ADR 0009);
     - `apiFetch(page, path, init)` runs `fetch` inside the page, so cookies and Origin behave as in the browser (`testing.md` §6).
   - `e2e/helpers/mailpit.ts`: `latestToken(email, kind: "accept" | "reset")`:
@@ -969,18 +1031,20 @@ The web gates are ESLint, Prettier, `tsc --noEmit` and Vitest coverage ≥ 80% l
     3. Return the token and the full link. Tests open the link exactly as a user would (`page.goto(link)`).
 
     Each test uses a unique address (`e2e+<uuid>@payrun.local`), so there's no Mailpit cleanup and no cross-test interference.
-  - `e2e/helpers/mint-token.ts`: signs a short-lived admin token with the dev key from `.env`, to call identity directly on `IDENTITY_DIRECT_URL` (`role-change.spec.ts` only).
-  - `e2e/helpers/toxiproxy.ts`: enable or disable a proxy; resets all toxics in `afterEach`.
+  - `e2e/helpers/mint-token.ts` (test-only): runs the CLI `uv run python scripts/mint_token.py --aud <aud> --sub <sub> [--roles a,b] [--issuer web|payout-worker] [--name NAME]` (C35) and returns the JWT it prints on stdout. The CLI reads the keys from `.env`. It never signs in TypeScript and holds no key itself. Two uses:
+    - `role-change.spec.ts`: an `issuer=web`, `aud=identity` admin token to call identity directly on `IDENTITY_DIRECT_URL`;
+    - `recover.spec.ts` blocked case: an `issuer=payout-worker`, `sub=service:payout-worker`, `aud=payroll` token (signed with `PAYOUT_WORKER_JWT_PRIVATE_KEY`) to call payroll's internal result endpoint on `http://127.0.0.1:${PAYROLL_PORT}` (C44).
+  - `e2e/helpers/toxiproxy.ts`: enable or disable a proxy; re-enables every proxy and resets all toxics in `afterEach`.
 
 | Spec | Scenarios | Req |
 |---|---|---|
 | `access.spec.ts` | **J1:** the owner invites `e2e+…` with `[payroll_admin]`; the token comes from Mailpit; accept via the link; the URL has no `token` after load (fragment stripped) and no query token ever (request log listener); lands on the dashboard; `/api/auth/me` roles equal exactly `[payroll_admin]`; the nav hides admin items. Sign out → `/login`; the back button doesn't show data. Wrong password → "Email or password is incorrect." Expired or used invite link → `invite_invalid` message. Reset: request → Mailpit `reset` token → new password → old session gets 401 → sign in with the new password. Unauthenticated `/employees` → `/login?next=/employees`; `/api/employees` → 401 `unauthenticated`. The cookie has HttpOnly, SameSite=Lax and Secure | PAY-101, 103, 104, 105, 106 |
-| `employees.spec.ts` | **J2:** admin sets the tax and retirement rates; payroll_admin adds a salaried and an hourly employee; the list shows `••••` + last 4 only, and the page HTML and `/api` responses never contain the full account number; edit bank details (dialog empty, not prefilled); deactivate and reactivate; duplicate email → message on the field; an approver-only user sees no "Add employee" and gets `<Forbidden/>` on `/employees/new` | PAY-200–203, 601, NFR-08 |
-| `pay-run.spec.ts` | **J3:** create a monthly run; the hourly row requires hours (`hours_missing` on calculate); enter hours → calculate → totals shown; for every payslip row gross = net + tax + retirement, and funding = Σ net (read from the table); a duplicate period → `pay_run_exists` message; a biweekly run with a wrong start → `invalid_period_start`; delete a calculated run → the period is free again | PAY-300–304 |
+| `employees.spec.ts` | **J2:** admin sets the tax and retirement rates; payroll_admin adds a salaried and an hourly employee; the list shows `••••` + last 4 only, and the page HTML and `/api` responses never contain the full account number; edit bank details (dialog empty, not prefilled); deactivate and reactivate the employee (PAY-203; employee reactivation stays in scope); duplicate email → message on the field; an approver-only user sees no "Add employee" and gets `<Forbidden/>` on `/employees/new`; the employee list pages with Next/Previous | PAY-200–203, 601, NFR-08 |
+| `pay-run.spec.ts` | **J3:** create a monthly run; the hourly row requires hours (`hours_missing` on calculate); enter hours → calculate → totals shown; for every payslip row gross = net + tax + retirement, and funding = Σ net (read from every page of the payslips table); a duplicate period → `pay_run_exists` message; a biweekly run with a wrong start → `invalid_period_start`; delete a calculated run → the period is free again | PAY-300–304 |
 | `approve-pay.spec.ts` | **J4:** dual approval on; the owner calculates; the owner's Approve → the dual-approval message (exact text, §3.3); the approver approves → status `processing` → polling (at most 2 s between `GET /api/pay-runs/{id}` requests, observed with `page.on("request")`) → `partially_failed` (the `0000` account) within 60 s; the failed row shows "Failed: Account closed"; a second approve via `apiFetch` with a new key → 409 `pay_run_not_approvable`; two parallel approves on a fresh run → exactly one 200 | PAY-400, 401, 413, 501 |
-| `recover.spec.ts` | **J5:** continues from a `partially_failed` run; the owner (payroll_admin) edits the failed employee's bank details; the owner (also approver) clicks Retry → the retry `approver_must_differ` message; the approver retries → the run returns to `processing`, then `paid`; the history shows attempt 1 rejected and attempt 2 settled; retrying a paid payout via API → 409 `payout_not_retryable` | PAY-500, 501, 401 |
-| `role-change.spec.ts` | (a) The admin removes `approver` from user B in `/users`; B's next approve → 401 at once (sessions revoked through `web:user-sess`) → `/login`; B signs in again → the approve button is hidden, and `apiFetch` approve → 403 `forbidden_role`. (b) **Re-check backstop:** demote user C by calling identity `PATCH /v1/users/{id}` directly (`mint-token.ts`; bypasses the BFF's revocation); poll C's mutations: allowed until the re-check, then 401 within `SESSION_ROLE_RECHECK_S` + 5 s (deadline 70 s) | PAY-107, 108 |
-| `errors.spec.ts` | `/no-such-page` → 404 page; a forbidden page; **identity down** (Toxiproxy disables identity) → login shows "temporarily unavailable, try again" and the response is 503 `service_unavailable`, while a signed-in user can still list employees (payroll path); **payroll down** → employees page shows the error banner with a reference; `apiFetch` with an evil `Origin` (via `page.request` with explicit headers) → 403 `bad_origin`; a 70 KB body → 413 `payload_too_large`; response headers on a page and an `/api` route: CSP with a nonce and `strict-dynamic`, `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: same-origin`, `x-request-id`, `x-trace-id` (no HSTS in dev) | PAY-602, 604, plan §12.1 |
+| `recover.spec.ts` | **J5:** continues from a `partially_failed` run; the owner (payroll_admin) edits the failed employee's bank details; the owner (also approver) clicks Retry → the retry `approver_must_differ` message; the approver retries → the run returns to `processing`, then `paid`; the history shows attempt 1 rejected and attempt 2 settled; retrying a paid payout via API → 409 `payout_not_retryable`. **Blocked case (PAY-502, R8, C44):** (1) disable the Toxiproxy `bank-stub` proxy so the worker can't finish; (2) the owner calculates and the approver approves a fresh run, and the test reads two payouts A and B and their current attempts from `GET /api/pay-runs/{id}/payouts`; (3) for each, it posts `{attempt, outcome: "poison", reason: "schema_invalid"}` to `POST http://127.0.0.1:${PAYROLL_PORT}/v1/internal/payouts/{payout_id}/result` with a worker token from `mint-token.ts` and `Idempotency-Key: e2e-<uuid>:poison`; (4) both rows show **"Blocked"**, the banner shows "2 blocked", and Retry isn't offered; (5) re-enable the `bank-stub` proxy; on A the approver opens Resolve, sees the bank-check warning, picks "Send again" with a note → A's history shows the same attempt settled; (6) a second resolve on A via `apiFetch` → 409 `payout_not_blocked`; (7) on B, "Mark rejected" → B shows "Failed: Rejected by an operator" with Retry offered; the approver retries B → the run ends `paid` | PAY-500, 501, 502, 401 |
+| `role-change.spec.ts` | (a) The admin removes `approver` from user B in `/users`; B's next approve → 401 at once (sessions revoked through `web:user-sess`) → `/login`; B signs in again → the approve button is hidden, and `apiFetch` approve → 403 `forbidden_role`. (b) **Re-check backstop (C45):** with identity reachable, demote user C at time T by calling identity `PATCH /v1/users/{id}` directly (`mint-token.ts`; bypasses the BFF's revocation); C's requests may succeed before T + 60 s, and the first request C sends at or after T + 60 s must get 401. (c) The admin deactivates user D; `/users` shows D as inactive with no Reactivate control (C25) | PAY-107, 108 |
+| `errors.spec.ts` | `/no-such-page` → 404 page; a forbidden page; **identity down** (web → identity is a direct connection, so `e2e/helpers/stack.ts` stops the `identity` container with `scripts/stack.sh` and starts it again in `afterAll`) → login shows "temporarily unavailable, try again" and the response is 503 `service_unavailable`, while a signed-in user can still list employees (payroll path); **payroll down** (the Toxiproxy `payroll` proxy disabled) → employees page shows the error banner with a reference; `apiFetch` with an evil `Origin` (via `page.request` with explicit headers) → 403 `bad_origin`; a 70 KB body → 413 `payload_too_large`; response headers on a page and an `/api` route: CSP with a nonce and `strict-dynamic`, `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: same-origin`, `x-request-id`, `x-trace-id` (no HSTS in dev) | PAY-602, 604, plan §12.1 |
 | `trace.spec.ts` | (a) **J4 trace:** the approver approves via `apiFetch` and reads `x-trace-id`; poll `GET {TEMPO_URL}/api/traces/<id>` for up to 30 s until spans exist from `service.name` = `web`, `payroll`, `payout-worker` and `bank-stub`; then Loki `query_range` `{service_name=~".+"} \| trace_id="<id>"` has at least one line each for web, payroll and payout-worker (bank-stub too if it logs inside the trace). (b) **No tokens in telemetry:** after an accept in this spec, Loki `{service_name=~".+"} \|= "<invite token>"` over the last 15 min returns 0 lines, and Tempo TraceQL `{ span.url.full =~ ".*<token>.*" \|\| span.url.query =~ ".*<token>.*" }` returns no traces | PAY-NFR-09, NFR-07 |
 | `a11y.spec.ts` | `@axe-core/playwright` with the `wcag2a`/`wcag2aa` tags on `/login`, `/accept` (invalid-token state), `/reset`, `/dashboard`, `/employees`, `/employees/new`, `/settings`, `/users`, `/pay-runs`, `/pay-runs/[id]` (payslips tab), the payouts tab, `/audit`: no serious or critical violations. Keyboard-only path: tab to Approve, open the confirm dialog, Escape returns focus | PAY-NFR-14, NFR-12 |
 
@@ -989,50 +1053,54 @@ Nightly runs the suite three times in a row (plan §12). No `waitForTimeout`: ev
 ### 9.3 k6 (`load/`)
 
 - **Shared helper** `load/lib/session.js`: `login(email, password)` posts `/api/auth/login` with `Origin: BASE_URL` and returns `name=value` for `SESSION_COOKIE` (`sid`; `__Host-sid` in prod-like runs).
-- **Mutations** send `Origin`, and approve sends `Idempotency-Key: uuidv4()` (k6 `crypto.randomUUID`).
+- **Mutations** send `Origin: BASE_URL` (`http://127.0.0.1:4100`; C12), and approve sends `Idempotency-Key: uuidv4()` (k6 `crypto.randomUUID`).
+- **Paging** (`load/lib/pages.js`): `allPages(path, params)` follows `next_cursor` with `limit=100` until it is null and returns every item (C8). Each page request is tagged with the route template.
+- **Seed summary** (`load/lib/seed.js`): `const seed = JSON.parse(open(__ENV.SEED_JSON))` in the init context (`k6 run -e SEED_JSON=ci-logs/seed.json …`), so every VU reads `seed.runs.current`, the run `seed.py` created (C33). A missing file or key fails the script at start.
 - **Tags:** every request has `name` (the route template) and `kind` (`simple` or `heavy`).
 - The test environment's raised `BFF_RATE_LIMIT_*` and login limits apply (plan §12).
 
 | Script | When | Scenarios | Thresholds | Req |
 |---|---|---|---|---|
-| `load/smoke.js` | PR (`e2e` job) | `smoke`: `constant-vus` 5 VUs × 30 s, as `LOAD_USER_EMAIL`. Per iteration: `GET /api/auth/me`, `GET /api/employees?limit=50`, `GET /api/pay-runs?limit=20`, `GET /api/pay-runs/{id}` (a seeded run), `GET /api/settings`; `sleep(1)` | `http_req_failed` < 1%; `http_req_duration` p(95) < 300 ms | PAY-NFR-05 |
-| `load/full.js` | Nightly | `peak`: `ramping-arrival-rate` 0 → 30 req/s over 1 min, held for 10 min (plan §10: peak 20 × 1.5). The mix: 70% reads (as in smoke); 15% `POST /api/employees` then `PATCH` (unique emails); 10% run lifecycle on a scratch schedule (create, hours, calculate, delete) with `kind:heavy` on calculate; 5% `GET /api/pay-runs/{id}/payouts`. `soak` (`-e SCENARIO=soak`): `constant-arrival-rate` 5 req/s × 30 min, reads plus 10% writes | `http_req_failed` < 1%; `http_req_duration{kind:simple}` p(95) < 300 ms; `http_req_duration{kind:heavy}` p(95) < 1500 ms. Soak also checks for no upward drift: the p95 of the last 5 min is within 20% of the first 5 min, compared in `handleSummary` | PAY-NFR-04, NFR-05 |
-| `load/settlement.js` | Nightly (with `seed.py --employees 500`) | `settlement`: `shared-iterations`, 1 VU, 5 iterations. `setup()` signs in as `LOAD_USER_EMAIL` (preparer; payroll_admin) and `approver@payrun.local` (`SEED_APPROVER_PASSWORD`) (Issues #15). Each iteration: find the next unused monthly `period_start` (from `GET /api/pay-runs`); `POST /api/pay-runs`; `GET …/payslips`; `PUT …/hours` for every hourly payslip; `POST …/calculate` (as the preparer, `kind:heavy`); `POST …/approve` as the approver with a fresh `Idempotency-Key` (`kind:heavy`); then poll `GET /api/pay-runs/{id}` every 2 s until `paid` or `partially_failed` (timeout 180 s), recording the Trend `run_settlement_seconds` (from the approve response to the first final status) | `run_settlement_seconds` p(95) < 60 s; `http_req_duration{name:calculate}` and `{name:approve}` p(95) < 1500 ms; `checks` > 99%. Cross-checked against `payroll_payout_settlement_seconds` in Prometheus by the nightly script | PAY-NFR-05, NFR-06 |
+| `load/smoke.js` | PR (`e2e` job) | `smoke`: `constant-vus` 5 VUs × 30 s, as `LOAD_USER_EMAIL`. Per iteration: `GET /api/auth/me`, `GET /api/employees?limit=50`, `GET /api/pay-runs?limit=20`, `GET /api/pay-runs/{id}` and `GET /api/pay-runs/{id}/payslips?limit=50` for `runs.current` from the seed summary (C33), `GET /api/settings`; `sleep(1)` | `http_req_failed` < 1%; `http_req_duration` p(95) < 300 ms | PAY-NFR-05 |
+| `load/full.js` | Nightly | `peak`: `ramping-arrival-rate` 0 → 30 req/s over 1 min, held for 10 min (plan §10: peak 20 × 1.5). The mix: 70% reads (as in smoke); 15% `POST /api/employees` then `PATCH` (unique emails); 10% run lifecycle on a scratch schedule (create, hours, calculate, delete) with `kind:heavy` on calculate; 5% `GET /api/pay-runs/{id}/payouts?limit=50` (one page; every 10th of these walks all pages with `allPages`). `soak` (`-e SCENARIO=soak`): `constant-arrival-rate` 5 req/s × 30 min, reads plus 10% writes | `http_req_failed` < 1%; `http_req_duration{kind:simple}` p(95) < 300 ms; `http_req_duration{kind:heavy}` p(95) < 1500 ms. Soak also checks for no upward drift: the p95 of the last 5 min is within 20% of the first 5 min, compared in `handleSummary` | PAY-NFR-04, NFR-05 |
+| `load/settlement.js` | Nightly (with `seed.py --employees 500`) | `settlement`: `shared-iterations`, 1 VU, 5 iterations. `setup()` signs in as `LOAD_USER_EMAIL` (preparer; `payroll_admin` only) and `approver@payrun.local` (`SEED_APPROVER_PASSWORD`) (R22, C27). Each iteration: find the next unused monthly `period_start` (from `allPages("/api/pay-runs")`); `POST /api/pay-runs`; `allPages("…/payslips")` until `next_cursor` is null (C8); `PUT …/hours` for every hourly payslip, in requests of at most 500 entries; `POST …/calculate` (as the preparer, `kind:heavy`); `POST …/approve` as the approver with a fresh `Idempotency-Key` (`kind:heavy`); then poll `GET /api/pay-runs/{id}` every 2 s until `paid` or `partially_failed` (timeout 180 s), recording the Trend `run_settlement_seconds` (from the approve response to the first final status) | `run_settlement_seconds` p(95) < 60 s; `http_req_duration{name:calculate}` and `{name:approve}` p(95) < 1500 ms; `checks` > 99%. Cross-checked against `payroll_payout_settlement_seconds` in Prometheus by the nightly script | PAY-NFR-05, NFR-06 |
 
 ## 10. Traceability
 
 | Requirement | Design section(s) | Tests |
 |---|---|---|
 | PAY-101 Invite | §3.2 users, §6.2 `/users` | `users.routes.test.ts`, `access.spec.ts` |
-| PAY-102 Resend | §3.2 invites, §6.2 `/users` | `users.routes.test.ts` |
+| PAY-102 Resend | §2.4 `PendingInvite`, §3.2 invites, §6.2 `/users` | `users.routes.test.ts`, `users-page.test.tsx` |
 | PAY-103 Accept | §3.2 auth, §4.1, §6.2 `/accept`, §7.4 span hygiene | `auth.routes.test.ts`, `accept-form.test.tsx`, `access.spec.ts`, `trace.spec.ts` (b) |
 | PAY-104 Sign in | §3.2 auth, §3.3, §5.1, §6.2 `/login` | `auth.routes.test.ts`, `login-form.test.tsx`, `access.spec.ts` |
 | PAY-105 Reset | §3.2 auth, §4.4, §6.2 `/reset` | `auth.routes.test.ts`, `reset-forms.test.tsx`, `access.spec.ts` |
 | PAY-106 Sessions | §2.1, §2.2, §4.1–4.4, §5.5 | `session.test.ts`, `session.int.test.ts`, `require-session.test.ts`, `proxy.test.ts`, `access.spec.ts` |
 | PAY-107 Re-check | §4.3 step 5, §4.4 | `require-session.test.ts`, `users.routes.test.ts`, `role-change.spec.ts` |
-| PAY-108 User admin | §3.2 users, §6.2 `/users` | `users.routes.test.ts`, `users-page.test.tsx`, `role-change.spec.ts` |
+| PAY-108 User admin | §2.3 `UserPatchBody`, §2.4 `User`, §3.2 users, §6.2 `/users` | `users.routes.test.ts`, `users-page.test.tsx`, `role-change.spec.ts` |
 | PAY-109 Auth audit | §3.2 audit, §6.2 `/audit` | `audit.routes.test.ts`, `a11y.spec.ts` |
-| PAY-200 Settings | §3.2 settings, §6.2 `/settings` | `settings.routes.test.ts`, `settings-form.test.tsx`, `employees.spec.ts` |
+| PAY-200 Settings | §2.4 `Settings`, §3.2 settings, §3.3 (`anchor_locked`, `company_settings_not_found`), §6.2 `/settings` | `settings.routes.test.ts`, `settings-form.test.tsx`, `employees.spec.ts` |
 | PAY-201 Create employee | §2.3, §3.2 employees, §6.2 | `employees.routes.test.ts`, `employee-form.test.tsx`, `employees.spec.ts` |
 | PAY-202 List and read employees | §2.4 (`Employee` strict), §3.2, §6.2 | `employees.routes.test.ts`, `schemas/*.test.ts`, `employees.spec.ts` |
 | PAY-203 Update employee | §3.2, §6.2 `/employees/[id]` | `employees.routes.test.ts`, `employees.spec.ts`, `recover.spec.ts` |
 | PAY-300 Create run | §3.2 pay runs, §3.3, §6.2 `/pay-runs/new` | `pay-runs.routes.test.ts`, `pay-run.spec.ts` |
-| PAY-301 Hours | §2.3 `HoursBody`, §6.3 | `pay-runs.routes.test.ts`, `hours-editor.test.tsx`, `pay-run.spec.ts` |
+| PAY-301 Hours | §2.3 `HoursBody`, §2.4 `Hours`, §3.2, §6.3 hours editor | `pay-runs.routes.test.ts`, `hours-editor.test.tsx`, `pay-run.spec.ts` |
 | PAY-302 Calculate | §3.2 (10 s), §6.3 | `pay-runs.routes.test.ts`, `pay-run.spec.ts`, `full.js`, `settlement.js` |
-| PAY-303 Summary and payslips | §2.4, §3.2, §6.3 | `pay-runs.routes.test.ts`, `pay-run.spec.ts` |
+| PAY-303 Summary and payslips | §2.4 `PayRun`, `Payslip`, `Page<T>`, §3.2, §6.3 | `pay-runs.routes.test.ts`, `payouts.routes.test.ts`, `run-page.test.tsx`, `pay-run.spec.ts` |
 | PAY-304 Delete run | §3.2, §6.3 | `pay-runs.routes.test.ts`, `pay-run.spec.ts` |
-| PAY-400 Approve | §3.2 (Idempotency-Key), §6.3 | `pay-runs.routes.test.ts`, `approve-button.test.tsx`, `approve-pay.spec.ts`, `settlement.js` |
+| PAY-400 Approve | §2.3 `IdempotencyKeyHeader`, §3.2 (Idempotency-Key), §3.3, §6.3 | `pay-runs.routes.test.ts`, `approve-button.test.tsx`, `approve-pay.spec.ts`, `settlement.js` |
 | PAY-401 Dual approval | §3.3 (message), §6.3 | `errors.test.ts`, `approve-button.test.tsx`, `approve-pay.spec.ts`, `recover.spec.ts` |
 | PAY-413 Live progress | §6.3 polling and badges, §5.1 budget | `run-page.test.tsx`, `payout-badge.test.ts`, `approve-pay.spec.ts` |
 | PAY-500 Retry | §3.2, §3.3, §6.3 | `payouts.routes.test.ts`, `retry-button.test.tsx`, `recover.spec.ts` |
-| PAY-501 Payout history | §2.4 (`Payout` strict), §6.3 | `payouts.routes.test.ts`, `payouts-tab.test.tsx`, `approve-pay.spec.ts`, `recover.spec.ts` |
-| PAY-600 Internal JWT | §3.4.1 | `internal-jwt.test.ts`, `auth.routes.test.ts`, `employees.routes.test.ts` |
+| PAY-501 Payout history | §2.4 (`Payout`, `Attempt` strict), §3.2, §6.3 | `payouts.routes.test.ts`, `payouts-tab.test.tsx`, `approve-pay.spec.ts`, `recover.spec.ts` |
+| PAY-502 Operator resolution | §2.3 `ResolveBody`, §3.2 resolve route, §3.3 `payout_not_blocked`, §6.3 resolve dialog | `resolve.route.test.ts`, `resolve-dialog.test.tsx`, `payouts-tab.test.tsx`, `recover.spec.ts` (blocked case) |
+| PAY-600 Internal JWT | §3.4.1, §3.2 (`U`/`S`) | `internal-jwt.test.ts`, `auth.routes.test.ts`, `employees.routes.test.ts` |
 | PAY-601 Authorization | §3.1, §4.3, §5.5, §6.1 | `require-session.test.ts`, `proxy.test.ts`, `*.routes.test.ts`, `role-gate.test.tsx`, `employees.spec.ts` |
-| PAY-602 Error format | §3.3 | `errors.test.ts`, `*.routes.test.ts`, `errors.spec.ts` |
+| PAY-602 Error format | §2.4 `ErrorBody`, `Page<T>`, §3.3, §1.2 fallback routes | `errors.test.ts`, `*.routes.test.ts`, `fallback.routes.test.ts`, `errors.spec.ts` |
 | PAY-603 Rate limits | §4.5, §5.1, §5.2 | `rate-limit.test.ts`, `rate-limit.int.test.ts`, `client-ip.test.ts`, `auth.routes.test.ts` |
 | PAY-604 BFF protections | §5.3–5.6, §7.3 | `body.test.ts`, `origin.test.ts`, `csp.test.ts`, `proxy.test.ts`, `headers.test.ts`, `errors.spec.ts`, CSP listener in `fixtures.ts` |
-| PAY-605 Health and startup (web part) | §1.2 `livez`/`readyz`, §8 startup checks | `config.test.ts`, `health.routes.test.ts` |
-| PAY-607 Redis ACLs (web) | §2.1 ACL | `session.int.test.ts` |
+| PAY-605 Health and startup (web part) | §1.2 `/api/livez`/`/api/readyz`, §8 startup checks (exit 2) | `config.test.ts`, `health.routes.test.ts` |
+| PAY-607 Redis ACLs (web) | §2.1 ACL, §8 Redis keys | `session.int.test.ts` |
+| PAY-609 Seed data (web part) | §8 test-only keys, §9.2 global setup, §9.3 seed summary | `e2e/global-setup.ts`, `smoke.js`, `settlement.js` |
 | PAY-NFR-04 Availability SLO | §7.2 `bff_request_duration_seconds` | `metrics.test.ts`, `full.js` |
 | PAY-NFR-05 Latency SLO | §3.4.2, §7.2 | `smoke.js`, `full.js`, `settlement.js` |
 | PAY-NFR-06 Settlement SLO | §9.3 | `settlement.js` |
@@ -1043,48 +1111,10 @@ Nightly runs the suite three times in a row (plan §12). No `waitForTimeout`: ev
 | PAY-NFR-12 Gates (web) | §9 | CI `web` and `e2e` jobs |
 | PAY-NFR-14 Accessibility | §6.3 notes | `a11y.spec.ts` |
 
-## Lead resolutions applied (2026-11-10; README R-table)
+## Change log
 
-These override anything earlier in this file that disagrees.
+- 2026-11-10: incorporated README R-table and C-table decisions (R3, R4, R8, R9, R17, R18, R19, R21, R22, R23, R24, R27, R33, R34, R36, R37; C4, C5, C6, C7, C8, C9, C10, C11, C12, C14, C15, C16, C23, C24, C25, C26, C27, C28, C29, C31, C33, C34, C35, C37, C44, C45).
 
-- **R3:** the generic code is `validation_error`, not `validation_failed`; this file has been updated. Map `payout_not_blocked` to "This payout isn't blocked any more. Refresh the page." and `anchor_locked` to "The biweekly anchor can't change after biweekly runs exist."
-- **R8, PAY-502:** new BFF route `POST /api/pay-runs/[id]/payouts/[payoutId]/resolve` (approver, Origin check, Zod `{action: "redrive"|"mark_rejected", note: string 1–500}`) → payroll resolve. On the run page's payouts tab, a "Resolve" button appears only on `blocked` rows and opens a dialog. It says to check the bank first, offers both actions, and requires a note. Vitest: `resolve-route.test.ts`. e2e: a blocked case in `recover.spec.ts`, which forces `needs_operator` through the test-only `mint_token`-authorised internal result call with `poison`.
-- **R9:** `internal-jwt.ts` adds the `name` claim for user tokens. Public-flow tokens use `cid = COMPANY_ID`, `roles: []`, and no `name` or `sid`.
-- **R19:** after reset confirm, the BFF deletes every session in `web:user-sess:<user_id>` straight away.
-- **R21:** the run page shows `calculated_by_name` and `approved_by_name`, reads `counts.blocked` and `counts.awaiting_bank` from the run summary (one poll endpoint), and uses `payslip_id` and `amount_cents` from the payouts list. The users page uses `pending_invite_id` for "Resend invite".
-- **R22:** `LOAD_USER_EMAIL` is a payroll_admin; `settlement.js` approves as `approver@payrun.local`.
-- **R23, R24:** the HMAC session key and the new config keys are accepted.
-- **R36:** the `TRUSTED_PROXY_HOPS=0` spike is part of task S7.
-
-## Issues for the lead (all resolved: see the section above and the spec README R-table)
-
-These are contradictions or gaps in the source documents. The design above uses the stated assumption in each case; none of the sources were edited.
-
-1. **`cid` on `service:web` tokens is undefined.** PAY-600 requires `cid` on every token, but public flows (login, accept, reset) happen before the BFF knows the user. The design uses `cid = COMPANY_ID`; identity's low-level design must accept that, and multi-company would need a different rule.
-2. **Identity responses must carry what the session needs.** Plan §7 says login returns "the user and roles". The session (PAY-106) and the re-check (PAY-107) need `id`, `roles`, `roles_version`, `status` and `company_id` from `POST /v1/auth/login`, `POST /v1/invites/accept` and `GET /v1/users/me`.
-3. **Reset confirm can't clear `web:user-sess` as written.** Plan §7 says "the BFF clears `web:user-sess`" after `password-reset/confirm`, but the BFF only has the token, not the user ID. The design asks identity's confirm to return `{user_id}`. Without it, revocation falls back to the 60 s `roles_version` re-check (PAY-105 says reset bumps `roles_version`), so earlier sessions get 401 within 60 s rather than at once, which is weaker than PAY-105's "on their next request".
-4. **The client IP doesn't reach identity.** identity enforces `AUTH_LOGIN_LIMIT_IP` and records `ip_hash` (PAY-104, PAY-109), but only the BFF sees the client. No header or claim is defined. The design sends `X-Client-IP: <clientIp>`, to be trusted by identity only on `iss=web` tokens. This needs agreement in identity's low-level design.
-5. **`TRUSTED_PROXY_HOPS = 0` on Next.js 16.** Route handlers have no socket address (`request.ip` was removed). The design assumes the standalone Next server appends the peer address to `X-Forwarded-For`, so hops 0 means "the right-most entry". This needs a short spike during implementation. If it doesn't hold, a tiny custom server (or a required ingress in every environment) is needed.
-6. **Demoted user: 401 or 403?** Plan §12.1's row says "403 within `SESSION_ROLE_RECHECK_S`". PAY-107 and HLD §4 say "401 (session ended), or 403 when the roles shrank but the session was refreshed". The design follows PAY-107: a `roles_version` mismatch always ends the session (401), and 403 follows on re-sign-in.
-7. **The invite body differs.** Plan §5 J1 shows `POST /api/users/invite {email, roles}`; PAY-101 has `{email, name, roles[]}`. The design follows PAY-101.
-8. **Missing 404 codes.** Only `employee_not_found` and `payout_not_found` (internal endpoint) are named. The design assumes `pay_run_not_found`, `payslip_not_found` and `payout_not_found` (public routes) in payroll, and `user_not_found` and `invite_not_found` in identity. The service low-level designs must confirm them.
-9. **No code for generic validation errors.** PAY-602 says "422 with field details" but names no code. The design uses `validation_error` at the BFF, and expects services to use the same. It also adds BFF codes `invalid_json` (400) and `request_failed` (the unknown-4xx fallback).
-10. **Resending an invite needs an invite ID** (`POST /v1/invites/{id}/resend`), but `GET /v1/users` (PAY-108) doesn't say it exposes one. The design expects an `invite_id` on pending users.
-11. **The payouts list has no amounts.** PAY-501 returns name, status, `no_transfer` and attempts, but no `amount_cents` and no `payslip_id` or `employee_id`. The Payouts tab can't show amounts, or join them to payslips, without one of these. Suggest adding `amount_cents` and `payslip_id` to the payroll response.
-12. **The run summary can't show attempt states.** PAY-413 says the run page polls `GET /api/pay-runs/{id}` and shows "awaiting bank" and "blocked", but PAY-303's counts are by payout status (`requested`/`paid`/`failed`), which can't express attempt states. The design polls the payouts list too while `processing`: two requests per 2 s, and about 100 KB+ per poll at 500 payouts. Suggest adding `attempt_counts {indeterminate, needs_operator}` to the run summary.
-13. **No display names for `calculated_by` and `approved_by`.** These are user IDs, and only admins can list users (identity `GET /v1/users`). Non-admin roles can't see who calculated or approved a run, which J4 attributability suggests they should. Options: payroll snapshots display names onto the run, or identity offers a name lookup for any role.
-14. **The run summary lacks the dual-approval snapshot.** PAY-303 doesn't include the run's `require_dual_approval` snapshot, so the UI can't tell in advance whether the current user may approve. The design shows a soft hint only.
-15. **`LOAD_USER_EMAIL` has no stated roles** (PAY-609). The k6 scripts need `payroll_admin` for writes. `settlement.js` also needs an approver who isn't the calculator (dual approval on); the design uses `approver@payrun.local` with `SEED_APPROVER_PASSWORD`. `seed.py` must give `LOAD_USER_EMAIL` at least `payroll_admin`.
-16. **Session key form.** PAY-106 says `web:sess:<256-bit id>`. The design stores `web:sess:<HMAC-SHA256(SESSION_SECRET, id)>` (also 256 bits), so a Redis dump yields no usable cookies; this matches the plan's description of `SESSION_SECRET` as a "session hashing salt". Please confirm the deviation.
-17. **New configuration keys and one behaviour choice.** The design adds keys not in plan §2.2:
-    - `SESSION_RECHECK_GRACE_S` (300);
-    - `SESSION_TOUCH_INTERVAL_S` (60);
-    - `BFF_TELEMETRY_RATE_LIMIT_IP` (60);
-    - `BFF_BODY_LIMIT_BYTES`;
-    - `UPSTREAM_*` timeouts and retries.
-
-    The grace window is a design choice. Plan §12.1 wants signed-in journeys to keep working while identity is down, but PAY-107's "within 60 s" can't hold without identity. The design fails open for up to 300 s after the last successful check, then returns 503. Please confirm.
-18. **The invite and reset links depend on identity.** identity builds the email links, so it needs the web's public URL (no identity config key is named for it). The paths must be `/accept#token=…` and `/reset#token=…` for the pages in §6.2.
-19. **The payroll audit response is unspecified.** PAY-109 specifies identity's audit fields; nothing specifies `GET /v1/audit-events` (fields, cursor). The design assumes `{id, at, actor_user_id, event, entity_type, entity_id, changes}`.
-20. **Pagination envelope.** No document fixes the list shape. The design assumes `{items, next_cursor}` for every cursor list, and `{items}` for payslips and payouts.
-21. **Session limits barely fail open in practice.** PAY-603 says per-session limits "fail open" when Redis is down, but the session lookup itself needs Redis and returns 503 (plan §2.1). So the fail-open only matters for flapping connections and telemetry. This isn't a contradiction, but the wording may mislead a reader into expecting signed-in requests to keep working during a Redis outage.
+Resolved after the change log entry:
+- **C51:** until F3, `e2e.sh` runs only the `@skeleton`-tagged spec `skeleton.spec.ts` (sign in as the owner, calculate the seeded run, approve as `approver@payrun.local`, the run shows `paid`, and the trace assertion) on the `--skeleton` seed. The J1–J5 specs carry the tag `@journeys` and run from F6, on the full seed. Playwright selects them with `--grep`, and `e2e.sh` reads `E2E_SUITE=skeleton|full`.
+- **C52:** the retry button sends an `Idempotency-Key` per click, as approve does.

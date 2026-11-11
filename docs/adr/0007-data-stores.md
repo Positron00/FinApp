@@ -9,5 +9,6 @@ Options:
 Recommendation: option 1.
 - **Prod Redis:** prefer a durable engine (for example MemoryDB). Payout durability doesn't depend on it, though: the outbox and payroll's re-publish of non-final attempts redrive anything the stream loses (ADR 0003).
 - **Redis ACLs:** one ACL user per service, limited to its own key patterns. web `~web:*`; identity `~identity:*`; payroll `~payroll:*` plus XADD on `stream:payout.requested`; payout-worker reads that stream and consumer group and writes `stream:payout.requested.dlq`. Passwords `REDIS_<SVC>_PASSWORD`.
+- **ACL additions (spec R12, C27):** PING for every user; for payout-worker, XINFO on the `.dlq` stream, `XGROUP DELCONSUMER`, and write access for `XGROUP CREATE … MKSTREAM`; a read-only exporter user. Scripting stays denied for every user (`-@scripting`, spec C3).
 Decision: the recommendation above, accepted by the user on 2026-11-10 (plan sign-off).
 Consequences: the alerts `RedisMemoryHigh` and stream length near `MAXLEN`. Revisit if a cache is added.

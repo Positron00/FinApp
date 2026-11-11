@@ -57,11 +57,14 @@ stateDiagram-v2
     indeterminate --> rejected
     requested --> needs_operator: poison / republish max / key window
     indeterminate --> needs_operator
+    needs_operator --> settled: late bank answer
+    needs_operator --> rejected: late bank answer / operator mark_rejected
+    needs_operator --> requested: operator redrive (publish_count = 1)
   }
 ```
 
 - **Payout:** `requested` (current attempt requested, indeterminate or needs_operator) → `paid` (settled, or `no_transfer`) | `failed` (rejected) → retry → `requested`.
-- **Run:** `draft` ⇄ `calculated` → (approve) `processing` | `paid` → `paid` | `partially_failed`. Retry: `partially_failed` → `processing`. The rule is PAY-406.
+- **Run:** `draft` ⇄ `calculated` → (approve) `processing` | `paid` → `paid` | `partially_failed`. Retry or redrive: `partially_failed` → `processing`. `draft` and `calculated` can be soft-deleted (`deleted_at`, PAY-304), which frees the period. The rule is PAY-406.
 
 ## 3. Data layout
 
@@ -76,7 +79,7 @@ The tables are listed in plan §6 and given exactly in each low-level design.
 | `web:sess:*`, `web:user-sess:*`, `web:rl:*` | web | web | Session TTLs (PAY-106) |
 | `identity:rl:*`, `payroll:rl:*` | the owning service | the same service | The limiter window |
 | `stream:payout.requested` | payroll relay | payout-worker | MAXLEN ~ 100000 |
-| `stream:payout.requested.dlq` | payout-worker | operators (runbook) | Manual purge (runbook) |
+| `stream:payout.requested.dlq` | payout-worker | operators (runbook) | `MAXLEN ~ 10000`; replay or purge per runbook |
 
 ## 4. Failure handling
 
@@ -102,7 +105,7 @@ has a runbook at `docs/runbooks/<AlertName>.md`.
 | Redis data loss / NOGROUP | NOGROUP error | Recreate the group; re-publish | `queue.group.recreated`, `payout.republished` | `PayoutsStuck` | PAY-407, 408 |
 | Outbox relay crash | Unsent age | Another replica or the restart sends | `outbox.relay.error` / `outbox_oldest_age_seconds` | `OutboxStuck` | PAY-402 |
 | Slow DB (2 s) | Statement timeout | 503 `db_timeout` | `http.request` / `http_server_request_duration_seconds` | `BffAvailabilityFastBurn` | PAY-605, NFR-04 |
-| Postgres down | `/readyz` | 503 `db_unavailable` fast; recovers | `db.unavailable` | `BffAvailabilityFastBurn` | PAY-605 |
+| Postgres down | `/readyz` | 503 `db_unavailable` fast; recovers | `db.unavailable` / `http_server_request_duration_seconds` | `BffAvailabilityFastBurn` | PAY-605 |
 | identity down | BFF client | 503 `service_unavailable`; breaker | `bff.upstream_error` / `circuit_breaker_state` | `BffAvailabilityFastBurn` | PAY-602 |
 | SMTP down | Relay errors | Queued; failed after 10 attempts | `email.send_failed` / `identity_emails_pending`, `identity_emails_failed_total` | `EmailOutboxStuck` | PAY-110 |
 | Concurrent approve | Row lock | One wins, the other gets 409 | `payrun.approved` | — | PAY-400 |

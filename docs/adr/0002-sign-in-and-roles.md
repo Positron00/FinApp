@@ -17,5 +17,6 @@ Consequences:
 - **The first owner in every environment:** `python -m identity.bootstrap_owner --email … --company-id …`, a one-shot CLI run as a Compose service or Kubernetes Job with the identity migrator credentials. It works only while `users` is empty, and emails an invite link. There's no bootstrap HTTP endpoint.
 - `scripts/seed.py` (dev and CI only) creates the second approver and the load-test user through the admin invite API, accepting each invite with the token read from Mailpit's API. No back door exists.
 - **Salary visibility:** all three roles can read salaries and payslips; a 0.1.0 company is small and every role works on payroll. A narrower `admin` (users and settings only) is a later option.
-- **Role changes take effect within `SESSION_ROLE_RECHECK_S` (60 s):** the BFF re-checks `roles_version` and status.
+- **Role changes take effect within `SESSION_ROLE_RECHECK_S` (60 s)** while identity is reachable: the BFF re-checks `roles_version` and status. If identity is unreachable, cached roles are kept for up to `SESSION_RECHECK_GRACE_S` (300 s), then the BFF returns 503, so a demotion can't be bypassed for longer than that window (spec C37).
+- **Bootstrap flags (spec R16):** `--if-empty` makes re-runs a no-op (exit 0). `--password-env VAR` (dev only) creates an active owner with no invite email, for the Compose stack.
 - Revisit for multi-company or SSO (pattern C).

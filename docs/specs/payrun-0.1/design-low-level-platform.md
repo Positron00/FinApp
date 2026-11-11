@@ -1,6 +1,6 @@
 # Low-level design: platform
 
-Owner: lead. Sources: [architecture plan](../../plan/architecture-plan.md) v1.2 (§2.2, §6, §8, §11–§13, §17), ADRs [0007](../../adr/0007-data-stores.md), [0008](../../adr/0008-secrets.md), [0010](../../adr/0010-alert-receivers.md), [0011](../../adr/0011-egress.md), [requirements](requirements.md) (PAY-600–609, PAY-NFR-01–14), [high-level design](design-high-level.md).
+Owner: lead. Sources: [architecture plan](../../plan/architecture-plan.md) v1.2 (§2.2, §6, §8, §11–§13, §17), ADRs [0007](../../adr/0007-data-stores.md), [0008](../../adr/0008-secrets.md), [0010](../../adr/0010-alert-receivers.md), [0011](../../adr/0011-egress.md), [requirements](requirements.md) (PAY-600–609, PAY-NFR-01–15), [high-level design](design-high-level.md), and the spec README's "Spec resolutions" (R) and "Contract decisions" (C) tables, which this body follows.
 
 Scope: `libs/pycommon`, the repo scaffold, the DB bootstrap SQL, Redis config and ACLs, `scripts/`, Docker Compose, the observability configs, Kubernetes, images and CI. Service-specific tables, endpoints and pages are in the identity, payroll, payout-worker, bank-stub and web low-level designs; this file gives them the shared pieces they build on.
 
@@ -8,14 +8,14 @@ Scope: `libs/pycommon`, the repo scaffold, the DB bootstrap SQL, Redis config an
 
 | # | Decision | Where |
 |---|---|---|
-| D1 | Config keys are **unprefixed** and use the plan's names (`DB_STATEMENT_TIMEOUT_MS`, `BANK_BASE_URL`, …). The skill's per-service prefix is not used, because the plan names the keys | §4 |
+| D1 | **Env names (C1):** the pycommon `BaseServiceSettings` names are the contract for every Python service, unprefixed: `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_SCHEMA`, `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`, `REDIS_PASSWORD`, plus the other §4 keys (`DB_STATEMENT_TIMEOUT_MS`, `LOG_LEVEL`, `DEBUG`, `DOCS_ENABLED`, …). Migrate containers set the same keys with migrator credentials. Service-only keys keep a service prefix (`IDENTITY_`, `PAYROLL_`, `PAYOUT_`, `BANK_STUB_`), except keys the plan or requirements already name (`BANK_BASE_URL`, `AUTH_LOGIN_LIMIT_*`, `INVITE_TTL_H`, …). The SMTP keys (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`) are unprefixed infrastructure keys like `DB_*` (C49). No service reads `DATABASE_URL` or `REDIS_URL` | §4 |
 | D2 | DB role passwords are injected with psql `\getenv` + `format(%L)` + `\gexec`, so one `.sql` artifact runs unchanged in Compose, Testcontainers and the Kubernetes Job | §2.1 |
 | D3 | The Redis ACL file is generated from env at container start by a POSIX `sh` entrypoint, with SHA-256 hashed passwords, into a tmpfs | §2.2 |
 | D4 | One shared Python Dockerfile (`deploy/docker/python-service.Dockerfile`) with build args; every Python process (including the worker) is an ASGI app served by uvicorn | §10 |
 | D5 | alert-sink is a ~100-line stdlib Python script run in the pinned Python base image: no extra image to pin or scan | §8.5 |
-| D6 | Rate limiting is a fixed-window counter (`INCR` + `EXPIRE … NX` in `MULTI`), not Lua, so ACLs need no scripting commands | §3.10 |
-| D7 | Gauges the plan calls "computed at scrape time" are refreshed by an async task every export interval (15 s) and read by the observable-gauge callback, because OTel callbacks are synchronous and the DB driver is async | §3.3 |
-| D8 | Kustomize runs with `--load-restrictor LoadRestrictionsNone`, so the Kubernetes bootstrap Job reuses `deploy/compose/init/*.sql` (PAY-606) without a copy | §9.2 |
+| D6 | **No Lua in Redis (C3):** rate limiting is a fixed-window counter (`INCR` + `EXPIRE … NX` in `MULTI`), and lock levels use `SET NX EX`, so every ACL user keeps `-@scripting` | §3.11, §2.2 |
+| D7 | **Gauges are computed at metric collection (R26, C18):** OTel observable-gauge callbacks run on the metric reader's thread every export interval (15 s). pycommon offers only the callback helper (`observable_gauge`); each service owns its queries (payroll LLD §7.2 is authoritative for payroll's gauges, `outbox_*` included) | §3.3 |
+| D8 | **Kubernetes copies of shared assets (R32, C36):** `scripts/sync-k8s-assets.sh` copies the bootstrap SQL (and the Redis and Collector configs) under `deploy/k8s/`, and CI fails if the copy differs. Kustomize runs with no load-restrictor flag | §3.15, §9 |
 
 ## 1. Modules and repo layout
 
@@ -27,7 +27,7 @@ FinApp/
   .python-version            # 3.14 (see §10.3)
   .nvmrc                     # 24
   .trivyignore               # empty at 0.1.0; entries need reason, owner, exp:YYYY-MM-DD
-  .env.example               # every key from §5.1, with a comment each; no values for secrets
+  .env.example               # every key from §3.15 and §4, with a comment each; no values for secrets
   pyproject.toml  uv.lock    # uv workspace root (§1.2)
   package.json  pnpm-workspace.yaml  pnpm-lock.yaml
   CHANGELOG.md  README.md  SECURITY_DEPENDENCIES.md
@@ -48,7 +48,8 @@ FinApp/
       src/<pkg>/{main.py, settings.py, api/, domain/, db/, events/, clients/}
       tests/{unit,integration,contract}/
   contracts/events/payout.requested.v1.json
-  contracts/events/examples/payout.requested.v1.*.json
+  contracts/events/payout.requested.dlq.v1.json      # DLQ entry fields (C21)
+  contracts/events/examples/payout.requested.v1.*.json   # company_id = the dev COMPANY_ID (C28)
   deploy/
     docker/python-service.Dockerfile  docker/bake.hcl
     compose/
@@ -56,7 +57,7 @@ FinApp/
       init/
         00-database.sql  10-identity.sql  20-payroll.sql  30-payouts.sql  40-bank-stub.sql  90-monitoring.sql
         lib/service_schema.psql
-        run-init.sh           # loop used by the Kubernetes Job (§9.2)
+        run-init.sh           # loop used by the Kubernetes Job (§9.3)
       redis/redis.conf  redis/entrypoint.sh
     observability/
       collector.yaml  collector.prod.yaml
@@ -70,13 +71,13 @@ FinApp/
       grafana/provisioning/dashboards/dashboards.yaml
       grafana/dashboards/{service-overview,journeys,queues,bank,platform}.json
     k8s/
-      base/  components/  overlays/{dev,uat,prod}/  schemas/   # §9
+      base/  components/  overlays/{dev,uat,prod}/  schemas/   # §9; synced copies marked in §9.1
   load/                      # k6 (smoke.js, full.js, soak.js, settlement.js)
   tests/
     resilience/              # Toxiproxy fault tests
     platform/                # tests for deploy assets and scripts (§6.2)
   scripts/
-    dev-env.sh  stack.sh  export_openapi.py  seed.py
+    dev-env.sh  stack.sh  export_openapi.py  seed.py  mint_token.py  sync-k8s-assets.sh
     ci/{lib.sh, python.sh, web.sh, contract.sh, e2e.sh, images.sh, manifests.sh, security.sh,
         check_metrics.sh, schemathesis_auth.py, nightly-load.sh, nightly-resilience.sh,
         nightly-e2e.sh, nightly-schemathesis.sh, nightly-audit.sh, report_failure.sh}
@@ -311,17 +312,17 @@ ci-logs
 |---|---|---|
 | `libs/pycommon/src/pycommon/settings.py` | New | `BaseServiceSettings`, `Env`, `load_settings`, secret and keyset parsing |
 | `…/logging.py` | New | JSON formatter, `redact`, `log_event`, `request_id_var`, `user_text` |
-| `…/otel.py` | New | Tracer, meter and logger providers; instrumentors; histogram buckets; `AsyncGauge`; traceparent helpers; event-loop lag |
+| `…/otel.py` | New | Tracer, meter and logger providers; instrumentors; histogram buckets; `observable_gauge` (collection-time callback helper); traceparent helpers; event-loop lag |
 | `…/errors.py` | New | `AppError` hierarchy, error body, exception handlers |
-| `…/auth.py` | New | Issuer-bound `Keyset`, `TokenVerifier`, `TokenSigner`, `Principal`, FastAPI auth dependencies |
+| `…/auth.py` | New | Issuer-bound `Keyset`, `TokenVerifier`, `TokenSigner`, `Principal` (with `name`), FastAPI auth dependencies (401/403 rule of C30) |
 | `…/health.py` | New | `/livez`, `/readyz`, DB, Redis and migration-head checks |
 | `…/db.py` | New | Async engine with timeouts, sessions, error mapping, `TimestampMixin`, `new_id`, advisory-lock keys, Alembic env helper |
-| `…/redis_client.py` | New | `create_redis` per ACL user, with a separate blocking client for consumers |
-| `…/streams.py` | New | `Envelope`, `StreamProducer`, `ConsumerBase`, `OutboxRelay`, outbox / processed-events / idempotency-key tables and helpers, purge helpers |
+| `…/redis_client.py` | New | `create_redis` per ACL user; the same factory with a longer socket timeout gives the worker its blocking-read client |
+| `…/streams.py` | New | `Envelope` (`traceparent` required), `StreamProducer.publish` (the three stream fields of R7), `RelayLoop` over an `OutboxRepository` protocol. No tables (C22) |
 | `…/http.py` | New | `ProviderPolicy`, `CircuitBreaker`, `Guard`, `ResilientClient`, typed errors |
-| `…/ratelimit.py` | New | Redis fixed-window limiter, fail-open / fail-closed, caller-limit dependency |
-| `…/startup_checks.py` | New | Common and service-specific startup checks, timing invariants |
-| `…/maintenance.py` | New | Advisory-lock periodic runner |
+| `…/ratelimit.py` | New | Redis fixed-window limiter, fail-open / fail-closed, caller-limit dependency with `exempt_subs` |
+| `…/startup_checks.py` | New | Common and service-specific startup checks, timing invariants; exit 2 with `startup.check_failed` (C29) |
+| `…/maintenance.py` | New | Advisory-lock periodic runner; services supply the tasks |
 | `…/app.py` | New | `create_app(settings, …)`, `AppContext`, middleware, lifespan |
 | `…/serve.py` | New | `python -m pycommon.serve`: runs uvicorn on `$PYCOMMON_APP`, no access log |
 | `…/testing.py` | New | Pytest plugin: Postgres-with-bootstrap and Redis-with-ACL containers, token factory, in-memory OTel, fake clock |
@@ -330,8 +331,9 @@ ci-logs
 | `deploy/compose/compose*.yaml`, `toxiproxy.json` | New | Local and CI stack (PAY-NFR-13) |
 | `deploy/observability/*` | New | Collector, Prometheus, rules, Alertmanager, alert-sink, Tempo, Loki, Grafana (PAY-NFR-04, 10, 11) |
 | `deploy/k8s/*` | New | Kustomize base, components, overlays (PAY-NFR-13) |
+| `contracts/events/payout.requested.dlq.v1.json` | New | DLQ entry schema (C21) |
 | `deploy/docker/python-service.Dockerfile`, `apps/web/Dockerfile` | New | Images |
-| `scripts/*` | New | dev-env, stack, OpenAPI export, seed, CI scripts |
+| `scripts/*` | New | dev-env, stack, OpenAPI export, seed, token minting, k8s asset sync, CI scripts |
 | `.github/workflows/*` | New | ci.yml, nightly.yml (PAY-NFR-12) |
 
 ## 2. Data models
@@ -347,13 +349,13 @@ environment with `\getenv` (psql ≥ 15; every psql here is 16) and builds the D
   With `\getenv`, `%L` does the quoting inside Postgres, and the same `.sql` files run unchanged in:
   1. Compose: mounted at `/docker-entrypoint-initdb.d` (the entrypoint runs `*.sql` with psql and ignores the `lib/` directory);
   2. Testcontainers: `pycommon.testing` mounts the same directory into `postgres:16-alpine` with the passwords as container env;
-  3. the Kubernetes `db-bootstrap` Job: `run-init.sh` loops over the files with `psql -v ON_ERROR_STOP=1 -f`.
+  3. the Kubernetes `db-bootstrap` Job: `run-init.sh` loops over the files with `psql -v ON_ERROR_STOP=1 -f`. Kustomize can't read files outside its root, so `scripts/sync-k8s-assets.sh` copies the directory byte for byte to `deploy/k8s/base/bootstrap/init/` and CI fails on any difference (R32, C36). `deploy/compose/init/` stays the only source that is edited.
 - **Missing variable:** the template checks `:{?var}` and raises, so the run fails with the variable's name and never with its value.
 - **Idempotent:** roles are created only if missing, then `ALTER ROLE … PASSWORD` keeps them in sync, so the Job can be re-run to rotate passwords. Schema and grants use `IF NOT EXISTS` or are naturally repeatable.
 - **No logging of passwords:** the server keeps `log_statement = none` (the default); `compose.yaml` doesn't change it. The test `test_bootstrap_sql.py` asserts this setting.
 - **Managed Postgres** (uat, prod: the admin is not a superuser): in PG 16 a `CREATEROLE` admin has ADMIN on roles it creates but can't `SET ROLE` to them, which `CREATE SCHEMA … AUTHORIZATION` and `ALTER DEFAULT PRIVILEGES FOR ROLE` need. The template grants each migrator to `current_user WITH SET TRUE, INHERIT FALSE` when `current_user` is not a superuser.
 
-**Roles** (database `payrun`):
+**Roles** (database `payrun`; names per C2):
 
 | Schema | Migrator role (owns schema, runs Alembic) | Runtime role (DML only) | Password env vars |
 |---|---|---|---|
@@ -422,7 +424,7 @@ SELECT format('ALTER ROLE %I SET search_path = %I', :'migrator', :'schema') \gex
 SELECT format('ALTER ROLE %I SET search_path = %I', :'runtime', :'schema') \gexec
 ```
 
-**`10-identity.sql`** (20, 30, 40 are identical apart from the values):
+**`10-identity.sql`** (20, 30, 40 are identical apart from the values, and have no audit-log revoke):
 
 ```sql
 \set schema identity
@@ -431,7 +433,15 @@ SELECT format('ALTER ROLE %I SET search_path = %I', :'runtime', :'schema') \gexe
 \set migrator_env IDENTITY_DB_MIGRATOR_PASSWORD
 \set runtime_env IDENTITY_DB_PASSWORD
 \ir lib/service_schema.psql
+-- C50: the audit log is append-only for the runtime role. The template's re-grant above would restore
+-- UPDATE/DELETE on a re-run (e.g. a password rotation), so revoke again whenever the table exists.
+SELECT 'REVOKE UPDATE, DELETE ON TABLE identity.audit_log FROM identity_app'
+ WHERE to_regclass('identity.audit_log') IS NOT NULL \gexec
 ```
+
+The identity migration that creates `identity.audit_log` also revokes `UPDATE, DELETE` from `identity_app`
+(identity LLD §2.6), so the table is append-only after a fresh bootstrap, after migrations, and after any
+bootstrap re-run.
 
 - `20-payroll.sql`: `payroll`, `payroll_migrator`, `payroll_app`, `PAYROLL_DB_MIGRATOR_PASSWORD`, `PAYROLL_DB_PASSWORD`.
 - `30-payouts.sql`: `payouts`, `payouts_migrator`, `payouts_app`, `PAYOUTS_DB_MIGRATOR_PASSWORD`, `PAYOUTS_DB_PASSWORD`.
@@ -481,22 +491,23 @@ latency-tracking yes
 256 MB is far above the expected peak: a full stream at `STREAM_MAXLEN` 100000 entries of about
 600 bytes is about 60 MB; sessions and limiter keys are a few MB. `RedisMemoryHigh` fires at 80%.
 
-**ACL users** (generated; `#<sha256>` is the hex SHA-256 of the password, so no plaintext is on disk):
+**ACL users** (generated; `#<sha256>` is the hex SHA-256 of the password, so no plaintext is on disk; R12, C3, C27):
 
 | User | Password env | Keys | Commands |
 |---|---|---|---|
 | `default` | `REDIS_ADMIN_PASSWORD` | `~*` `&*` | `+@all` (admin; used by healthchecks, resilience `FLUSHALL`, operators) |
-| `web` | `REDIS_WEB_PASSWORD` | `~web:*` | `+@connection +@read +@write +@keyspace +@transaction -@stream -@scripting -@pubsub -@admin -@dangerous` |
+| `web` | `REDIS_WEB_PASSWORD` | `~web:*` | `+@connection +ping +@read +@write +@keyspace +@transaction -@stream -@scripting -@pubsub -@admin -@dangerous` |
 | `identity` | `REDIS_IDENTITY_PASSWORD` | `~identity:*` | same as web |
 | `payroll` | `REDIS_PAYROLL_PASSWORD` | `~payroll:*`, selector `(~stream:payout.requested +xadd)` | same as web on its keys; `XADD` only on the stream |
-| `payout-worker` | `REDIS_PAYOUT_WORKER_PASSWORD` | selectors only | root `+@connection -@dangerous`; `(~stream:payout.requested +xreadgroup +xack +xautoclaim +xpending +xinfo +xgroup\|create)`; `(~stream:payout.requested.dlq +xadd +xinfo)` |
-| `exporter` | `REDIS_EXPORTER_PASSWORD` | `%R~stream:*` (read-only) | `+@connection -@dangerous +info +ping +config\|get +client\|list +slowlog\|get +slowlog\|len +latency\|latest +xinfo +xlen +type +dbsize +memory\|stats` |
+| `payout-worker` | `REDIS_PAYOUT_WORKER_PASSWORD` | selectors only | root `+@connection +ping -@scripting -@dangerous`; `(~stream:payout.requested +xreadgroup +xack +xautoclaim +xpending +xinfo +xgroup\|create +xgroup\|delconsumer)`; `(~stream:payout.requested.dlq +xadd +xinfo)` |
+| `exporter` | `REDIS_EXPORTER_PASSWORD` | `%R~stream:*` (read-only) | `+@connection +ping -@scripting -@dangerous +info +config\|get +client\|list +slowlog\|get +slowlog\|len +latency\|latest +xinfo +xlen +type +dbsize +memory\|stats` |
 
 Notes:
+- **No Lua anywhere (C3):** every user except `default` lacks `@scripting`, so `EVAL`, `EVALSHA`, `FCALL` and `SCRIPT` fail with `NOPERM`. identity's limiter and lockout use `pycommon.ratelimit` (`MULTI` + `INCR` + `EXPIRE NX`) and `SET NX EX` (§3.11).
 - `-@stream` for web and identity, plus their key patterns, means `XADD stream:payout.requested` fails with `NOPERM` (the PAY-607 acceptance test).
-- `+xinfo` on the DLQ lets the worker export `queue_dlq_messages` (from `XINFO STREAM` length) and on the main stream `queue_consumer_lag` (from `XINFO GROUPS`, Redis 7 `lag`). The plan's list covers `XINFO` generally; the DLQ part is an addition (Issue 9).
-- `+@connection` covers `AUTH`, `HELLO`, `PING`, `CLIENT SETINFO` (sent by redis-py ≥ 5); `-@dangerous` after it removes `CLIENT KILL` and similar.
-- The exporter has no `SCAN` or `KEYS`: it is started with `--check-single-streams=stream:payout.requested,stream:payout.requested.dlq`, which needs no key scan.
+- **PING** is granted explicitly to every user (R12), for `/readyz` and client health checks; `+@connection` also covers `AUTH`, `HELLO`, `CLIENT SETINFO` (sent by redis-py ≥ 5). `-@dangerous` after it removes `CLIENT KILL` and similar.
+- **The worker's commands** match payout-worker LLD §3.3.1: `XREADGROUP`, `XACK`, `XAUTOCLAIM`, `XPENDING`, `XINFO GROUPS` and `XINFO STREAM`, `XGROUP CREATE … MKSTREAM`, `XGROUP DELCONSUMER` (C27; removes stale consumer names), `XADD` to the DLQ (with `MAXLEN ~ 10000`, C21), and `PING`. The `~` key patterns grant read **and** write, which `MKSTREAM` needs to create the stream key (R12). `XINFO` on the DLQ feeds `queue_dlq_messages` and on the main stream `queue_consumer_lag` (Redis 7 `lag`).
+- **The exporter** is read-only (`%R~`, R12) and has no `SCAN` or `KEYS`: it is started with `--check-single-streams=stream:payout.requested,stream:payout.requested.dlq`, which needs no key scan.
 
 **`entrypoint.sh`** (POSIX sh; the `redis:7-alpine` image has busybox `sha256sum`):
 
@@ -510,16 +521,26 @@ for v in REDIS_ADMIN_PASSWORD REDIS_WEB_PASSWORD REDIS_IDENTITY_PASSWORD REDIS_P
   [ -n "$val" ] || { echo "redis-acl: missing $v" >&2; exit 1; }
 done
 h() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
-BASE='+@connection +@read +@write +@keyspace +@transaction -@stream -@scripting -@pubsub -@admin -@dangerous'
-mkdir -p /run/redis
-cat > /run/redis/users.acl <<ACL
+BASE='+@connection +ping +@read +@write +@keyspace +@transaction -@stream -@scripting -@pubsub -@admin -@dangerous'
+WORKER_MAIN='~stream:payout.requested +xreadgroup +xack +xautoclaim +xpending +xinfo +xgroup|create +xgroup|delconsumer'
+WORKER_DLQ='~stream:payout.requested.dlq +xadd +xinfo'
+EXPORTER='+@connection +ping -@scripting -@dangerous +info +config|get +client|list +slowlog|get +slowlog|len +latency|latest +xinfo +xlen +type +dbsize +memory|stats'
+acl() {
+  cat <<ACL
 user default on #$(h "$REDIS_ADMIN_PASSWORD") ~* &* +@all
 user web on #$(h "$REDIS_WEB_PASSWORD") resetkeys resetchannels -@all ~web:* $BASE
 user identity on #$(h "$REDIS_IDENTITY_PASSWORD") resetkeys resetchannels -@all ~identity:* $BASE
 user payroll on #$(h "$REDIS_PAYROLL_PASSWORD") resetkeys resetchannels -@all ~payroll:* $BASE (~stream:payout.requested +xadd)
-user payout-worker on #$(h "$REDIS_PAYOUT_WORKER_PASSWORD") resetkeys resetchannels -@all +@connection -@dangerous (~stream:payout.requested +xreadgroup +xack +xautoclaim +xpending +xinfo +xgroup|create) (~stream:payout.requested.dlq +xadd +xinfo)
-user exporter on #$(h "$REDIS_EXPORTER_PASSWORD") resetkeys resetchannels -@all %R~stream:* +@connection -@dangerous +info +ping +config|get +client|list +slowlog|get +slowlog|len +latency|latest +xinfo +xlen +type +dbsize +memory|stats
+user payout-worker on #$(h "$REDIS_PAYOUT_WORKER_PASSWORD") resetkeys resetchannels -@all +@connection +ping -@scripting -@dangerous ($WORKER_MAIN) ($WORKER_DLQ)
+user exporter on #$(h "$REDIS_EXPORTER_PASSWORD") resetkeys resetchannels -@all %R~stream:* $EXPORTER
 ACL
+}
+if [ "${1:-}" = "--print" ]; then
+  acl | sed -e '/^user default /d' -e 's/ #[0-9a-f]\{64\}/ #<sha256>/'   # rule strings for the managed-Redis runbook
+  exit 0
+fi
+mkdir -p /run/redis
+acl > /run/redis/users.acl
 chown redis:redis /run/redis/users.acl
 exec docker-entrypoint.sh redis-server /usr/local/etc/redis/redis.conf
 ```
@@ -528,41 +549,22 @@ exec docker-entrypoint.sh redis-server /usr/local/etc/redis/redis.conf
 generated file never reaches the `redisdata` volume); `entrypoint: ["/bin/sh", "/usr/local/etc/redis/entrypoint.sh"]`.
 The script ends in the official `docker-entrypoint.sh`, which drops to the `redis` user.
 In uat and prod the same ACL strings (minus `default`) are applied to the managed Redis's user
-management by the operator; the strings are generated by `entrypoint.sh --print` for the runbook.
+management by the operator; `entrypoint.sh --print` prints them (with the hashes masked) for the runbook.
+The dev Kubernetes overlay's in-cluster Redis mounts a synced copy of `redis.conf` and `entrypoint.sh` (§9.1).
 
-### 2.3 Tables provided by pycommon (created by each service's own migrations)
+### 2.3 Service-owned tables (pycommon defines none; C22)
 
-pycommon defines SQLAlchemy `Table` factories; each owning service calls them with its own
-`MetaData(schema=…)` and creates them in its own Alembic migration. pycommon never creates tables.
+pycommon defines **no** outbox, idempotency-key or processed-events tables, and no table factories.
+Each service's own DDL and Alembic migration owns them:
 
-`outbox_table(metadata) -> Table` (payroll):
-
-| Column | Type | Notes |
+| Table | Owner | Spec |
 |---|---|---|
-| `id` | `uuid` PK | `new_id()` (UUIDv7) |
-| `event_id` | `uuid` UNIQUE NOT NULL | the envelope's `event_id` |
-| `stream` | `text` NOT NULL | e.g. `stream:payout.requested` |
-| `type` / `version` | `text` / `integer` NOT NULL | |
-| `envelope` | `jsonb` NOT NULL | the full envelope, `traceparent` included |
-| `aggregate_key` | `text` NULL | e.g. `<payout_id>:<attempt>`, indexed where `sent_at IS NULL`, for payroll's "no unsent row for this attempt" check |
-| `created_at` / `updated_at` | `timestamptz` NOT NULL | |
-| `sent_at` | `timestamptz` NULL | partial index `WHERE sent_at IS NULL` on `created_at` |
-| `relay_attempts` | `integer` NOT NULL DEFAULT 0 | |
-| `last_error` | `text` NULL | error class name only |
+| `payroll.outbox` | payroll | payroll LLD §2.9; relayed with `pycommon.streams.RelayLoop` through payroll's `OutboxRepository` (§3.9) |
+| `payroll.idempotency_keys` | payroll | payroll LLD §2.10, §4.8 |
+| `payouts.processed_events` (and `payouts.disbursements`) | payout-worker | payout-worker LLD §2.1 |
+| `bank_stub.transfers` | bank-stub | bank-stub LLD §2.1 |
 
-`processed_events_table(metadata) -> Table` (payout-worker): `event_id uuid PK`, `processed_at timestamptz NOT NULL` (indexed), `created_at`, `updated_at`.
-
-`idempotency_keys_table(metadata) -> Table` (payroll, and any receiver of retried POSTs):
-
-| Column | Type | Notes |
-|---|---|---|
-| `key` | `text` | PK part 1, ≤ 200 chars |
-| `caller` | `text` | PK part 2: `<iss>:<sub>` |
-| `method` / `route` | `text` | route template |
-| `request_hash` | `bytea` | SHA-256 of the canonical JSON body |
-| `status_code` | `integer` NULL | NULL while in progress |
-| `response_body` | `jsonb` NULL | |
-| `created_at` / `updated_at` / `expires_at` | `timestamptz` | `expires_at = created_at + IDEMPOTENCY_TTL_H`, indexed |
+Their purges are service maintenance tasks run by `pycommon.maintenance.MaintenanceRunner` (§3.13).
 
 ## 3. Interfaces: pycommon
 
@@ -583,17 +585,17 @@ class BaseServiceSettings(BaseSettings):
     service_name: str                         # set by each subclass as a default: "identity", …
     version: str = Field("0.0.0-dev", alias="APP_VERSION")
     env: Env = Env.dev                        # ENV
-    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
-    debug: bool = False
-    docs_enabled: bool = False                # /docs and /openapi.json routes; dev only
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"   # LOG_LEVEL; case-insensitive (C24)
+    debug: bool = False                       # DEBUG
+    docs_enabled: bool = False                # DOCS_ENABLED: /docs and /openapi.json routes; dev only
     company_id: UUID                          # COMPANY_ID
-    # Postgres
+    # Postgres (C1: the same keys for runtime and migrate processes; no DATABASE_URL)
     db_host: str = "postgres"; db_port: int = 5432; db_name: str = "payrun"
-    db_user: str; db_password: SecretStr; db_schema: str
+    db_user: str; db_password: SecretStr; db_schema: str    # DB_USER = <schema>_app or <schema>_migrator (C2)
     db_pool_size: int = 10; db_max_overflow: int = 5
     db_statement_timeout_ms: int = 2000       # DB_STATEMENT_TIMEOUT_MS
     db_pool_timeout_s: float = 2.0            # DB_POOL_TIMEOUT_S
-    # Redis (None for bank-stub)
+    # Redis (C1: no REDIS_URL; unused by bank-stub)
     redis_host: str | None = "redis"; redis_port: int = 6379
     redis_username: str | None = None; redis_password: SecretStr | None = None
     redis_socket_timeout_ms: int = 500        # REDIS_SOCKET_TIMEOUT_MS
@@ -606,11 +608,17 @@ class BaseServiceSettings(BaseSettings):
     service_rate_limit_worker: int = 6000     # per minute
     breaker_failures: int = 5; breaker_reset_s: float = 30.0
     maintenance_interval_s: int = 60
+    # retention windows (PAY-608), read by each service's own purge tasks
     retention_outbox_days: int = 7; retention_processed_events_days: int = 30
     retention_tokens_days: int = 7; retention_bank_details_days: int = 30
     idempotency_ttl_h: int = 24
 
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _upper_log_level(cls, v: object) -> object: ...   # str → v.strip().upper(), then the Literal check (C24)
+
     def db_url(self, *, user: str | None = None, password: SecretStr | None = None) -> str: ...
+        # builds the asyncpg URL from DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD, quoting user and password
     def secret_fields(self) -> dict[str, SecretStr]: ...   # every SecretStr field, by env name
 
 class SettingsError(Exception):
@@ -622,8 +630,10 @@ def normalise_pem(value: str) -> str      # turns literal "\n" into newlines; st
 
 Behaviour:
 - Precedence is process env > `.env` (dev and CI) > defaults (`architecture.md` §7). In containers there is no `.env`.
-- `load_settings` catches `ValidationError` and re-raises `SettingsError` built from each error's `loc` and `type` only. Pydantic's `input` (which may be a secret) is dropped. The process then logs `settings.invalid` and exits 2.
-- Service settings subclass this and add their keys (owned by the service LLDs), with the plan's unprefixed names (D1).
+- `load_settings` catches `ValidationError` and re-raises `SettingsError` built from each error's `loc` and `type` only. Pydantic's `input` (which may be a secret) is dropped. The process then logs `settings.invalid` {fields} and exits 2, the same exit code as a failed startup check (C29).
+- **Names (C1, D1):** the fields above are read by their unprefixed env names, in every Python service and in every environment. A service may not rename them (no `<SVC>_DB_HOST`, `<SVC>_REDIS_URL`, `DATABASE_URL` or `REDIS_URL`), and may not add a prefixed duplicate of a base field (such as `PAYROLL_DOCS_ENABLED`).
+- Service settings subclass this and add their own keys (owned by the service LLDs), with the service prefix (`IDENTITY_`, `PAYROLL_`, `PAYOUT_`, `BANK_STUB_`) unless the plan or requirements already name the key.
+- **`LOG_LEVEL`** accepts any case (`info`, `Info`, `INFO`); the validator upper-cases it before the `Literal` check (C24). Docs and configs write it in upper case.
 
 ### 3.2 `logging.py`
 
@@ -672,22 +682,24 @@ SECONDS_BUCKETS: Final = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 1
 SETTLEMENT_BUCKETS: Final = (1, 2, 5, 10, 15, 20, 30, 45, 60, 90, 120, 300, 600, 1800, 3600)
 def histogram(name: str, *, unit: str, description: str, buckets: Sequence[float]) -> Histogram
 
-class AsyncGauge:
-    """Observable gauge whose value is refreshed by an async callable every `interval_s`."""
-    def __init__(self, name: str, *, unit: str, description: str,
-                 refresh: Callable[[], Awaitable[Mapping[frozenset[tuple[str, str]], float]]],
-                 interval_s: float = 15.0) -> None: ...
-    async def run(self, stop: asyncio.Event) -> None: ...
+Observation = Mapping[frozenset[tuple[str, str]], float]      # label set → value
 
-def inject_traceparent() -> str | None                       # W3C traceparent of the current span
+def observable_gauge(name: str, *, unit: str, description: str,
+                     callback: Callable[[], Observation]) -> ObservableGauge
+    # collection-time helper (R26, C18): `callback` runs synchronously on the metric reader's thread
+
+def inject_traceparent() -> str | None                       # W3C traceparent of the current span, None when no valid span
+def new_traceparent() -> str                                   # "00-<32 hex>-<16 hex>-00": fresh, valid, not sampled
 def context_from_traceparent(tp: str | None) -> Context        # empty Context when tp is None/invalid
 ```
 
 Behaviour:
-- **Exporters:** OTLP gRPC to `OTEL_EXPORTER_OTLP_ENDPOINT` (`http://otel-collector:4317`); sampler from `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` (`parentbased_traceidratio`, 1.0 dev/uat, 0.1 prod); metric export every `OTEL_METRIC_EXPORT_INTERVAL` = 15000 ms, cumulative temporality.
+- **Exporters:** OTLP gRPC to `OTEL_EXPORTER_OTLP_ENDPOINT` (`http://otel-collector:4317`); metric export every `OTEL_METRIC_EXPORT_INTERVAL` = 15000 ms, cumulative temporality.
+- **Sampling (R27, C23):** `OTEL_TRACES_SAMPLER=parentbased_always_on` in every service and every environment, so the apps send 100% of spans; there is no `OTEL_TRACES_SAMPLER_ARG`. `setup` uses `ParentBased(ALWAYS_ON)` when the variable is unset, and logs `otel.sampler.overridden` {sampler} at warning when it is set to anything else. Prod keeps errors, slow traces and a 10% baseline with the Collector's `tail_sampling` (§8.1), not in the SDK.
 - **Instrumentation:** FastAPI (`excluded_urls="livez,readyz"`, no header capture, a `server_request_hook` that drops `url.query`), httpx (a request hook that drops `url.query` and never records headers), SQLAlchemy (`engine.sync_engine`; `enable_commenter=False`), Redis (a `request_hook` that records only the command name, never arguments: arguments can carry session IDs), system metrics (process CPU and memory only).
 - **Metric naming rule:** instruments are created with the **final Prometheus name minus `_total`** for counters (the Collector appends `_total`), and with the full name, `_seconds` included, for histograms and gauges with unit `s` (the Collector doesn't duplicate a suffix already present). `scripts/ci/check_metrics.sh` confirms the names in Prometheus in the e2e job.
-- **`AsyncGauge`** is D7: the refresh coroutine runs a DB query on the runtime role every 15 s, matching the export interval; the gauge callback returns the cached observations. If a refresh fails it keeps the last value for at most 2 intervals, then reports nothing (the series goes stale rather than lying). payroll uses it for `payroll_payouts_stuck`, `payroll_runs_processing_oldest_age_seconds` and `payroll_attempts_needs_operator`; identity for its email gauges; `OutboxRelay` for `outbox_*`.
+- **`observable_gauge`** is D7. It registers an OTel observable gauge whose callback runs at **collection time**, every export interval (15 s), on the `PeriodicExportingMetricReader` thread. So the callback must be synchronous and must not touch the event loop: a service that needs the DB there uses a sync engine with a short statement timeout (payroll LLD §7.2), or reads values its own poller cached (payout-worker LLD §3.3.8). The helper wraps the callback: an exception logs `metrics.gauge_query_failed` {gauge, error_type} at warning and yields **no observation** for that cycle, never a stale or zero value. pycommon registers no domain gauges itself: the queries for `payroll_*` and `outbox_*` (payroll LLD §7.2), `identity_email*` (identity LLD §5.2) and `queue_*` (payout-worker LLD §5.2) are owned by those services (C18).
+- **`new_traceparent`** gives producers a valid, unsampled context when no span is active, so `Envelope.traceparent` is always present (C22).
 - **`asyncio_event_loop_lag_seconds`** (gauge) is measured by a 1 s ticker task started by `create_app`.
 
 ### 3.4 `errors.py`
@@ -758,6 +770,7 @@ class Principal:
     sub: str                      # user id (UUID string), "service:web" or "service:payout-worker"
     roles: frozenset[str]
     cid: UUID
+    name: str | None              # display name; user tokens only (R9, C10); never logged
     sid: str | None
     jti: str
     exp: datetime
@@ -770,7 +783,8 @@ class Principal:
 
 class TokenRejected(Unauthorized):            # 401 invalid_token; .reason is logged, never returned
     reason: Literal["missing", "malformed", "unknown_kid", "bad_alg", "bad_signature", "expired",
-                    "not_yet_valid", "wrong_aud", "issuer_mismatch", "missing_claim", "lifetime_too_long"]
+                    "not_yet_valid", "wrong_aud", "issuer_mismatch", "issuer_not_allowed", "missing_claim",
+                    "lifetime_too_long"]
 
 class TokenVerifier:
     def __init__(self, keyset: Keyset, *, audience: str, leeway_s: int = 5,
@@ -781,13 +795,16 @@ class TokenSigner:
     def __init__(self, private_key_pem: str, *, kid: str, issuer: Issuer,
                  clock: Clock = SystemClock()) -> None: ...
     def mint(self, *, aud: str, sub: str, cid: UUID, roles: Iterable[str] = (),
-             sid: str | None = None, ttl_s: int = 60) -> str: ...
+             name: str | None = None, sid: str | None = None, ttl_s: int = 60) -> str: ...
+        # claims iss, aud, sub, cid, roles, iat, exp, jti (UUID4); name and sid only when given
 
 # FastAPI dependencies
+SubjectKind = Literal["user", "service:web", "service:payout-worker"]
+
 def authenticate(request: Request) -> Principal                 # reads Authorization: Bearer; sets request.state.principal
-def require(*, roles: Iterable[str] | None = None, any_role: bool = True,
-            issuers: Iterable[Issuer] = ("web",), subs: Iterable[str] | None = None,
-            allow_service_web: bool = False) -> Callable[..., Awaitable[Principal]]
+def require(*, issuers: Iterable[Issuer] = ("web",),
+            subjects: Iterable[SubjectKind] = ("user",),
+            roles: Iterable[str] | None = None, any_role: bool = True) -> Callable[..., Awaitable[Principal]]
 ```
 
 Verification order (each failure raises `TokenRejected` with the reason; the response is always
@@ -796,14 +813,21 @@ Verification order (each failure raises `TokenRejected` with the reason; the res
 2. Unverified header: `alg == "EdDSA"` (else `bad_alg`); `kid` present and in the keyset (else `unknown_kid`).
 3. `jwt.decode(token, entry.public_key, algorithms=["EdDSA"], audience=<service>, leeway=5, options={"require": ["exp", "iat", "iss", "aud", "sub", "jti"]})`; PyJWT errors map to `expired`, `wrong_aud`, `bad_signature`, `not_yet_valid` (iat in the future beyond leeway), `missing_claim`, `malformed`.
 4. **Issuer binding:** `claims["iss"] == entry.iss`, else `issuer_mismatch`. This is what stops the worker's key from minting `iss=web` tokens.
-5. `exp - iat ≤ max_lifetime_s` (60), else `lifetime_too_long`; `cid` is a UUID, else `missing_claim`.
+5. `exp - iat ≤ max_lifetime_s` (60), else `lifetime_too_long`; `cid` is a UUID, else `missing_claim`; `name`, when present, is a string of 1–200 characters, else `malformed`.
 
-`require(...)` then checks, in order: `iss` in `issuers` (else 401 `invalid_token`, so a web token
-on `/v1/internal/*` is a 401 as PAY-411 requires); `sub` in `subs` when given (401); a
-`service:web` subject only where `allow_service_web=True` (401); roles (403 `forbidden_role`,
-log `auth.forbidden` with the route and the missing roles). `create_app` attaches `authenticate`
-to every router except health; handlers add `require(...)` per route. payroll's internal router uses
-`require(issuers=("payout-worker",), subs=("service:payout-worker",))`.
+**The 401/403 rule (C30)**, applied by `authenticate` and `require(...)` in this order:
+
+| Condition | Status, `code` | Log |
+|---|---|---|
+| Missing, malformed, expired or badly signed token; unknown kid; wrong `aud`; `iss` not equal to the kid's bound issuer (`issuer_mismatch`) | 401 `invalid_token` | `auth.token.rejected` {reason, kid, iss} at warning |
+| A valid token whose `iss` is not in the route's `issuers` (a web token on `/v1/internal/*`, a worker token on a user route; PAY-411) | 401 `invalid_token` | `auth.token.rejected` {reason: `issuer_not_allowed`, iss} |
+| A valid token of the wrong kind for the route: its subject kind (`user` when `sub` is a UUID, else the literal `service:web` or `service:payout-worker`) is not in `subjects` (for example `service:web` on a user route, or a user token on identity's public-flow routes) | 403 `forbidden_role` | `auth.forbidden` {route, subject_kind} at info |
+| A valid token of the right kind with a missing role (`any_role=True`: none of `roles`; `False`: not all of them) | 403 `forbidden_role` | `auth.forbidden` {route, missing_roles} at info |
+
+`create_app` attaches `authenticate` to every router except health; handlers add `require(...)` per route.
+payroll's internal router uses `require(issuers=("payout-worker",), subjects=("service:payout-worker",))`;
+identity's four public-flow routes use `require(subjects=("service:web",))`. The token, `name` and
+`sid` are never logged.
 
 `Keyset.from_json` rejects (as `SettingsError`): non-object JSON, an `iss` outside `Issuer`, a PEM
 that isn't an Ed25519 public key, and duplicate kids. Rotation follows `auth.md`: add the new kid
@@ -864,11 +888,16 @@ def create_redis(settings: BaseServiceSettings, *, socket_timeout_ms: int | None
 
 Connects as `REDIS_USERNAME` / `REDIS_PASSWORD`, `socket_connect_timeout` = `socket_timeout` =
 `REDIS_SOCKET_TIMEOUT_MS` (500 ms), `health_check_interval = 15`, `retry_on_timeout = False` (callers
-decide). **Consumers need a second client:** `XREADGROUP … BLOCK PAYOUT_XREAD_BLOCK_MS` (5000 ms) would
-always hit a 500 ms socket timeout, so `ConsumerBase` takes a client created with
-`socket_timeout_ms = block_ms + 1000` and uses it only for the blocking read (Issue 10).
+decide). **Blocking reads need a second client:** `XREADGROUP … BLOCK PAYOUT_XREAD_BLOCK_MS` (5000 ms) would
+always hit a 500 ms socket timeout, so the worker's own consumer (payout-worker LLD §3.3.1; C21) creates a
+second client with `create_redis(settings, socket_timeout_ms=PAYOUT_XREAD_BLOCK_MS + REDIS_SOCKET_TIMEOUT_MS)`
+(5.5 s) and uses it only for the blocking read.
 
 ### 3.9 `streams.py`
+
+pycommon gives producers the envelope, the stream write and a relay loop. It defines **no tables**
+and **no consumer** (C22, C21): payroll's DDL owns the outbox and idempotency tables, and the
+payout-worker owns its consumer, its processed-events table and the DLQ write (payout-worker LLD §3.2–§3.3).
 
 ```python
 class Envelope(BaseModel):
@@ -876,118 +905,68 @@ class Envelope(BaseModel):
     event_id: UUID
     type: str
     version: int
-    occurred_at: datetime
+    occurred_at: datetime              # UTC, serialised RFC 3339 with "Z" and milliseconds
     producer: str
-    traceparent: str | None
+    traceparent: str                   # required (C22); W3C format, validated by regex
     data: dict[str, Any]
     @classmethod
     def new(cls, *, type: str, version: int, producer: str, data: Mapping[str, Any],
-            clock: Clock = SystemClock()) -> "Envelope": ...      # new_id(), now, inject_traceparent()
+            clock: Clock = SystemClock()) -> "Envelope": ...
+        # event_id = new_id(); occurred_at = now; traceparent = inject_traceparent() or new_traceparent()
+    def to_json(self) -> str: ...      # compact JSON, the stream's `envelope` field
 
 class StreamProducer:
-    def __init__(self, redis: Redis, *, maxlen: int) -> None: ...   # STREAM_MAXLEN
-    async def publish(self, stream: str, envelope: Envelope | Mapping[str, Any]) -> bytes: ...
-        # XADD <stream> MAXLEN ~ <maxlen> * envelope <json>; span "<stream> publish" (kind PRODUCER)
+    def __init__(self, redis: Redis) -> None: ...
+    async def publish(self, stream: str, *, event_id: UUID | str, type: str, envelope_json: str,
+                      maxlen: int) -> bytes: ...
+        # XADD <stream> MAXLEN ~ <maxlen> * event_id <id> type <type> envelope <json>   (R7)
+    async def publish_many(self, stream: str, items: Sequence[StreamItem], *,
+                           maxlen: int) -> list[bytes | Exception]: ...
+        # one non-transactional pipeline, raise_on_error=False: per-item entry id or the error
 
-# --- outbox ---------------------------------------------------------------
-def outbox_table(metadata: MetaData) -> Table
-async def enqueue(session: AsyncSession, table: Table, *, stream: str, envelope: Envelope,
-                  aggregate_key: str | None = None) -> None        # same transaction as the state change
+@dataclass(frozen=True)
+class StreamItem:
+    event_id: UUID
+    type: str
+    envelope_json: str                 # already carries the traceparent the consumer should continue
 
-class OutboxRelay:
-    def __init__(self, sf: async_sessionmaker[AsyncSession], producer: StreamProducer, table: Table, *,
-                 batch_size: int = 100, idle_interval_s: float = 0.5, max_backoff_s: float = 10.0,
+class OutboxRepository(Protocol):      # implemented by the owning service over its own table
+    async def claim_unsent(self, session: AsyncSession, *, limit: int) -> Sequence[StreamItem]: ...
+        # SELECT … WHERE sent_at IS NULL ORDER BY created_at, id LIMIT :limit FOR UPDATE SKIP LOCKED
+    async def mark_sent(self, session: AsyncSession, items: Sequence[StreamItem]) -> None: ...
+    async def mark_failed(self, session: AsyncSession, items: Sequence[StreamItem], *, error_type: str) -> None: ...
+
+class RelayLoop:
+    def __init__(self, sf: async_sessionmaker[AsyncSession], producer: StreamProducer,
+                 repo: OutboxRepository, *, stream: str, maxlen: int, batch_size: int = 100,
+                 poll_interval_s: float = 0.2, max_backoff_s: float = 5.0,
                  clock: Clock = SystemClock()) -> None: ...
-    async def relay_once(self) -> int: ...
+    def wake(self) -> None: ...                 # called from the owner's after-commit hook
+    async def relay_once(self) -> int: ...      # rows sent
     async def run(self, stop: asyncio.Event) -> None: ...
-
-# --- consumer -------------------------------------------------------------
-@dataclass(frozen=True)
-class Message:
-    stream: str
-    entry_id: bytes
-    deliveries: int
-    envelope: Envelope | None        # None when the entry didn't parse
-    raw: Mapping[bytes, bytes]
-    parse_error: str | None
-
-class RetryableError(Exception): ...           # leave pending; redelivered via XAUTOCLAIM
-class PoisonMessage(Exception):                 # deterministic failure: DLQ now
-    def __init__(self, code: str) -> None: ...
-
-class Disposition(StrEnum):
-    dlq = "dlq"          # XADD to <stream>.dlq, then XACK
-    ack = "ack"          # XACK without DLQ (e.g. the worker's "report indeterminate" path)
-
-class ConsumerBase(ABC):
-    def __init__(self, *, redis: Redis, blocking_redis: Redis, stream: str, group: str, consumer: str,
-                 concurrency: int, claim_min_idle_ms: int, max_deliveries: int, block_ms: int,
-                 dlq_stream: str | None = None, clock: Clock = SystemClock()) -> None: ...
-    @abstractmethod
-    async def handle(self, msg: Message) -> None: ...
-    async def on_exhausted(self, msg: Message, last_error: BaseException) -> Disposition:
-        return Disposition.dlq                    # override: the worker returns ack after reporting indeterminate
-    async def on_poison(self, msg: Message, error: PoisonMessage) -> None: ...  # hook: worker reports "poison"
-    async def ensure_group(self) -> None: ...     # XGROUP CREATE <s> <g> 0 MKSTREAM; ignore BUSYGROUP
-    async def run(self, stop: asyncio.Event) -> None: ...
-    @property
-    def alive(self) -> bool: ...                  # for task_check
-
-# --- idempotency helpers ----------------------------------------------------
-def processed_events_table(metadata: MetaData) -> Table
-async def already_processed(session: AsyncSession, table: Table, event_id: UUID) -> bool
-async def mark_processed(session: AsyncSession, table: Table, event_id: UUID) -> None   # INSERT … ON CONFLICT DO NOTHING
-
-def idempotency_keys_table(metadata: MetaData) -> Table
-@dataclass(frozen=True)
-class StoredResponse:
-    status_code: int
-    body: Any
-class IdempotencyStore:
-    def __init__(self, table: Table, *, ttl_h: int, clock: Clock = SystemClock()) -> None: ...
-    async def begin(self, session: AsyncSession, *, key: str, caller: str, method: str, route: str,
-                    body: Any) -> StoredResponse | None: ...
-    async def complete(self, session: AsyncSession, *, key: str, caller: str, status_code: int,
-                       body: Any) -> None: ...
-def request_hash(body: Any) -> bytes          # sha256 of json.dumps(body, sort_keys=True, separators=(",", ":"))
-
-# --- purge helpers (used by maintenance tasks) ------------------------------
-async def purge_sent_outbox(session: AsyncSession, table: Table, *, older_than: timedelta) -> int
-async def purge_processed_events(session: AsyncSession, table: Table, *, older_than: timedelta) -> int
-async def purge_idempotency_keys(session: AsyncSession, table: Table) -> int     # expires_at < now
 ```
 
+**Stream entry fields (R7):** `event_id` (string), `type` (`payout.requested`), `envelope` (the
+envelope JSON). The payout-worker reads exactly these three. `publish` and `publish_many` record a span
+`"<stream> publish"` (kind PRODUCER, `messaging.system=redis`, `messaging.destination.name`,
+`messaging.message.id = event_id`); the owner may instead start its own publish span and put that
+span's context in `envelope_json`, as payroll does (payroll LLD §5.2).
+
 **Relay behaviour** (PAY-402):
-1. In one transaction: `SELECT … WHERE sent_at IS NULL ORDER BY created_at LIMIT 100 FOR UPDATE SKIP LOCKED`.
-2. `XADD` each row's envelope in order; for each success collect the id.
-3. `UPDATE … SET sent_at = now() WHERE id IN (…)`; commit.
-4. On a Redis error: roll back (the rows stay unsent and unlocked), log `outbox.relay.error` {error_type, batch_size} at warning, increase backoff (0.5 s doubling to 10 s). A row that was XADDed but whose commit failed is sent again later: delivery is at least once, and consumers are idempotent.
-5. When a batch was full, loop immediately; otherwise sleep `idle_interval_s`.
-6. Each loop updates the cached `outbox_unsent` and `outbox_oldest_age_seconds` (one `SELECT count(*), min(created_at) … WHERE sent_at IS NULL`, rate-limited to every 15 s).
+1. Wait for `wake()` or `poll_interval_s` (200 ms), whichever comes first.
+2. In one transaction: `repo.claim_unsent(limit=batch_size)`; nothing claimed → commit and loop.
+3. `publish_many` the claimed items in order.
+4. `repo.mark_sent` for the items that got an entry id, `repo.mark_failed(error_type=<class name>)` for the rest; commit.
+5. Any failure (per item, or the whole pipeline raising): log `outbox.relay.error` {error_type, batch_size, failed, backoff_ms} at error, then sleep full-jitter `min(0.2 × 2^k, max_backoff_s)` s, `k += 1`; a clean batch resets `k`. A row that was XADDed but whose commit failed is sent again later: delivery is at least once, and the consumer is idempotent.
+6. A full batch loops at once; on `stop`, the current batch finishes, then `run` returns.
 
-Several replicas are safe because of `SKIP LOCKED`.
+Several replicas are safe because the repository claims with `SKIP LOCKED`. The `outbox_unsent`
+and `outbox_oldest_age_seconds` gauges are payroll's (payroll LLD §7.2, C18), not the loop's.
 
-**Consumer behaviour** (the shared mechanics of PAY-403 and PAY-408; the worker LLD owns `handle`):
-1. `ensure_group()`; then read this consumer's own pending entries with `XREADGROUP … STREAMS <s> 0` until empty; then `>` with `BLOCK block_ms COUNT concurrency` on `blocking_redis`.
-2. Every `claim_min_idle_ms / 2`, `XAUTOCLAIM <s> <g> <me> <claim_min_idle_ms> <cursor> COUNT concurrency`, which also recovers entries from dead consumers.
-3. **Delivery count** comes from `XPENDING <s> <g> <id> <id> 1` (`times_delivered`), read once per message before `handle`.
-4. Parse: a missing or invalid `envelope` field → `PoisonMessage("schema_invalid")`.
-5. Run `handle` under a semaphore of `concurrency`, inside a span `"<stream> process"` (kind CONSUMER) **started as a child of `context_from_traceparent(envelope.traceparent)`**, so the journey is one trace (PAY-NFR-09).
-6. Outcomes:
-   - success → `XACK`; `queue_messages_total{outcome="ok"}`; log `queue.message.processed`.
-   - `RetryableError` or any other exception with `deliveries < max_deliveries` → stay pending; `outcome="retry"`; log `queue.message.failed` at warning.
-   - the same with `deliveries ≥ max_deliveries` → `on_exhausted()`; `dlq` → DLQ then ACK (`outcome="dlq"`); `ack` → ACK (`outcome="abandoned"`).
-   - `PoisonMessage` → `on_poison()`, then DLQ and ACK at once (`outcome="dlq"`), whatever the delivery count (Issue 8).
-7. **DLQ entry:** `XADD <stream>.dlq MAXLEN ~ 10000 * source_id <id> envelope <raw json> error <code> deliveries <n> failed_at <iso>`. The error is a code (`schema_invalid`, `amount_mismatch`, `payroll_unreachable`, …), never exception text.
-8. **NOGROUP** on any call → `ensure_group()`, log `queue.group.recreated`, continue.
-9. **Shutdown:** on `stop`, stop reading and claiming, wait for in-flight handlers up to `shutdown_timeout_s` (default 60 s, below the 75 s grace period), then return. Unfinished messages stay pending and are reclaimed.
-10. The counter is **pre-initialised** with `add(0)` for each `outcome` at start-up, so the first DLQ after a restart is a 0 → 1 increase that `increase()` can see (§8.3, `PayoutDLQ`).
-
-**`IdempotencyStore.begin`:** `INSERT … ON CONFLICT (key, caller) DO NOTHING`, then `SELECT … FOR UPDATE`.
-A new row → `None` (proceed). An existing row with a different `request_hash` → `ValidationFailed(code="idempotency_key_reused")` (422).
-A completed row → the `StoredResponse` (the caller returns it). A row still in progress (`status_code IS NULL`,
-another transaction holds it) can't happen after the row lock, because the first transaction has committed
-or rolled back by then. The begin and the business change share one transaction, so a rollback forgets the key.
+**DLQ** (written by the worker, not pycommon; C21): `XADD stream:payout.requested.dlq MAXLEN ~ 10000 *`
+with the fields `envelope, source_id, error_kind, error_code, error, delivery_count, consumer, failed_at`,
+specified in `contracts/events/payout.requested.dlq.v1.json`. `queue_messages_total{stream, group, outcome}`
+takes `ok`, `retry` and `dlq` and is pre-initialised with `add(0)` for each at start (C21).
 
 ### 3.10 `http.py` (resilient client; plan §9, `external-apis.md`)
 
@@ -1063,7 +1042,7 @@ class FailMode(StrEnum):
 
 @dataclass(frozen=True)
 class Limit:
-    scope: str             # metric label and key part: "caller_user", "caller_worker", "login_account", …
+    scope: str             # metric label and key part: "caller", "login_account", "login_ip", …
     limit: int
     window_s: int
     fail_mode: FailMode
@@ -1081,13 +1060,15 @@ class RateLimiter:
     async def hit(self, limit: Limit, subject: str) -> Decision: ...
     async def check(self, limit: Limit, subject: str) -> None: ...   # raises RateLimited / ServiceUnavailable
 
-def caller_rate_limit(settings: BaseServiceSettings) -> Callable[..., Awaitable[None]]   # FastAPI dependency
+def caller_rate_limit(settings: BaseServiceSettings, *,
+                      exempt_subs: Iterable[str] = ("service:web",)) -> Callable[..., Awaitable[None]]
+    # FastAPI dependency (C17)
 ```
 
 - **Algorithm (D6):** fixed window. Key `"{prefix}:{scope}:{sha256(subject)[:32]}:{now // window_s}"`; in one `MULTI`: `INCR key`, `EXPIRE key window_s+1 NX`. Allowed when the count ≤ `limit`; otherwise `retry_after_s = window_end − now` (≥ 1). The subject is hashed, so emails and IPs never appear in Redis keys. Bursts up to 2× at a window edge are accepted at this scale.
 - **Redis error or timeout** (500 ms socket timeout): `rate_limiter_errors_total{component}` +1 and log `ratelimit.backend_error` (warning, at most once per 10 s); then `open` → `Decision(allowed=True, degraded=True)`; `closed` → `ServiceUnavailable` (503 `service_unavailable`).
 - **Denied:** `rate_limited_total{scope}` +1; `check` raises `RateLimited` with `Retry-After`.
-- **`caller_rate_limit`:** keyed by `Principal.caller_key` (`(iss, sub)`); `iss=payout-worker` uses `SERVICE_RATE_LIMIT_WORKER` (6000/min), every other caller `SERVICE_RATE_LIMIT_USER` (600/min); fail open. Login, reset and invite-accept limits (fail closed) are built by identity with the same class.
+- **`caller_rate_limit` (PAY-603, C17):** scope `caller`, component `caller`, subject `Principal.caller_key` (`"<iss>:<sub>"`), so the key is `"{prefix}:caller:{sha256(caller_key)[:32]}:{window}"` in every service; identity and payroll use this format and build no caller keys of their own. A principal whose `sub` is in `exempt_subs` (default `("service:web",)`: the BFF's public flows, which identity limits per IP instead) is not counted. `iss=payout-worker` uses `SERVICE_RATE_LIMIT_WORKER` (6000/min), every other caller `SERVICE_RATE_LIMIT_USER` (600/min), window 60 s; fail open. Login, reset and invite-accept limits (fail closed) are built by identity with the same `RateLimiter`.
 
 ### 3.12 `startup_checks.py` (PAY-605)
 
@@ -1095,7 +1076,8 @@ def caller_rate_limit(settings: BaseServiceSettings) -> Callable[..., Awaitable[
 @dataclass(frozen=True)
 class CheckFailure:
     setting: str          # env var name, e.g. "PAYROLL_FIELD_ACTIVE_KID"
-    reason: str           # "missing", "dev_default", "dev_kid", "debug_on", "docs_on", "bank_stub_url", "timing_invariant"
+    reason: str           # "missing", "dev_default", "dev_kid", "debug_on", "docs_on", "bank_stub_url", "timing_invariant",
+                          # "not_deployable" (bank-stub refuses ENV=prod)
 
 StartupCheck = Callable[[BaseServiceSettings], Iterable[CheckFailure]]
 
@@ -1106,7 +1088,7 @@ def check_secrets(s: BaseServiceSettings) -> Iterable[CheckFailure]          # e
 def check_jwt_kids(s: BaseServiceSettings) -> Iterable[CheckFailure]         # INTERNAL_JWT_PUBLIC_KEYS kids and any *_KID field
 def check_debug_and_docs(s: BaseServiceSettings) -> Iterable[CheckFailure]
 def check_field_keys(keys_json: str, active_kid: str, *, setting: str = "PAYROLL_FIELD_KEYS") -> Iterable[CheckFailure]
-def check_bank_base_url(url: str, *, env: Env) -> Iterable[CheckFailure]      # prod: host not bank-stub, not localhost, no "placeholder"/"example"
+def check_bank_base_url(url: str, *, env: Env) -> Iterable[CheckFailure]      # prod: host not bank-stub, not localhost, not *.invalid, no "placeholder"/"example"
 def check_claim_idle(claim_min_idle_ms: int, bank_total_deadline_s: float,
                      payroll_call_deadline_s: float) -> Iterable[CheckFailure]
     # claim_min_idle_ms/1000 > bank_total_deadline_s + 2*payroll_call_deadline_s + 10
@@ -1119,8 +1101,8 @@ def run_startup_checks(settings: BaseServiceSettings, extra: Sequence[StartupChe
 
 - `run_startup_checks` runs the common checks plus `extra`. In **uat and prod** any failure logs `startup.check_failed` {setting, reason} at error for **each** failure (never the value), then exits with code 2. In **dev** the same failures are logged at warning and start-up continues, so a developer sees them.
 - The two timing checks are extras: payroll registers `check_republish_after`, the worker registers `check_claim_idle` and `check_republish_after`. Both services therefore read the shared timing keys (`PAYOUT_MAX_DELIVERIES`, `PAYOUT_CLAIM_MIN_IDLE_MS`, `BANK_TOTAL_DEADLINE_S`, `PAYOUT_PAYROLL_CALL_DEADLINE_S`, `PAYOUT_REPUBLISH_AFTER_S`) from one shared source: `x-payout-timing` in Compose, the `payout-timing` ConfigMap in Kubernetes.
-- **With the plan's defaults the republish check fails:** 300 > 5 × 60 + 15 = 315 is false. Dev only warns; uat and prod would refuse to start (Issue 1).
-- The claim-idle check passes with the defaults: 60 > 15 + 2 × 5 + 10 = 35.
+- **The defaults pass both checks:** republish 360 > 5 × 60 + 15 = 315 (R1; the old plan value 300 failed), and claim idle 60 > 15 + 2 × 5 + 10 = 35.
+- **Every Python service uses this module (C29):** a failed check logs `startup.check_failed` {setting, reason} and exits **2**; services add their checks as `extra` and log no other start-up refusal event (no `worker.startup.refused`, `bank_stub.startup.refused` or exit 1). The web does the same in TypeScript: `config.invalid`, exit 2.
 
 ### 3.13 `maintenance.py` (PAY-608)
 
@@ -1137,14 +1119,12 @@ class MaintenanceRunner:
     async def tick(self) -> bool: ...          # True when this replica held the lock and ran
     async def run(self, stop: asyncio.Event) -> None: ...
 
-def standard_purge_tasks(settings: BaseServiceSettings, *, outbox: Table | None = None,
-                         processed: Table | None = None, idempotency: Table | None = None) -> list[MaintenanceTask]
 ```
 
 - **Lock:** on a dedicated pooled connection, `SELECT pg_try_advisory_lock(advisory_lock_key(lock_name))` (`lock_name = "<service>:maintenance"`). Not acquired → skip this tick (another replica is running), log `maintenance.skipped` at debug. Acquired → run each task **in its own transaction** (one session each, committed on success, rolled back on error), then `pg_advisory_unlock` in a `finally`. If the connection dies, Postgres releases the lock. The runtime role needs no extra privilege for advisory locks.
-- A failing task logs `maintenance.task.failed` {task, error_type} at error and doesn't stop the others.
+- **Log events (C44):** every service uses these names. A completed task logs `maintenance.task.completed` {task, affected, duration_ms} at info; a failing task logs `maintenance.task.failed` {task, error_type} at error and doesn't stop the others; a tick that didn't get the lock logs `maintenance.skipped` at debug. Metrics `maintenance_runs_total{task, outcome}` and `maintenance_duration_seconds{task}`.
 - Ticks every `MAINTENANCE_INTERVAL_S` ± 10% jitter; the first tick is 5 s after start-up.
-- `standard_purge_tasks` builds the outbox (`RETENTION_OUTBOX_DAYS`), processed-events (`RETENTION_PROCESSED_EVENTS_DAYS`) and idempotency-key (`IDEMPOTENCY_TTL_H`) purges; each service adds its own (tokens, bank details, emails, re-publish).
+- **Tasks are the services'** (C22): pycommon owns no tables, so it ships no purge tasks. payroll supplies outbox (`RETENTION_OUTBOX_DAYS`), idempotency-key (`IDEMPOTENCY_TTL_H`), bank-detail (`RETENTION_BANK_DETAILS_DAYS`) and re-publish tasks; the worker the processed-events purge (`RETENTION_PROCESSED_EVENTS_DAYS`); identity the token, email and audit purges. Each task deletes in batches of 1000 and returns the row count.
 
 ### 3.14 `app.py`
 
@@ -1182,9 +1162,9 @@ Order of assembly (outermost first):
 3. Request-context middleware: `request_id` from `X-Request-ID` if it matches `^[A-Za-z0-9-]{1,64}$`, else a new UUID4; set `request_id_var`; add `x-request-id` and `x-trace-id` response headers; log one `http.request` {method, route (template), status, duration_ms, caller (sha256 of `caller_key`, first 16 hex)} at info (warning for 5xx).
 4. Body-size limit (pure ASGI): `Content-Length` > `MAX_BODY_BYTES` → 413 at once; otherwise counts streamed bytes and aborts with 413 `payload_too_large` past the limit.
 5. Error handlers (`install_handlers`).
-6. Routers: `routers` included with `dependencies=[Depends(authenticate)]` (and `Depends(caller_rate_limit)` when Redis is used); `public_routers` as given; `health_router` with no dependencies.
+6. Routers: `routers` included with `dependencies=[Depends(authenticate)]` (and `Depends(caller_rate_limit(settings))`, exempting `service:web`, when Redis is used); `public_routers` as given; `health_router` with no dependencies.
 7. Lifespan:
-   1. `setup_logging`; `run_startup_checks(settings, startup_checks)` (exit 2 in uat/prod on failure), **before** any connection is opened;
+   1. `setup_logging`; `run_startup_checks(settings, startup_checks)` (`startup.check_failed`, exit 2 in uat/prod on failure; C29), **before** any connection is opened;
    2. create the engine, Redis client, verifier and limiter as configured; build `AppContext` on `app.state.ctx`;
    3. `on_startup(ctx)`; log `service.started` {version, env};
    4. start each `background` task with a shared `stop` event (relay, maintenance, gauges, the worker's consumer, the event-loop-lag ticker);
@@ -1193,7 +1173,7 @@ Order of assembly (outermost first):
 
 **`serve.py`:** `python -m pycommon.serve` reads `PYCOMMON_APP` (`identity.main:app`), host `0.0.0.0`, port `PORT` (8000), and runs `uvicorn.Server(Config(app, access_log=False, proxy_headers=False, server_header=False, timeout_graceful_shutdown=<from settings>, lifespan="on"))`. The worker is served the same way: its `app` has only health routes and the consumer as a background task.
 
-**`testing.py`** (pytest plugin `pycommon.testing`, registered with `pytest_plugins`): fixtures `pg_bootstrapped` (Postgres 16 with `deploy/compose/init` mounted at `/docker-entrypoint-initdb.d` and generated test passwords in the container env), `db_url_for(role)`, `alembic_upgrade(service)`, `redis_acl` (Redis 7 with `deploy/compose/redis/` mounted and the same entrypoint), `redis_url_for(user)`, `token_factory` (a throwaway Ed25519 key pair, `TokenSigner` and a matching `Keyset`), `otel_memory` (in-memory span exporter and `InMemoryMetricReader`), `fake_clock`, `caplog_json`. Service tests reuse them, so bootstrap SQL and ACLs are exercised in every service's integration suite (PAY-606, 607).
+**`testing.py`** (pytest plugin `pycommon.testing`, registered with `pytest_plugins`): fixtures `pg_bootstrapped` (Postgres 16 with `deploy/compose/init` mounted at `/docker-entrypoint-initdb.d` and generated test passwords in the container env), `db_env_for(role)` (the C1 keys `DB_HOST` … `DB_SCHEMA` for that role), `alembic_upgrade(service)`, `redis_acl` (Redis 7 with `deploy/compose/redis/` mounted and the same entrypoint), `redis_env_for(user)` (the C1 keys `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`, `REDIS_PASSWORD` for that ACL user), `token_factory` (a throwaway Ed25519 key pair, `TokenSigner` and a matching `Keyset`), `otel_memory` (in-memory span exporter and `InMemoryMetricReader`), `fake_clock`, `caplog_json`. Service tests reuse them, so bootstrap SQL and ACLs are exercised in every service's integration suite (PAY-606, 607).
 
 ### 3.15 `scripts/`
 
@@ -1217,8 +1197,8 @@ Variables written:
 | `WEB_PORT`, `GRAFANA_PORT`, `MAILPIT_PORT` | base+0, +1, +2 (4100, 4101, 4102) | derived | Compose (Compose can't add numbers) |
 | `IDENTITY_PORT`, `PAYROLL_PORT`, `PAYOUT_WORKER_PORT`, `BANK_STUB_PORT` | base+10…+13 (4110–4113) | derived | `compose.test.yaml`, tests |
 | `TEMPO_PORT`, `LOKI_PORT`, `PROMETHEUS_PORT`, `ALERTMANAGER_PORT`, `TOXIPROXY_PORT` | base+30…+34 (4130–4134) | derived | `compose.test.yaml`, tests |
-| `ALERT_SINK_PORT` | base+35 (4135), proposed (Issue 4) | derived | `compose.test.yaml`, alert drills |
-| `COMPANY_ID` | fixed dev UUID `0193a000-0000-7000-8000-000000000001` | kept | payroll migration seed, identity bootstrap, seed |
+| `ALERT_SINK_PORT` | base+35 (4135; R31) | derived | `compose.test.yaml`, alert drills |
+| `COMPANY_ID` | fixed dev UUID `0193a000-0000-7000-8000-000000000001` (C28; the same value in the event-schema examples, tests and every design) | kept | every service, payroll migration seed, identity bootstrap, seed, `mint_token.py` |
 | `POSTGRES_PASSWORD` | `openssl rand -hex 24` | kept | Postgres superuser, bootstrap |
 | `IDENTITY_DB_MIGRATOR_PASSWORD`, `IDENTITY_DB_PASSWORD` | hex 24 each | kept | bootstrap SQL, identity |
 | `PAYROLL_DB_MIGRATOR_PASSWORD`, `PAYROLL_DB_PASSWORD` | hex 24 each | kept | bootstrap SQL, payroll |
@@ -1238,14 +1218,15 @@ Variables written:
 | `SESSION_SECRET` | `openssl rand -base64 48` | kept | web |
 | `BANK_STUB_API_KEY` | `openssl rand -hex 32` (no provider-like prefix, so secret scanners don't match it) | kept | bank-stub, payout-worker |
 | `GRAFANA_ADMIN_PASSWORD` | hex 24 | kept | Grafana |
-| `SMTP_HOST`, `SMTP_PORT` | `mailpit`, `1025` (no credentials in dev) | kept | identity |
+| `SMTP_HOST`, `SMTP_PORT` | `mailpit`, `1025` (no credentials in dev; `SMTP_USERNAME`/`SMTP_PASSWORD` are unset) | kept | identity (unprefixed infrastructure keys, C49) |
 | `ALERT_PAGE_WEBHOOK_URL`, `ALERT_TICKET_WEBHOOK_URL` | `http://alert-sink:8080/page`, `http://alert-sink:8080/ticket` | kept | Alertmanager |
-| `OTEL_TRACES_SAMPLER_ARG` | `1.0` | kept | all |
-| `SEED_OWNER_EMAIL` | `owner@payrun.local` | kept | bootstrap-owner, seed |
-| `SEED_OWNER_PASSWORD`, `SEED_APPROVER_PASSWORD`, `LOAD_USER_PASSWORD` | 20 random URL-safe characters each | kept | seed, e2e, k6 |
-| `LOAD_USER_EMAIL` | `load@payrun.local` | kept | seed, k6 |
+| `OTEL_TRACES_SAMPLER` | `parentbased_always_on` (C23; there is no `OTEL_TRACES_SAMPLER_ARG`) | kept | all |
+| `SEED_OWNER_EMAIL` | `owner@payrun.local` | kept | bootstrap-owner, seed, e2e |
+| `SEED_OWNER_PASSWORD`, `SEED_APPROVER_PASSWORD`, `LOAD_USER_PASSWORD` | 20 random URL-safe characters each | kept | bootstrap-owner (`--password-env SEED_OWNER_PASSWORD`, R16), seed, e2e, k6 |
+| `LOAD_USER_EMAIL` | `load@payrun.local` (role `payroll_admin` only; R22, C27) | kept | seed, k6 |
 
-The 12 `REDIS_*`/DB/exporter passwords use hex so they never need escaping in URLs or ACL lines.
+The Postgres, DB-role, exporter and Redis passwords use hex, so they never need escaping in ACL lines or connection strings.
+The `.env` names `<SVC>_DB_PASSWORD`, `REDIS_<USER>_PASSWORD` and `<SVC>_INTERNAL_JWT_PUBLIC_KEYS` exist only in `.env`, Compose interpolation and the secret stores: each process receives them under its C1 name (`DB_PASSWORD`, `REDIS_PASSWORD`, `INTERNAL_JWT_PUBLIC_KEYS`; §7, §9).
 
 #### `scripts/stack.sh`
 
@@ -1254,7 +1235,7 @@ The 12 `REDIS_*`/DB/exporter passwords use hex so they never need escaping in UR
 
 | Command | Does |
 |---|---|
-| `up [--profiles core,obs,test]` | Default profiles `core,obs,test` (the e2e set; `--profiles core` for a lighter dev stack). `$COMPOSE --profile … up -d --build --wait --wait-timeout 180`. On failure prints `ps` and the last 100 log lines of every unhealthy service, and exits 1 |
+| `up [--profiles core,obs,test]` | Default profiles `core,obs,test` (the e2e set; `--profiles core` for a lighter dev stack). `$COMPOSE --profile … up -d --build --wait --wait-timeout 180`. On failure prints `ps` and the last 100 log lines of every unhealthy service, and exits 1. **Start-up timing (PAY-NFR-15):** then, for each of identity, payroll, payout-worker, bank-stub and web, reads `State.StartedAt` and the first passing health-check time from `docker inspect` and writes `ci-logs/startup.json` (`{service: seconds_to_ready}`); with `--check-startup` (set by `e2e.sh`) it exits 1 if any service took more than 20 s |
 | `down [-v]` | `$COMPOSE --profile core --profile obs --profile test down --remove-orphans [-v]` |
 | `logs [svc…]` | `$COMPOSE logs --no-color --timestamps [svc…]` |
 | `ps` | `$COMPOSE ps` |
@@ -1272,16 +1253,65 @@ The 12 `REDIS_*`/DB/exporter passwords use hex so they never need escaping in UR
 
 #### `scripts/seed.py` (PAY-609)
 
-`uv run python scripts/seed.py [--employees 10|500] [--base-url http://127.0.0.1:${WEB_PORT}] [--print-auth]`.
-Summary; the identity and web LLDs own the endpoints it calls.
-1. Refuses to run unless `ENV == "dev"` (exit 2, PAY-609).
-2. Waits (polling, 60 s cap) for `GET /api/health` and Mailpit's `/api/v1/info` (`MAILPIT_PORT`).
-3. **Owner:** the `bootstrap-owner` one-shot has created a pending owner and queued an invite. The seed finds the newest message to `SEED_OWNER_EMAIL` in Mailpit (`/api/v1/search?query=to:…`), extracts the token from the `/accept#token=…` link, and accepts it through the BFF with `SEED_OWNER_PASSWORD` (Issue 3). If the owner is already active it signs in instead.
-4. Signs in as the owner (BFF session cookie), invites `approver@payrun.local` (`[approver]`) and `LOAD_USER_EMAIL` (`[payroll_admin, approver]`), and accepts each invite from Mailpit with `SEED_APPROVER_PASSWORD` / `LOAD_USER_PASSWORD`. Existing users are skipped.
-5. Sets the company settings (tax 2000 bps, retirement 500 bps, dual approval on).
-6. Creates employees up to the target count (default 10: salaried and hourly on both schedules, one with an account ending `0000`; `--employees 500`: 500 on one monthly schedule for k6), using polyfactory with a fixed seed so names and numbers are reproducible. It counts existing employees first, so re-runs are no-ops.
-7. `--print-auth` prints, as `export` lines, what Schemathesis needs to mint tokens: the owner's user id, `COMPANY_ID` and the roles. It doesn't print JWTs, because they expire in 60 s (Issue 2); `scripts/ci/schemathesis_auth.py` mints them per request.
-All calls go through the BFF and Mailpit APIs; no SQL.
+`uv run python scripts/seed.py [--skeleton] [--employees 10|500] [--base-url http://127.0.0.1:${WEB_PORT}] [--out PATH]`.
+The identity, payroll and web LLDs own the endpoints it calls. All calls go through the BFF and Mailpit
+APIs; no SQL. Progress goes to stderr; stdout carries only the JSON summary.
+
+1. Refuses to run unless `ENV == "dev"` (exit 2, PAY-609). `--skeleton` with `--employees` is an argument error (exit 2).
+2. Waits (polling, 60 s cap, else exit 3) for the web's `GET /api/readyz` (C4) and Mailpit's `/api/v1/info` (`MAILPIT_PORT`).
+3. **Owner:** the `bootstrap-owner` one-shot has already created an **active** owner with `SEED_OWNER_PASSWORD` (`--if-empty --password-env`, R16, C27). The seed signs in as `SEED_OWNER_EMAIL` through `POST /api/auth/login` and keeps the session cookie. It never accepts an owner invite.
+4. **Users:** invites (`POST /api/users/invite`) `approver@payrun.local` with roles `[approver]` and `LOAD_USER_EMAIL` with roles `[payroll_admin]` only (R22, C27), finds each invite in Mailpit (`/api/v1/search?query=to:…`, newest first), extracts the token from the `/accept#token=…` link and accepts it through `POST /api/auth/accept` with `SEED_APPROVER_PASSWORD` / `LOAD_USER_PASSWORD`. Users that already exist are skipped (looked up by email in `GET /api/users`, paging until `next_cursor` is null); a pending one gets `POST /api/invites/{pending_invite_id}/resend` and is then accepted. Both modes create these users: k6 smoke signs in as `LOAD_USER_EMAIL`, and the skeleton journey approves as the approver.
+5. **Settings (full mode only):** `PUT /api/settings` with tax 2000 bps, retirement 500 bps and dual approval on (R22). `--skeleton` makes no settings PUT and runs on the migration's 0/0 seed (C33).
+6. **Employees:** counts existing employees first, then creates the missing ones, with polyfactory and a fixed seed so names and numbers are reproducible:
+   - `--skeleton`: 5 salaried monthly employees (C33);
+   - default: 10, salaried and hourly on both schedules, one with an account ending `0000`;
+   - `--employees 500`: 500 on one monthly schedule, for k6.
+7. **Runs** (both modes, C33): ensures one monthly run for the current month (period start = the 1st, UTC) and one draft monthly run for the next month. The current-month run is created if missing, given 160 hours for each hourly payslip, and calculated as the owner when it is still `draft`; a run already past `calculated` is left as it is. Its ID is reported, so k6 smoke can read it.
+8. **JSON summary** (stdout, and `--out PATH` when given; e2e writes `ci-logs/seed.json`):
+
+```json
+{
+  "mode": "skeleton",
+  "company_id": "0193a000-0000-7000-8000-000000000001",
+  "users": {"owner": "<uuid>", "approver": "<uuid>", "load": "<uuid>"},
+  "employees": 5,
+  "runs": {"current": "<uuid>", "draft": "<uuid>"}
+}
+```
+
+`mode` is `skeleton` or `full`; `employees` is the total after the run. A re-run prints the same IDs and counts (PAY-609).
+Exit codes: 0 done; 1 an API step failed (logs the step, the HTTP status and the error `code`, never a body); 2 arguments or `ENV`; 3 the stack wasn't ready in 60 s.
+Schemathesis and Playwright read `users.owner` from the summary; k6 smoke reads `runs.current`.
+
+#### `scripts/mint_token.py` (PAY-609, C35)
+
+A CLI plus an importable function, both on top of `pycommon.auth.TokenSigner`:
+
+```python
+def mint(aud: str, sub: str, roles: Sequence[str], *, issuer: Literal["web", "payout-worker"] = "web",
+         cid: UUID | str = COMPANY_ID, name: str | None = None) -> str
+```
+
+- **Keys:** `issuer="web"` signs with `INTERNAL_JWT_PRIVATE_KEY` / `INTERNAL_JWT_KID`; `"payout-worker"` with `PAYOUT_WORKER_JWT_PRIVATE_KEY` / `PAYOUT_WORKER_JWT_KID`. They come from the process env, else from `./.env` (PEMs through `normalise_pem`). `COMPANY_ID` defaults the same way.
+- **Claims** follow PAY-600 and R9: 60 s TTL, a fresh `jti`. A user `sub` (UUID) gets the given `roles`, `name` and a random `sid`; `sub="service:web"` gets `roles: []` and no `name` or `sid`; `issuer="payout-worker"` requires `sub="service:payout-worker"` and `roles: []`. Anything else raises `ValueError` (CLI: exit 2).
+- **Dev and CI only:** refuses unless `ENV == "dev"` (exit 2), like the seed.
+- **CLI:** `uv run python scripts/mint_token.py --aud payroll --sub <uuid|service:web|service:payout-worker> [--roles admin,approver] [--issuer web|payout-worker] [--cid UUID] [--name NAME]` prints the token and a newline on stdout and nothing else; nothing is logged. Playwright's test-only helper calls this CLI (C35); `scripts/ci/schemathesis_auth.py` imports `mint`.
+
+#### `scripts/sync-k8s-assets.sh` (R32, C36)
+
+`scripts/sync-k8s-assets.sh [--check]`. Kustomize can't load files outside a kustomization's root, and
+the design runs it with no load-restrictor flag, so the script copies the shared assets byte for byte:
+
+| Source (the only copy that is edited) | Copy |
+|---|---|
+| `deploy/compose/init/` (`*.sql`, `lib/service_schema.psql`, `run-init.sh`) | `deploy/k8s/base/bootstrap/init/` |
+| `deploy/compose/redis/redis.conf`, `entrypoint.sh` | `deploy/k8s/components/in-cluster-data/redis/` |
+| `deploy/observability/collector.yaml` | `deploy/k8s/base/otel-collector/collector.yaml` |
+| `deploy/observability/collector.prod.yaml` | `deploy/k8s/overlays/prod/collector.prod.yaml` |
+
+It deletes copy files that no longer have a source. `--check` copies nothing and exits 1 listing every
+file that differs or is missing. The copies are committed; `manifests.sh` runs the script and then
+`git diff --exit-code` and `git status --porcelain` on the copy paths, so a stale copy fails CI.
 
 #### `scripts/ci/*.sh`
 
@@ -1291,16 +1321,16 @@ All start with `source scripts/ci/lib.sh` (`set -euo pipefail`, `log()`, `group(
 |---|---|
 | `python.sh <member>` | `uv sync --locked --all-packages`; `ruff check <paths>`; `ruff format --check <paths>`; `mypy --strict <src> <tests>`; `pytest <member>/tests/unit -p pytest_socket --disable-socket --allow-unix-socket --cov=<pkg> --cov-branch`; `pytest <member>/tests/integration --cov=<pkg> --cov-branch --cov-append --cov-fail-under=<85 or 90> --cov-report=xml`. Member `platform` runs `tests/platform` (no coverage gate) |
 | `web.sh` | `corepack enable`; `pnpm install --frozen-lockfile`; `pnpm --filter web lint`; `pnpm exec prettier --check .`; `pnpm --filter web typecheck`; `pnpm --filter web test --coverage` (thresholds 80% in the Vitest config); `pnpm --filter web build` |
-| `contract.sh` | `export_openapi.py --all`; `pnpm --filter @payrun/api-client generate`; `git diff --exit-code -- services/*/openapi.json packages/api-client`; per service, `oasdiff breaking <(git show origin/main:services/<svc>/openapi.json) services/<svc>/openapi.json --fail-on ERR` (skipped when `main` has no spec); `check-jsonschema --check-metaschema contracts/events/*.json`; `check-jsonschema --schemafile contracts/events/payout.requested.v1.json contracts/events/examples/payout.requested.v1.*.json` |
-| `e2e.sh` | `dev-env.sh`; `stack.sh up` (core, obs, test); `seed.py`; `pnpm --filter web exec playwright test` (includes `trace.spec.ts` and axe); Schemathesis per service (below); `seed.py --employees 500` then `k6 run load/smoke.js`; `pytest tests/resilience -m smoke` (slow DB, identity down); `check_metrics.sh`; on failure `stack.sh logs > ci-logs/compose.log`; always `stack.sh down -v` |
+| `contract.sh` | `export_openapi.py --all`; `pnpm --filter @payrun/api-client generate`; `git diff --exit-code -- services/*/openapi.json packages/api-client`; per service, `oasdiff breaking <(git show origin/main:services/<svc>/openapi.json) services/<svc>/openapi.json --fail-on ERR` (skipped when `main` has no spec); `check-jsonschema --check-metaschema contracts/events/*.json`; `check-jsonschema --schemafile contracts/events/payout.requested.v1.json contracts/events/examples/payout.requested.v1.*.json`, and the same for `payout.requested.dlq.v1.json` and its examples (C21); every example's `data.company_id` equals the dev `COMPANY_ID` (C28) |
+| `e2e.sh` | Takes `E2E_SUITE=skeleton\|full` (default `full`; `ci.yml` sets `skeleton` until task F3 lands; C51). Both suites: `dev-env.sh`; `stack.sh up --check-startup` (core, obs, test; PAY-NFR-15). **skeleton:** `seed.py --skeleton --out ci-logs/seed.json`, then `pnpm --filter web exec playwright test --grep @skeleton` (only `skeleton.spec.ts`). **full:** `seed.py --out ci-logs/seed.json` (the full seed, C33), then `seed.py --employees 500 --out ci-logs/seed.json`, then Playwright `--grep @journeys` plus the trace (`trace.spec.ts`) and a11y (axe) specs. Playwright runs with `.env` and `SEED_JSON=ci-logs/seed.json` in its environment (`.env` already holds the test-only `PAYOUT_WORKER_JWT_PRIVATE_KEY` and `PAYROLL_PORT` for the blocked case, C44). Then, in **both** suites: `pytest tests/platform/test_seed.py -m stack` (PAY-609); Schemathesis per service (below); `k6 run -e SEED_JSON=ci-logs/seed.json load/smoke.js`; `pytest tests/resilience -m smoke` (the PR fault smoke tests: slow DB, identity down; C38); `check_metrics.sh`. On failure `stack.sh logs > ci-logs/compose.log`; always `stack.sh down -v` |
 | `check_metrics.sh` | Queries Prometheus (`PROMETHEUS_PORT`) `/api/v1/series` for each required name (`http_server_request_duration_seconds_count`, `bff_request_duration_seconds_count`, `queue_messages_total`, `queue_consumer_lag`, `outbox_oldest_age_seconds`, `circuit_breaker_state`, `external_requests_total`, `payroll_payouts_stuck`, `payroll_runs_processing_oldest_age_seconds`, `payroll_attempts_needs_operator`, `payroll_payout_settlement_seconds_count`, `identity_emails_pending`, `rate_limiter_errors_total`, `redis_stream_length`, `pg_up`, `otelcol_exporter_send_failed_spans_total`); fails listing the missing ones. Guards the metric-naming rule of §3.3 |
-| `schemathesis_auth.py` | A Schemathesis auth provider (`@schemathesis.auth()`) that mints a fresh token per request with `TokenSigner` from `INTERNAL_JWT_PRIVATE_KEY` (aud per service, owner sub and roles) and, for `/v1/internal/*`, with `PAYOUT_WORKER_JWT_PRIVATE_KEY`; for bank-stub it sets `X-Api-Key` |
-| `images.sh` | `docker buildx bake -f deploy/docker/bake.hcl --set *.platform=linux/amd64 --load` (cache `type=gha`, one scope per image); `trivy image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed=false --ignorefile .trivyignore payrun/<img>:ci` for the 5 images |
-| `manifests.sh` | `kustomize build --load-restrictor LoadRestrictionsNone deploy/k8s/overlays/<env> \| kubeconform …` for dev, uat, prod (§9.6); `pytest tests/platform/test_k8s_policy.py`; `promtool check config`, `promtool check rules`, `promtool test rules` (in the pinned `prom/prometheus` image); `amtool check-config` (pinned `prom/alertmanager` image); `docker compose -f … config -q` for both Compose files |
+| `schemathesis_auth.py` | A Schemathesis auth provider (`@schemathesis.auth()`, R30, C35) that imports `scripts/mint_token.py`'s `mint` and mints a **fresh token per request** (tokens live 60 s). `aud` is the service under test (`PAYRUN_SERVICE`, set by `e2e.sh` per run). Identity's four public-flow routes get `sub="service:web"`, `roles: []` and `X-Client-IP: 127.0.0.1`; `/v1/internal/*` gets `issuer="payout-worker"`, `sub="service:payout-worker"`; every other route gets the owner (`users.owner` from `SEED_JSON`) with `[admin, approver, payroll_admin]` and `name="Owner"`. For bank-stub it sets `X-Api-Key: $BANK_STUB_API_KEY` instead |
+| `images.sh` | **Trivy ignore policy first (C38):** every non-comment line of `.trivyignore` is a CVE ID followed by a comment `# reason: <text>; owner: <github handle>; exp:YYYY-MM-DD`; the script fails if a field is missing, if `exp` is in the past, or if the CVE is not also listed in `SECURITY_DEPENDENCIES.md`. Then `docker buildx bake -f deploy/docker/bake.hcl --set *.platform=linux/amd64 --load` (cache `type=gha`, one scope per image); `trivy image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed=false --ignorefile .trivyignore payrun/<img>:ci` for the 5 images |
+| `manifests.sh` | `scripts/sync-k8s-assets.sh`, then `git diff --exit-code` and an empty `git status --porcelain` on the copy paths (R32, C36); `kustomize build deploy/k8s/overlays/<env> \| kubeconform …` for dev, uat, prod (§9.6; no load-restrictor flag); `pytest tests/platform/test_k8s_policy.py`; `promtool check config`, `promtool check rules`, `promtool test rules` (in the pinned `prom/prometheus` image); `amtool check-config` (pinned `prom/alertmanager` image); `otelcol-contrib validate --config` for both Collector files; `docker compose -f … config -q` for both Compose files |
 | `security.sh` | `uv export --frozen --all-packages --no-dev --no-hashes \| pip-audit -r /dev/stdin --strict` (accepted advisories via `--ignore-vuln` from `SECURITY_DEPENDENCIES.md`); `pnpm audit --audit-level high`; `gitleaks git --log-opts="<base>..HEAD" --redact --exit-code 1` |
-| `nightly-load.sh` | stack up, `seed.py --employees 500`, `k6 run load/full.js` (30 req/s, 10 min), `load/soak.js` (5 req/s, 30 min), `load/settlement.js`; uploads k6 summaries |
+| `nightly-load.sh` | stack up, `seed.py --employees 500 --out ci-logs/seed.json`, `k6 run load/full.js` (30 req/s, 10 min), `load/soak.js` (5 req/s, 30 min), `load/settlement.js` (approves as `approver@payrun.local`, R22); uploads k6 summaries |
 | `nightly-resilience.sh` | stack up, seed, `pytest tests/resilience` (all faults) |
-| `nightly-e2e.sh` | e2e three times in a row (`--repeat-each 1` per run, fresh stack each time) |
+| `nightly-e2e.sh` | `E2E_SUITE=full e2e.sh` three times in a row (`--repeat-each 1` per run, fresh stack each time; `skeleton` until F3) |
 | `nightly-schemathesis.sh` | Schemathesis with `--max-examples 500` per service |
 | `nightly-audit.sh` | `security.sh` with fresh advisory DBs, plus `trivy image` of the freshly built images |
 | `report_failure.sh <job>` | Opens or updates the nightly issue (§11.2) |
@@ -1313,21 +1343,27 @@ Keys owned by the platform (pycommon base settings, shared timing, infrastructur
 keys (`AUTH_LOGIN_LIMIT_*`, `SESSION_*`, `BANK_STUB_*`, …) are in the service LLDs; their values in
 Compose and Kubernetes are listed in §7 and §9.
 
+**Naming (C1, D1):** the names below are authoritative for every Python service, runtime and migrate
+process alike, in Compose, Kubernetes, Testcontainers and `.env.example`. No process reads `DATABASE_URL`,
+`MIGRATOR_DATABASE_URL` or `REDIS_URL`, and no service prefixes these keys. The web uses the same Redis
+names (`REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME=web`, `REDIS_PASSWORD`; C12).
+
 | Key / env var | Type | Default (dev / uat / prod) | Requirement |
 |---|---|---|---|
 | `ENV` | `dev\|uat\|prod` | dev / uat / prod | PAY-605 |
 | `APP_VERSION` | str | git SHA / image tag / image tag | NFR-10 (`service.version`) |
-| `LOG_LEVEL` | str | INFO / INFO / INFO | NFR-07 |
+| `LOG_LEVEL` | `DEBUG\|INFO\|WARNING\|ERROR`, any case (C24) | INFO / INFO / INFO | NFR-07 |
 | `DEBUG`, `DOCS_ENABLED` | bool | false, true / false / false (refused if true) | PAY-605 |
-| `COMPANY_ID` | UUID | fixed dev UUID / per env / per env | PAY-200, 600 |
+| `COMPANY_ID` | UUID | `0193a000-0000-7000-8000-000000000001` (C28) / per env / per env | PAY-200, 600 |
 | `DB_HOST`, `DB_PORT`, `DB_NAME` | str, int, str | postgres, 5432, payrun / managed endpoint | PAY-606 |
-| `DB_USER`, `DB_PASSWORD`, `DB_SCHEMA` | str, secret, str | `<schema>_app` (runtime) or `<schema>_migrator` (migrate) | PAY-606 |
+| `DB_USER`, `DB_PASSWORD`, `DB_SCHEMA` | str, secret, str | `<schema>_app` (runtime) or `<schema>_migrator` (migrate, bootstrap-owner) per C2; password from `<SVC>_DB_PASSWORD` / `<SVC>_DB_MIGRATOR_PASSWORD` | PAY-606 |
 | `DB_STATEMENT_TIMEOUT_MS` / `DB_POOL_TIMEOUT_S` | int / float | 2000 / 2 everywhere | PAY-605, plan §2.2 |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | int | 10 / 5 everywhere (tuned after load tests) | NFR-05 |
-| `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`, `REDIS_PASSWORD` | str, int, str, secret | redis, 6379, per-service ACL user | PAY-607 |
+| `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`, `REDIS_PASSWORD` | str, int, str, secret | redis, 6379, the service's ACL user (§2.2), password from `REDIS_<USER>_PASSWORD` / managed endpoint | PAY-607 |
 | `REDIS_SOCKET_TIMEOUT_MS` / `PAYOUT_XREAD_BLOCK_MS` | int | 500 / 5000 everywhere | plan §2.2 |
 | `INTERNAL_JWT_PUBLIC_KEYS` | JSON keyset | from `<SVC>_INTERNAL_JWT_PUBLIC_KEYS` / ConfigMap / ConfigMap | PAY-600 |
 | `MAX_BODY_BYTES` | int | 262144 | PAY-604 |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD` | str, int, str, secret | mailpit, 1025, unset, unset / in-cluster Mailpit / provider via ExternalSecret (unprefixed infrastructure keys, read by identity; C49) | PAY-110 |
 | `SERVICE_RATE_LIMIT_USER` / `_WORKER` | int per min | 600 / 6000 (test env: 1000000 / 1000000) | PAY-603 |
 | `BREAKER_FAILURES` / `BREAKER_RESET_S` | int / float | 5 / 30 | plan §2.2 |
 | `MAINTENANCE_INTERVAL_S` | int | 60 | PAY-608 |
@@ -1338,10 +1374,10 @@ Compose and Kubernetes are listed in §7 and §9.
 | `PAYOUT_REPUBLISH_AFTER_S` / `PAYOUT_REPUBLISH_MAX_BACKOFF_S` / `PAYOUT_REPUBLISH_MAX` | int | 360 / 900 / 10 (shared; README resolution R1) | PAY-407, 605 |
 | `BANK_TOTAL_DEADLINE_S` / `PAYOUT_PAYROLL_CALL_DEADLINE_S` | float | 15 / 5 (shared) | PAY-404, 605 |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | URL | `http://otel-collector:4317` (Python), `:4318` (web) | NFR-09, 10 |
-| `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` | str / float | parentbased_traceidratio / 1.0, 1.0, 0.1 | plan §11 |
+| `OTEL_TRACES_SAMPLER` | str | `parentbased_always_on` everywhere (R27, C23); no `OTEL_TRACES_SAMPLER_ARG`; prod sampling is the Collector's `tail_sampling` | plan §11 |
 | `OTEL_METRIC_EXPORT_INTERVAL` | ms | 15000 | NFR-10 |
 | `OTEL_SEMCONV_STABILITY_OPT_IN` | str | `http` (Dockerfile, Compose, K8s, and `otel.py` fallback) | NFR-10 |
-| `PYCOMMON_APP` / `PORT` | str / int | `<pkg>.main:app` / 8000 (Dockerfile) | — |
+| `PYCOMMON_APP` / `PORT` | str / int | `<pkg>.main:app` / 8000 (Python Dockerfile); the web container uses `PORT=3000` (C4) | — |
 | `APP_PORT_BASE` | int | 4100 / n/a / n/a | PAY-NFR-13 |
 
 ## 5. Logging and metrics (pycommon)
@@ -1353,30 +1389,24 @@ Service LLDs add their domain events and business metrics. These come from pycom
 | `http.request` | info (warning on 5xx) | method, route, status, duration_ms, caller | every non-health request | NFR-07, 10 |
 | `http.error` / `http.unhandled` | info, warning / error | code, status / error_type + traceback | AppError / unhandled exception | PAY-602 |
 | `auth.token.rejected` | warning | reason, kid, iss | JWT verification failed | PAY-600 |
-| `auth.forbidden` | info | route, missing_roles | role check failed | PAY-601 |
-| `settings.invalid` | error | fields | settings validation failed | PAY-605 |
-| `startup.check_failed` | error (uat/prod) / warning (dev) | setting, reason | a startup check fails | PAY-605 |
+| `auth.forbidden` | info | route, subject_kind or missing_roles | 403 by the C30 rule | PAY-601 |
+| `settings.invalid` | error | fields | settings validation failed; exit 2 | PAY-605 |
+| `startup.check_failed` | error (uat/prod) / warning (dev) | setting, reason | a startup check fails; exit 2 in uat/prod (C29) | PAY-605 |
+| `otel.sampler.overridden` | warning | sampler | `OTEL_TRACES_SAMPLER` isn't `parentbased_always_on` | plan §11 |
+| `metrics.gauge_query_failed` | warning | gauge, error_type | an `observable_gauge` callback raised | plan §2.1 |
 | `service.started` / `service.stopped` | info | version, env | lifespan | — |
 | `background.task.crashed` | error | task, error_type | a background task raised | — |
 | `health.check_failed` | warning | check, error_type | `/readyz` failure (rate-limited) | PAY-605 |
 | `db.timeout` / `db.unavailable` | warning | operation | DB timeout / connection failure | PAY-605 |
 | `redis.unavailable` | warning | operation | Redis error not handled by the caller | plan §2.1 |
-| `outbox.relay.error` | warning | error_type, batch_size | relay XADD or commit failed | PAY-402 |
-| `queue.message.processed` / `queue.message.failed` | info / warning | stream, group, consumer, deliveries, duration_ms, outcome, error_code | per message | PAY-403, 408 |
-| `queue.message.dead_lettered` | error | stream, source_id, error_code, deliveries | DLQ write | PAY-408, 409 |
-| `queue.group.recreated` | warning | stream, group | NOGROUP handled | PAY-408 |
+| `outbox.relay.error` | error | error_type, batch_size, failed, backoff_ms | `RelayLoop` XADD or commit failed | PAY-402 |
 | `external.request.retry` / `external.request.failed` | warning | provider, operation, attempt, reason, delay_ms | resilient client | plan §9 |
 | `external.breaker.opened` / `.half_open` / `.closed` | warning / info / info | target | breaker transition | plan §9 |
 | `ratelimit.backend_error` | warning (≤ 1 per 10 s) | component, fail_mode | Redis failed in the limiter | PAY-603 |
-| `maintenance.task.completed` / `maintenance.task.failed` | info / error | task, affected, duration_ms / error_type | each task per tick | PAY-608 |
+| `maintenance.task.completed` / `maintenance.task.failed` / `maintenance.skipped` | info / error / debug | task, affected, duration_ms / task, error_type / — | each task per tick; lock not held (C44) | PAY-608 |
 | `http_server_request_duration_seconds` | histogram (auto) | `http_route`, `http_request_method`, `http_response_status_code` | every request | NFR-10 |
 | `db_client_connections_usage` | gauge (auto) | `state` | SQLAlchemy pool | NFR-10 saturation |
 | `asyncio_event_loop_lag_seconds` | gauge | — | 1 s ticker | NFR-10 saturation |
-| `queue_messages_total` | counter | `stream`, `group`, `outcome` (`ok`, `retry`, `dlq`, `abandoned`) | per message (pre-initialised to 0) | PAY-403, 408, NFR-11 |
-| `queue_processing_seconds` | histogram | `stream`, `group` | per message | NFR-10 |
-| `queue_consumer_lag` | gauge | `stream`, `group` | `XINFO GROUPS` every 15 s | NFR-10 |
-| `queue_dlq_messages` | gauge | `stream` | `XINFO STREAM <dlq>` length every 15 s | PAY-408 |
-| `outbox_unsent` / `outbox_oldest_age_seconds` | gauge | (`service_name`) | relay, every 15 s | PAY-402 |
 | `external_requests_total` | counter | `provider`, `operation`, `outcome` | per attempt | plan §9, 11 |
 | `external_request_duration_seconds` | histogram | `provider`, `operation` | per attempt | plan §9 |
 | `circuit_breaker_state` | gauge (0 closed, 1 half-open, 2 open) | `target` | breaker | plan §11 |
@@ -1387,6 +1417,13 @@ Service LLDs add their domain events and business metrics. These come from pycom
 All metrics carry `service_name` and `deployment_environment_name` from the resource (§8.1). No
 label ever holds a user id, email, request id, raw path or error message.
 
+**Service-owned metrics the platform assets depend on** (rules, dashboards and `check_metrics.sh`; the
+owning LLD defines them, and these names and labels are the contract):
+- payout-worker: `queue_messages_total{stream, group, outcome}` with `outcome` ∈ `ok`, `retry`, `dlq`, pre-initialised with `add(0)` for each (C21); `queue_processing_seconds`, `queue_consumer_lag`, `queue_dlq_messages`, `payouts_bank_transfers_total{outcome, reason}`;
+- payroll: `payroll_*` and `outbox_unsent` / `outbox_oldest_age_seconds` (payroll LLD §7.2, C18);
+- identity: `auth_signins_total{outcome}` with `outcome` ∈ `success`, `failure`, `rate_limited` (C19); `identity_emails_failed_total` (counter, C20, R25), `identity_emails_pending`, `identity_email_oldest_pending_age_seconds`;
+- web: `bff_request_duration_seconds{route, status}` (route templates, status as the numeric code) and the BFF's own counters (web LLD §7.2).
+
 ## 6. Tests
 
 ### 6.1 pycommon (gate: ≥ 90% line coverage, branch coverage on; unit + integration combined)
@@ -1396,43 +1433,45 @@ Unit tests run with `--disable-socket --allow-unix-socket`; integration tests us
 
 | Test file | Covers |
 |---|---|
-| `tests/unit/test_settings.py` | Precedence env > `.env` > defaults; `SettingsError` lists field names and never values (a secret placed in an invalid field doesn't appear in the message); `normalise_pem`; `db_url` quoting; `secret_fields` |
+| `tests/unit/test_settings.py` | Precedence env > `.env` > defaults; the C1 names are read unprefixed (`DB_HOST` … `REDIS_PASSWORD`) and `DATABASE_URL`/`REDIS_URL` are ignored; `LOG_LEVEL=info`, `Info` and `INFO` all load as `INFO`, `verbose` fails (C24); `SettingsError` lists field names and never values (a secret placed in an invalid field doesn't appear in the message), and `load_settings` exits 2; `normalise_pem`; `db_url` quoting; `secret_fields` |
 | `tests/unit/test_logging.py` | JSON line has every required field; `trace_id`/`span_id` inside a span (in-memory exporter); `redact` masks each of the 7 PAY-NFR-07 keys and the extra ones, case-insensitively, nested in dicts and lists, plus JWT / Bearer / PEM values under innocent keys; depth cap; `user_text` length outside dev; uvicorn access log silenced; OTLP handler gets redacted attributes (NFR-07) |
-| `tests/unit/test_otel.py` | Resource attributes; `OTEL_SEMCONV_STABILITY_OPT_IN` set before instrumentation import; a TestClient request yields `http.server.request.duration` with `http.route` (the stable name, checked with `InMemoryMetricReader`); `url.query` dropped from server and client spans; Redis hook records no arguments; histogram buckets applied; `AsyncGauge` caches, goes stale after 2 failed refreshes; traceparent inject/extract round trip and invalid input → empty context |
+| `tests/unit/test_otel.py` | Resource attributes; `OTEL_SEMCONV_STABILITY_OPT_IN` set before instrumentation import; the sampler is `ParentBased(ALWAYS_ON)` when `OTEL_TRACES_SAMPLER` is unset or `parentbased_always_on`, and another value logs `otel.sampler.overridden` (C23); a TestClient request yields `http.server.request.duration` with `http.route` (the stable name, checked with `InMemoryMetricReader`); `url.query` dropped from server and client spans; Redis hook records no arguments; histogram buckets applied; `observable_gauge` reports the callback's value at collection, and a raising callback yields no observation and logs `metrics.gauge_query_failed` (R26, C18); traceparent inject/extract round trip, `new_traceparent` format (unsampled flag), and invalid input → empty context |
 | `tests/unit/test_errors.py` | Each handler row of §3.4: status, code, body shape with `request_id`, no traceback or exception text in the body, 422 details without input values, `Retry-After` on 429 (PAY-602) |
-| `tests/unit/test_jwt.py` | PAY-600: valid web and worker tokens pass; 401 `invalid_token` for missing header, malformed, unknown kid, `alg` ≠ EdDSA (including `none` and HS256 with the public key as secret), tampered signature, expired, iat in the future, wrong aud, missing each required claim, lifetime > 60 s; **a token signed with the worker key but `iss=web` is rejected (`issuer_mismatch`)**; 5 s leeway accepted and 6 s rejected (`FakeClock`); the token never appears in captured logs; `Keyset.from_json` rejects bad JSON, unknown iss, non-Ed25519 PEM; `TokenSigner.mint` claims |
-| `tests/unit/test_auth_deps.py` | `require`: wrong issuer → 401 (web token on an internal route; worker token on a public route); wrong `sub` → 401; `service:web` only where allowed; missing role → 403 `forbidden_role`; `any_role` vs all roles; `Principal.caller_key` (PAY-601, 411) |
+| `tests/unit/test_jwt.py` | PAY-600: valid web and worker tokens pass; `name` round-trips to `Principal.name` and is `None` when absent (C10); 401 `invalid_token` for missing header, malformed, unknown kid, `alg` ≠ EdDSA (including `none` and HS256 with the public key as secret), tampered signature, expired, iat in the future, wrong aud, missing each required claim, lifetime > 60 s; **a token signed with the worker key but `iss=web` is rejected (`issuer_mismatch`)**; 5 s leeway accepted and 6 s rejected (`FakeClock`); the token never appears in captured logs; `Keyset.from_json` rejects bad JSON, unknown iss, non-Ed25519 PEM; `TokenSigner.mint` claims |
+| `tests/unit/test_auth_deps.py` | The C30 matrix: route issuer not allowed → 401 `invalid_token` (web token on an internal route; worker token on a user route; PAY-411); `service:web` on a user route → 403 `forbidden_role`; a user token on a `service:web`-only route → 403; the issuer check runs first, so a web user token on a worker-only route is 401, not 403; missing role → 403 `forbidden_role`; `any_role` vs all roles; logs carry no token, `name` or `sid`; `Principal.caller_key` (PAY-601, 411) |
 | `tests/unit/test_health.py` | `/livez` always 200; `/readyz` 200 / 503 with per-check status and no error text; a hanging check times out at 1 s; checks run concurrently; health routes have no auth |
 | `tests/unit/test_db.py` | `create_engine` arguments (statement timeout, search path, pool timeout, pre-ping); `map_db_errors` maps each driver error to `DbTimeout` / `DbUnavailable`; `advisory_lock_key` is stable and signed 64-bit; `new_id` is version 7 and time-ordered |
-| `tests/unit/test_streams_unit.py` | `Envelope.new` fields and `extra="forbid"`; DLQ field layout; `request_hash` canonicalisation; consumer dispatch logic with a fake Redis port (success, retry, exhausted → hook, poison → immediate DLQ, NOGROUP → recreate) |
+| `tests/unit/test_streams_unit.py` | `Envelope.new` fields and `extra="forbid"`; `traceparent` is required (a missing or malformed one fails validation) and is filled from the active span or `new_traceparent()` (C22); `StreamProducer.publish` sends exactly `event_id`, `type`, `envelope` with `MAXLEN ~` (fake Redis port; R7); `RelayLoop` with a fake `OutboxRepository`: sent items marked sent, failed items marked failed with the class name, backoff doubles with jitter up to 5 s and resets after a clean batch, `wake()` skips the poll wait, a full batch loops at once |
 | `tests/unit/test_http.py` | Every behaviour line of §3.10 with respx and `FakeClock`: per-attempt timeouts; total deadline across retries; retries only for idempotent methods or with an `Idempotency-Key` (same key on every attempt); 429/502/503/504 retried, other 4xx not; `Retry-After` honoured or abandoned when past the deadline; full-jitter bounds; `auth_headers` called per attempt; `request` mapping to each typed error; `request_raw` returns 4xx/5xx unmapped; metrics labels per outcome; no body or header in logs |
 | `tests/unit/test_breaker.py` | closed → open after 5 consecutive failures; 4xx/429 don't count; open fails fast without sending; half-open after 30 s allows exactly one trial; trial success closes, failure re-opens; `circuit_breaker_state` values and transition logs |
-| `tests/unit/test_ratelimit_unit.py` | Key layout and subject hashing; window arithmetic and `retry_after_s`; worker vs user limit selection in `caller_rate_limit` |
-| `tests/unit/test_startup_checks.py` | PAY-605: each check fails and passes on crafted settings; missing secret; each `DEV_DEFAULTS` value; `dev-`/`test-` kids in the keyset, `*_KID` fields and `PAYROLL_FIELD_KEYS`; debug and docs on; bank URL pointing at `bank-stub`, `localhost` or a placeholder in prod (accepted in uat); `check_claim_idle` boundary (35 s fails, 35.001 s passes); `check_republish_after` boundary, including **the plan defaults failing (300 vs 315)**; uat/prod exit 2 with one log line per failure naming the setting and never the value; dev logs warnings and continues |
-| `tests/unit/test_maintenance_unit.py` | Interval with jitter; first tick delay; a failing task doesn't stop the next; `standard_purge_tasks` builds the right cut-offs |
+| `tests/unit/test_ratelimit_unit.py` | Key layout and subject hashing (the `caller` key format of §3.11); window arithmetic and `retry_after_s`; worker vs user limit selection in `caller_rate_limit`; `service:web` is exempt by default and `exempt_subs` overrides it (C17) |
+| `tests/unit/test_startup_checks.py` | PAY-605: each check fails and passes on crafted settings; missing secret; each `DEV_DEFAULTS` value; `dev-`/`test-` kids in the keyset, `*_KID` fields and `PAYROLL_FIELD_KEYS`; debug and docs on; bank URL pointing at `bank-stub`, `localhost` or a placeholder in prod (accepted in uat); `check_claim_idle` boundary (35 s fails, 35.001 s passes); `check_republish_after` boundary (315 fails, 315.001 passes), with the R1 default 360 passing and the old 300 failing; `BANK_BASE_URL=https://bank-provider.invalid` refused in prod; uat/prod exit 2 with one `startup.check_failed` line per failure naming the setting and never the value (C29); dev logs warnings and continues |
+| `tests/unit/test_maintenance_unit.py` | Interval with jitter; first tick delay; a failing task doesn't stop the next; log names `maintenance.task.completed`, `maintenance.task.failed`, `maintenance.skipped` (C44) |
 | `tests/unit/test_app.py` | `create_app` assembly: docs off unless enabled; `app.openapi()` works with docs off; request id accepted / regenerated / echoed in `x-request-id`, `x-trace-id` set; body limit 413 by `Content-Length` and by streamed size; every router except health requires a JWT; `public_routers` don't; startup checks run before any connection (a failing check means no engine is created); background tasks start and stop within the timeout; a crashing background task is restarted with backoff |
 | `tests/unit/test_serve.py` | `pycommon.serve` builds the uvicorn config from env (access log off, server header off) |
 | `tests/integration/test_db_pg.py` | Statement timeout → 503 `db_timeout` via a `pg_sleep(3)` route; pool exhaustion → `db_timeout` after 2 s; DB stopped → `db_unavailable` fast, and recovery without stuck connections once restarted; `migrations_check` detects a head mismatch; `run_alembic_env` puts the version table in the schema and revokes runtime writes on it |
-| `tests/integration/test_streams.py` | With real Redis and the ACL users: publish with `MAXLEN ~`; consumer reads its pending entries before new ones; a failing message is retried and its delivery count rises; a dead consumer's entry is reclaimed by XAUTOCLAIM after the idle time; exhausted → `on_exhausted` (both dispositions); poison → DLQ at once with the documented fields; `FLUSHALL` mid-run → NOGROUP → group recreated from `0`; the consumer span is a **child** of the producer's traceparent (same trace id); graceful shutdown finishes in-flight work and leaves the rest pending; the blocking client survives `BLOCK 5000` with a 500 ms general timeout; `queue_*` metrics including the pre-initialised `dlq` series |
-| `tests/integration/test_outbox_relay.py` | State change and outbox row commit together, a rollback leaves neither; two relays on the same table never send a row twice (SKIP LOCKED); Redis down → rows stay unsent and `outbox_oldest_age_seconds` grows; relay catches up after recovery; batch of 100 then immediate loop |
-| `tests/integration/test_idempotency.py` | `begin` new / replay / different body → 422 `idempotency_key_reused`; two concurrent `begin`s with the same key: the second waits and then replays; rollback forgets the key; purge after `expires_at` |
+| `tests/integration/test_streams.py` | With real Redis and the ACL users: the `payroll` user publishes with `MAXLEN ~` and the entry has exactly the three fields; `XREADGROUP` as `payout-worker` reads the envelope back and `context_from_traceparent` continues the producer's trace (same trace id); a client from `create_redis(socket_timeout_ms=5500)` survives `BLOCK 5000` while the default client times out at 500 ms |
+| `tests/integration/test_relay_loop.py` | Against a throwaway outbox table the **test** creates (pycommon ships none): two loops on one table never send a row twice (SKIP LOCKED); Redis stopped → rows stay unsent with `relay_attempts` rising, then the loop catches up after recovery; batch of 100 then an immediate loop |
 | `tests/integration/test_ratelimit.py` | PAY-603: two limiter instances share counts; 429 with `Retry-After` past the limit; Redis stopped → `open` allows and counts `rate_limiter_errors_total`, `closed` raises 503 `service_unavailable` |
-| `tests/integration/test_maintenance.py` | Two runners on one database: only one runs per tick (advisory lock); the lock is released after the tick and after a killed connection; each standard purge deletes exactly the rows past the window (PAY-608) |
+| `tests/integration/test_maintenance.py` | Two runners on one database: only one runs per tick (advisory lock); the lock is released after the tick and after a killed connection; a test task's affected count is logged in `maintenance.task.completed` (PAY-608; each service's own integration suite proves its purge windows) |
 | `tests/integration/test_secret_not_logged.py` | A full request through `create_app` with every secret set to a recognisable random value: none of them appears in captured stdout logs or exported spans (NFR-07) |
 
 ### 6.2 Platform assets (`tests/platform`, CI matrix member `platform`)
 
 | Test file | Covers |
 |---|---|
-| `test_bootstrap_sql.py` | PAY-606: the init SQL runs in a fresh Postgres; each runtime role gets `permission denied` on every other schema and can't `CREATE` in its own; each migrator owns its schema; default privileges give the runtime role DML on a table the migrator creates; `public` has no rights; `postgres_exporter` has `pg_monitor` and can't read any table; a missing password env var fails with the variable's name; re-running all files succeeds and rotates a changed password; `log_statement` is `none` |
-| `test_redis_acl.py` | PAY-607: `entrypoint.sh` output loads; web and identity get `NOPERM` on `XADD stream:payout.requested`; payroll can `XADD` the stream but not read sessions; the worker can XREADGROUP/XACK/XAUTOCLAIM/XGROUP CREATE on the stream and XADD only on the DLQ; the exporter can't write or read string keys; the file contains no plaintext password; a missing env var aborts |
-| `test_dev_env.py` | `dev-env.sh` in a temp dir: every §3.15 key present; a second run changes no kept value; keysets parse with `Keyset.from_json` and their PEMs match the private keys; kids start with `dev-`; derived ports follow `APP_PORT_BASE` |
-| `test_compose.py` | `docker compose config` for both files: every published port binds `127.0.0.1` and matches §7.2; every core service has a healthcheck; services depend on their migration with `service_completed_successfully` (PAY-NFR-13) |
+| `test_bootstrap_sql.py` | PAY-606: the init SQL runs in a fresh Postgres; each runtime role gets `permission denied` on every other schema and can't `CREATE` in its own; each migrator owns its schema; default privileges give the runtime role DML on a table the migrator creates; `public` has no rights; `postgres_exporter` has `pg_monitor` and can't read any table; a missing password env var fails with the variable's name; re-running all files succeeds and rotates a changed password; after identity's migrations and a full re-run, `identity_app` still gets `permission denied` for `UPDATE` and `DELETE` on `identity.audit_log` and can `INSERT` and `SELECT` (C50), and the files run cleanly when the table doesn't exist yet; `log_statement` is `none`. identity's own `services/identity/tests/integration/test_grants.py` also asserts that `audit_log` UPDATE is denied after a bootstrap re-run (C50) |
+| `test_redis_acl.py` | PAY-607: `entrypoint.sh` output loads; every user can `PING` (R12); `EVAL` and `FCALL` give `NOPERM` for every user but `default` (C3); web and identity get `NOPERM` on `XADD stream:payout.requested`; payroll can `XADD` the stream but not read sessions; the worker can XREADGROUP, XACK, XAUTOCLAIM, XPENDING, XINFO, `XGROUP CREATE … MKSTREAM` on an absent stream, and `XGROUP DELCONSUMER` (C27) on the stream, and only XADD and XINFO on the DLQ; the exporter can read stream info but can't write or read string keys (R12); `--print` masks the hashes; the file contains no plaintext password; a missing env var aborts |
+| `test_dev_env.py` | `dev-env.sh` in a temp dir: every §3.15 key present; `OTEL_TRACES_SAMPLER=parentbased_always_on` and no `OTEL_TRACES_SAMPLER_ARG` (C23); `COMPANY_ID` is the C28 value and equals `data.company_id` in every `contracts/events/examples` file; a second run changes no kept value; keysets parse with `Keyset.from_json` and their PEMs match the private keys; kids start with `dev-`; derived ports follow `APP_PORT_BASE` |
+| `test_compose.py` | `docker compose config` for both files: every published port binds `127.0.0.1` and matches §7.1; every core service has a healthcheck; services depend on their migration with `service_completed_successfully` (PAY-NFR-13); **env contract (C1):** no service env has `DATABASE_URL`, `MIGRATOR_DATABASE_URL` or `REDIS_URL`, every Python service and migrate one-shot has `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_SCHEMA` with `DB_USER` matching C2, and every Redis client (web included) has `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`, `REDIS_PASSWORD`; `OTEL_TRACES_SAMPLER=parentbased_always_on` everywhere (C23); the web has `PORT=3000`, port `${WEB_PORT}:3000` and a healthcheck on `/api/readyz` (C4); `bootstrap-owner` runs with `--if-empty` (R16) |
 | `test_toxiproxy_config.py` | `toxiproxy.json` has exactly the four proxies and listen ports used by `compose.test.yaml` |
 | `test_alert_sink.py` | POST /page and /ticket store payloads; GET returns them; DELETE clears; bounded at 500 per route |
-| `test_rules_meta.py` | Every alert in `alerts.yml` is one of the 17 in plan §11, has `severity` in {page, ticket, warning}, `summary`, and a `runbook_url` whose file exists under `docs/runbooks/`; every alert has at least one firing and one quiet `promtool` test case (NFR-10, 11) |
+| `test_rules_meta.py` | Every BFF SLI expression in `recording.yml` carries `route!~"/api/livez\|/api/readyz\|/api/telemetry"` (C4); no rule uses `outcome="failed"` for `auth_signins_total` (C19) or the gauge `identity_emails_failed` (C20); every alert in `alerts.yml` is one of the 17 in plan §11, has `severity` in {page, ticket, warning}, `summary`, and a `runbook_url` whose file exists under `docs/runbooks/`; every alert has at least one firing and one quiet `promtool` test case (NFR-10, 11) |
 | `test_dashboards.py` | The five dashboard JSONs parse, have stable `uid`s, use datasource uids `prometheus`/`tempo`/`loki`, and every metric name they query is in the §5 table or a service LLD's list |
-| `test_k8s_policy.py` | For each overlay's rendered output: every Deployment and Job has `runAsNonRoot`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, drops ALL, `seccompProfile: RuntimeDefault`, `automountServiceAccountToken: false`, resources and probes (Jobs: no probes); a default-deny policy exists; bank-stub is absent from prod; only payout-worker has an egress rule to the bank; prod has ExternalSecrets and no plaintext Secret values (PAY-NFR-13, ADR 0011) |
+| `test_k8s_policy.py` | For each overlay's rendered output: every Deployment and Job has `runAsNonRoot`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, drops ALL, `seccompProfile: RuntimeDefault`, `automountServiceAccountToken: false`, resources and probes (Jobs: no probes); the web's probes are `/api/livez` (startup, liveness) and `/api/readyz` (readiness) on port 3000 (C4); no container env or ConfigMap holds `DATABASE_URL`, `MIGRATOR_DATABASE_URL` or `REDIS_URL` (C1); `OTEL_TRACES_SAMPLER` is `parentbased_always_on` in every overlay (C23); a default-deny policy exists; bank-stub is absent from prod; only payout-worker has an egress rule to the bank; **prod's payout-worker Deployment has `replicas: 0`** (R14, C32); uat and prod use ExternalSecrets and have no plaintext Secret values (R29; PAY-NFR-13, ADR 0011) |
+| `test_mint_token.py` | PAY-609, C35: `mint()` tokens verify with the `.env` keysets for each issuer; claims per PAY-600 (user: roles, `name`, `sid`; `service:web`: no `name`, no `sid`; worker: `roles: []`); a bad issuer/sub pair raises; the CLI prints only the token and exits 2 when `ENV` isn't dev |
+| `test_sync_k8s_assets.py` | R32, C36: in a temp copy of the repo, `sync-k8s-assets.sh --check` passes after a sync and fails (exit 1, listing the file) after a source edit, a copy edit or a deleted source |
+| `test_seed.py` (marker `stack`; run by `e2e.sh`, skipped in the `platform` matrix member) | PAY-609: against the running stack, the JSON summary validates (keys and types of §3.15, `company_id` = `COMPANY_ID`); a second run prints the same IDs and counts; `ENV=uat` exits 2; `LOAD_USER_EMAIL` has exactly `[payroll_admin]` (C27); in skeleton mode there are 5 salaried monthly employees, `runs.current` is `calculated` and `runs.draft` is `draft` (C33) |
 
 Prometheus rule tests (`promtool test rules`) are described with the rules in §8.3.
 
@@ -1454,21 +1493,21 @@ Prometheus rule tests (`promtool test rules`) are described with the rules in §
 | `payroll` | core | payroll | migrate-payroll (completed), redis (healthy) | `/readyz` | test: `PAYROLL_PORT` 4111 |
 | `bank-stub` | core | bank-stub | migrate-bank-stub (completed) | `/readyz` | test: `BANK_STUB_PORT` 4113 |
 | `payout-worker` | core | payout-worker | migrate-payouts (completed), redis (healthy), payroll (healthy), bank-stub (healthy) | `/readyz` | test: `PAYOUT_WORKER_PORT` 4112 |
-| `web` | core | web | identity (healthy), payroll (healthy), redis (healthy), bootstrap-owner (completed) | `node -e "fetch('http://127.0.0.1:3000/api/health')…"` | `WEB_PORT` 4100 → 3000 |
+| `web` | core | web | identity (healthy), payroll (healthy), redis (healthy), bootstrap-owner (completed) | `node -e "fetch('http://127.0.0.1:3000/api/readyz')…"` (C4) | `WEB_PORT` 4100 → 3000 |
 | `otel-collector` | obs | `otel/opentelemetry-collector-contrib` | — | `healthcheck` extension `:13133` (via the collector's `healthcheckv2`; image has no shell, so `--wait` relies on `start_period`) | — |
 | `tempo` | obs | `grafana/tempo` | — | `wget -qO- localhost:3200/ready` | test: `TEMPO_PORT` 4130 → 3200 |
 | `loki` | obs | `grafana/loki` (3.x) | — | `wget -qO- localhost:3100/ready` | test: `LOKI_PORT` 4131 → 3100 |
 | `prometheus` | obs | `prom/prometheus` | — | `wget -qO- localhost:9090/-/ready` | test: `PROMETHEUS_PORT` 4132 → 9090 |
 | `alertmanager` | obs | `prom/alertmanager` | alert-sink (healthy) | `wget -qO- localhost:9093/-/ready` | test: `ALERTMANAGER_PORT` 4133 → 9093 |
-| `alert-sink` | obs | the pinned Python base image + `alert_sink.py` | — | `python -c` GET `/healthz` | test: `ALERT_SINK_PORT` 4135 → 8080 (Issue 4) |
+| `alert-sink` | obs | the pinned Python base image + `alert_sink.py` | — | `python -c` GET `/healthz` | test: `ALERT_SINK_PORT` 4135 → 8080 (R31) |
 | `grafana` | obs | `grafana/grafana` | prometheus, tempo, loki (healthy) | `wget -qO- localhost:3000/api/health` | `GRAFANA_PORT` 4101 → 3000 |
 | `postgres-exporter` | obs | `quay.io/prometheuscommunity/postgres-exporter` | postgres (healthy) | — (scrape `up`) | — |
 | `redis-exporter` | obs | `oliver006/redis_exporter` | redis (healthy) | — (scrape `up`) | — |
 | `toxiproxy` | test | `ghcr.io/shopify/toxiproxy` | postgres, redis (healthy) | `/toxiproxy-cli list` | test: `TOXIPROXY_PORT` 4134 → 8474 |
 
 - **No core service depends on an obs service.** Compose rejects a `depends_on` on a service outside the active profiles, and telemetry loss must never block the app; the OTel exporters retry and drop quietly when the Collector is absent.
-- `bootstrap-owner` runs `python -m identity.bootstrap_owner --email ${SEED_OWNER_EMAIL} --company-id ${COMPANY_ID}` with the identity migrator credentials (PAY-100). On a second `stack.sh up` the CLI exits 3 (users not empty), which would fail `service_completed_successfully`; the command is wrapped as `sh -c 'python -m identity.bootstrap_owner …; rc=$?; [ "$rc" -eq 3 ] && exit 0; exit "$rc"'` until identity adds a flag (Issue 3).
-- Migrate one-shots run `alembic -c /app/alembic.ini upgrade head` as `<schema>_migrator`, `restart: "no"`, and connect straight to `postgres` (never through Toxiproxy).
+- `bootstrap-owner` runs `python -m identity.bootstrap_owner --if-empty --email ${SEED_OWNER_EMAIL} --company-id ${COMPANY_ID} --password-env SEED_OWNER_PASSWORD` with the identity migrator credentials (PAY-100, PAY-609, R16). It creates an **active** owner with that password (dev only), and `--if-empty` exits 0 without changes when users already exist, so a second `stack.sh up` still satisfies `service_completed_successfully`. No exit-code wrapper.
+- Migrate one-shots run `alembic -c /app/alembic.ini upgrade head` with the same C1 keys as the service, but `DB_USER=<schema>_migrator` and the migrator password, `restart: "no"`, and connect straight to `postgres` (never through Toxiproxy).
 - `restart: unless-stopped` for long-running services; `read_only: true` with `tmpfs: [/tmp]` for the app containers (matching Kubernetes); `cap_drop: [ALL]`, `security_opt: [no-new-privileges:true]`.
 - Network: one bridge network `payrun`; services are reachable from the host only through the ports above, all bound to `127.0.0.1`.
 - Volumes (named): `pgdata`, `redisdata`, `prometheus-data`, `tempo-data`, `loki-data`, `grafana-data`.
@@ -1481,8 +1520,8 @@ name: payrun
 x-py-env: &py-env
   ENV: ${ENV:-dev}
   APP_VERSION: ${APP_VERSION:-dev}
-  LOG_LEVEL: INFO
-  COMPANY_ID: ${COMPANY_ID:?run scripts/dev-env.sh}
+  LOG_LEVEL: INFO                            # any case accepted (C24)
+  COMPANY_ID: ${COMPANY_ID:?run scripts/dev-env.sh}   # C28
   DB_HOST: postgres
   DB_PORT: "5432"
   DB_NAME: payrun
@@ -1503,8 +1542,7 @@ x-py-env: &py-env
   IDEMPOTENCY_TTL_H: "24"
   OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
   OTEL_EXPORTER_OTLP_PROTOCOL: grpc
-  OTEL_TRACES_SAMPLER: parentbased_traceidratio
-  OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-1.0}
+  OTEL_TRACES_SAMPLER: parentbased_always_on   # C23: every service and environment; no _ARG
   OTEL_METRIC_EXPORT_INTERVAL: "15000"
   OTEL_SEMCONV_STABILITY_OPT_IN: http
 
@@ -1615,7 +1653,57 @@ services:
       migrate-payroll: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
     healthcheck: *py-health
-  # identity, bank-stub, payout-worker, web: same pattern (env per §7.3)
+
+  bootstrap-owner:
+    <<: *app
+    restart: "no"
+    image: payrun/identity:${APP_VERSION:-dev}
+    command: ["python", "-m", "identity.bootstrap_owner", "--if-empty",
+              "--email", "${SEED_OWNER_EMAIL:?}", "--company-id", "${COMPANY_ID:?}",
+              "--password-env", "SEED_OWNER_PASSWORD"]          # R16: active dev owner; exit 0 when users exist
+    environment:
+      <<: *py-env
+      DB_USER: identity_migrator
+      DB_PASSWORD: ${IDENTITY_DB_MIGRATOR_PASSWORD:?}
+      DB_SCHEMA: identity
+      SEED_OWNER_PASSWORD: ${SEED_OWNER_PASSWORD:?}
+    depends_on:
+      migrate-identity: { condition: service_completed_successfully }
+
+  web:
+    <<: *app
+    image: payrun/web:${APP_VERSION:-dev}
+    build: { context: ../.., dockerfile: apps/web/Dockerfile }
+    environment:
+      ENV: ${ENV:-dev}
+      APP_VERSION: ${APP_VERSION:-dev}
+      LOG_LEVEL: INFO
+      NODE_ENV: production
+      PORT: "3000"                                      # C4
+      PUBLIC_BASE_URL: http://127.0.0.1:${WEB_PORT:?}    # C12
+      IDENTITY_BASE_URL: http://identity:8000
+      PAYROLL_BASE_URL: http://payroll:8000
+      REDIS_HOST: redis                                 # C1, C12: no REDIS_URL
+      REDIS_PORT: "6379"
+      REDIS_USERNAME: web
+      REDIS_PASSWORD: ${REDIS_WEB_PASSWORD:?}
+      COMPANY_ID: ${COMPANY_ID:?}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_TRACES_SAMPLER: parentbased_always_on
+      # plus the keys of §7.3
+    ports: ["127.0.0.1:${WEB_PORT:?}:3000"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/readyz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+    depends_on:
+      identity: { condition: service_healthy }
+      payroll: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      bootstrap-owner: { condition: service_completed_successfully }
+  # identity, bank-stub, payout-worker and the other migrate one-shots: same pattern as payroll (env per §7.3)
 
   alertmanager:
     image: prom/alertmanager
@@ -1639,16 +1727,22 @@ networks: { payrun: {} }
 
 ### 7.3 Environment per service (beyond `x-py-env`)
 
+Every Python service and one-shot, bank-stub included, gets `x-py-env`, so each has `COMPANY_ID` (C47:
+`BaseServiceSettings` requires it) and the C1 DB keys. Only the keys below differ.
+
 | Service | Env |
 |---|---|
-| identity | `DB_USER=identity_app`, `DB_PASSWORD=${IDENTITY_DB_PASSWORD}`, `DB_SCHEMA=identity`, `REDIS_USERNAME=identity`, `REDIS_PASSWORD=${REDIS_IDENTITY_PASSWORD}`, `INTERNAL_JWT_PUBLIC_KEYS=${IDENTITY_INTERNAL_JWT_PUBLIC_KEYS}`, `AUDIT_IP_HASH_KEY`, `SMTP_HOST=mailpit`, `SMTP_PORT=1025`, `AUTH_LOGIN_LIMIT_ACCOUNT=5`, `AUTH_LOGIN_LIMIT_IP=20`, `INVITE_TTL_H=72`, `RESET_TTL_H=1`, `EMAIL_MAX_ATTEMPTS=10`, `APP_BASE_URL=http://localhost:${WEB_PORT}` (invite links); the rest per identity LLD |
-| bootstrap-owner | identity's env with `DB_USER=identity_migrator`, `DB_PASSWORD=${IDENTITY_DB_MIGRATOR_PASSWORD}`, `SEED_OWNER_EMAIL` |
-| payroll | as in §7.2 |
-| payout-worker | `DB_USER=payouts_app`, `DB_PASSWORD=${PAYOUTS_DB_PASSWORD}`, `DB_SCHEMA=payouts`, `REDIS_USERNAME=payout-worker`, `REDIS_PASSWORD=${REDIS_PAYOUT_WORKER_PASSWORD}`, `x-payout-timing`, `PAYOUT_CONCURRENCY=16`, `PAYOUT_XREAD_BLOCK_MS=5000`, `PAYOUT_MAX_ATTEMPTS=5`, `BANK_KEY_SAFE_WINDOW_S=86400`, `PAYROLL_BASE_URL=http://payroll:8000`, `BANK_BASE_URL=http://bank-stub:8000`, `BANK_STUB_API_KEY`, `PAYOUT_WORKER_JWT_PRIVATE_KEY`, `PAYOUT_WORKER_JWT_KID`; `stop_grace_period: 75s` |
-| bank-stub | `DB_USER=bank_stub_app`, `DB_PASSWORD=${BANK_STUB_DB_PASSWORD}`, `DB_SCHEMA=bank_stub`, no Redis and no JWT keyset (`use_redis=False`, `use_jwt=False`), `BANK_STUB_API_KEY`, `BANK_STUB_FAILURE_RATE=0.05`, `BANK_STUB_LATENCY_MS=20` |
-| web | `NODE_ENV=production`, `ENV`, `IDENTITY_BASE_URL=http://identity:8000`, `PAYROLL_BASE_URL=http://payroll:8000`, `REDIS_URL=redis://redis:6379/0`, `REDIS_USERNAME=web`, `REDIS_PASSWORD=${REDIS_WEB_PASSWORD}`, `INTERNAL_JWT_PRIVATE_KEY`, `INTERNAL_JWT_KID`, `SESSION_SECRET`, `COMPANY_ID`, `TRUSTED_PROXY_HOPS=0`, `BFF_RATE_LIMIT_SESSION=120`, `BFF_RATE_LIMIT_IP=300`, `SESSION_IDLE_TTL_S=43200`, `SESSION_ABS_TTL_S=604800`, `SESSION_ROLE_RECHECK_S=60`, `APP_ORIGIN=http://localhost:${WEB_PORT}`, `OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318`, `OTEL_TRACES_SAMPLER*`; the rest per web LLD |
+| identity | `DB_USER=identity_app`, `DB_PASSWORD=${IDENTITY_DB_PASSWORD}`, `DB_SCHEMA=identity`, `REDIS_USERNAME=identity`, `REDIS_PASSWORD=${REDIS_IDENTITY_PASSWORD}`, `INTERNAL_JWT_PUBLIC_KEYS=${IDENTITY_INTERNAL_JWT_PUBLIC_KEYS}`, `AUDIT_IP_HASH_KEY`, `SMTP_HOST=${SMTP_HOST}`, `SMTP_PORT=${SMTP_PORT}` (1025; C49), `AUTH_LOGIN_LIMIT_ACCOUNT=5`, `AUTH_LOGIN_LIMIT_IP=20`, `INVITE_TTL_H=72`, `RESET_TTL_H=1`, `EMAIL_MAX_ATTEMPTS=10`, `IDENTITY_PUBLIC_BASE_URL=http://127.0.0.1:${WEB_PORT}` (invite and reset links; C12); the rest per identity LLD |
+| migrate-identity, bootstrap-owner | identity's keys with `DB_USER=identity_migrator`, `DB_PASSWORD=${IDENTITY_DB_MIGRATOR_PASSWORD}`; bootstrap-owner adds `SEED_OWNER_PASSWORD` (§7.2) |
+| payroll | as in §7.2 (`PAYOUT_MAX_ATTEMPTS` is payroll's) |
+| migrate-payroll | as in §7.2 |
+| payout-worker | `DB_USER=payouts_app`, `DB_PASSWORD=${PAYOUTS_DB_PASSWORD}`, `DB_SCHEMA=payouts`, `REDIS_USERNAME=payout-worker`, `REDIS_PASSWORD=${REDIS_PAYOUT_WORKER_PASSWORD}`, `x-payout-timing`, `PAYOUT_CONCURRENCY=16`, `PAYOUT_XREAD_BLOCK_MS=5000`, `PAYOUT_CONSUMER_GC_IDLE_S=3600` (maintenance prunes idle consumers with no pending entries via `XGROUP DELCONSUMER`), `BANK_KEY_SAFE_WINDOW_S=86400`, `PAYOUT_PAYROLL_BASE_URL=http://payroll:8000`, `PAYOUT_PAYROLL_CONNECT_TIMEOUT_S=1`, `PAYOUT_PAYROLL_READ_TIMEOUT_S=2`, `PAYOUT_PAYROLL_MAX_RETRIES=3` (C46), `BANK_BASE_URL=http://bank-stub:8000`, `BANK_STUB_API_KEY`, `PAYOUT_WORKER_JWT_PRIVATE_KEY`, `PAYOUT_WORKER_JWT_KID`; no `PAYOUT_MAX_ATTEMPTS` (payroll's key; C46); `stop_grace_period: 75s` |
+| migrate-payouts | `DB_USER=payouts_migrator`, `DB_PASSWORD=${PAYOUTS_DB_MIGRATOR_PASSWORD}`, `DB_SCHEMA=payouts` |
+| bank-stub | `DB_USER=bank_stub_app`, `DB_PASSWORD=${BANK_STUB_DB_PASSWORD}`, `DB_SCHEMA=bank_stub`, `COMPANY_ID` (from `x-py-env`; C47), no Redis and no JWT keyset (`use_redis=False`, `use_jwt=False`), `BANK_STUB_API_KEY`, `BANK_STUB_FAILURE_RATE=0.05`, `BANK_STUB_LATENCY_MS=20` |
+| migrate-bank-stub | `DB_USER=bank_stub_migrator`, `DB_PASSWORD=${BANK_STUB_DB_MIGRATOR_PASSWORD}`, `DB_SCHEMA=bank_stub` |
+| web | the §7.2 block, plus `INTERNAL_JWT_PRIVATE_KEY`, `INTERNAL_JWT_KID`, `SESSION_SECRET`, `SESSION_COOKIE_NAME=sid`, `TRUSTED_PROXY_HOPS=0`, `BFF_RATE_LIMIT_SESSION=120`, `BFF_RATE_LIMIT_IP=300`, `SESSION_IDLE_TTL_S=43200`, `SESSION_ABS_TTL_S=604800`, `SESSION_ROLE_RECHECK_S=60`; the rest per web LLD. No `REDIS_URL` (C12) |
 | postgres-exporter | `DATA_SOURCE_URI=postgres:5432/payrun?sslmode=disable`, `DATA_SOURCE_USER=postgres_exporter`, `DATA_SOURCE_PASS=${POSTGRES_EXPORTER_PASSWORD}` |
-| redis-exporter | `REDIS_ADDR=redis://redis:6379`, `REDIS_USER=exporter`, `REDIS_PASSWORD=${REDIS_EXPORTER_PASSWORD}`, `REDIS_EXPORTER_CHECK_SINGLE_STREAMS=stream:payout.requested,stream:payout.requested.dlq` |
+| redis-exporter | `REDIS_ADDR=redis://redis:6379`, `REDIS_USER=exporter`, `REDIS_PASSWORD=${REDIS_EXPORTER_PASSWORD}`, `REDIS_EXPORTER_CHECK_SINGLE_STREAMS=stream:payout.requested,stream:payout.requested.dlq` (the exporter's own variable names, not app config) |
 | grafana | `GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}`, `GF_AUTH_ANONYMOUS_ENABLED=false`, `GF_USERS_ALLOW_SIGN_UP=false`, `GF_ANALYTICS_REPORTING_ENABLED=false`; provisioning and dashboards mounted read-only |
 | prometheus | `command: --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.retention.time=30d --enable-feature=exemplar-storage --web.enable-remote-write-receiver=false` |
 
@@ -1680,7 +1774,7 @@ services:
   payout-worker:
     environment:
       <<: *via-toxiproxy
-      PAYROLL_BASE_URL: http://toxiproxy:18001
+      PAYOUT_PAYROLL_BASE_URL: http://toxiproxy:18001   # C46
       BANK_BASE_URL: http://toxiproxy:18002
     ports: ["127.0.0.1:${PAYOUT_WORKER_PORT}:8000"]
     depends_on: { toxiproxy: { condition: service_healthy } }
@@ -1691,7 +1785,8 @@ services:
   web:
     environment:
       PAYROLL_BASE_URL: http://toxiproxy:18001
-      REDIS_URL: redis://toxiproxy:16379/0
+      REDIS_HOST: toxiproxy                          # C1/C12 names; no REDIS_URL
+      REDIS_PORT: "16379"
       BFF_RATE_LIMIT_SESSION: "1000000"
       BFF_RATE_LIMIT_IP: "1000000"
     depends_on: { toxiproxy: { condition: service_healthy } }
@@ -1791,13 +1886,29 @@ service:
     logs:    { receivers: [otlp], processors: [memory_limiter, resource/env, transform/redact, batch], exporters: [otlp_http/loki] }
 ```
 
-**`collector.prod.yaml`** (used by the Kubernetes prod overlay; uat uses `collector.yaml` with backend endpoints patched):
-the same, plus `tail_sampling` before `batch` in the traces pipeline, with
-`decision_wait: 10s` and policies `errors` (`status_code: {status_codes: [ERROR]}`), `slow`
-(`latency: {threshold_ms: 300}`) and `baseline` (`probabilistic: {sampling_percentage: 10}`), and
-exporters pointing at the hosted or Helm-installed backends (`${env:TRACES_ENDPOINT}`, …). The
-Collector runs as a single-replica gateway Deployment so every span of a trace reaches the same
-tail sampler. See Issue 6 on head versus tail sampling.
+**`collector.prod.yaml`** (used by the Kubernetes prod overlay; uat uses `collector.yaml` with backend
+endpoints patched). The apps send 100% of spans (`parentbased_always_on`, C23), and prod sampling
+happens here (R27): the same file as above, plus `tail_sampling` before `batch` in the traces pipeline,
+and exporters pointing at the hosted or Helm-installed backends (`${env:TRACES_ENDPOINT}`, …):
+
+```yaml
+processors:
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 50000
+    expected_new_traces_per_sec: 200
+    policies:
+      - { name: errors,   type: status_code,   status_code: { status_codes: [ERROR] } }      # keep every error
+      - { name: slow,     type: latency,       latency: { threshold_ms: 300 } }               # keep traces > 300 ms
+      - { name: baseline, type: probabilistic, probabilistic: { sampling_percentage: 10 } }   # 10% of the rest
+service:
+  pipelines:
+    traces: { receivers: [otlp], processors: [memory_limiter, resource/env, transform/redact, tail_sampling, batch], exporters: [otlp_grpc/tempo] }
+```
+
+A trace is kept when any policy matches. The Collector runs as a single-replica gateway Deployment so
+every span of a trace reaches the same tail sampler. `x-trace-id` is still returned for every request;
+in prod a dropped trace's ID simply finds nothing in Tempo.
 
 ### 8.2 `prometheus/prometheus.yml`
 
@@ -1837,8 +1948,9 @@ Retention 30 days (flag in §7.3); exemplar storage on.
 
 ### 8.3 Rules (`prometheus/rules/`)
 
-**SLI route selector.** BFF availability counts the J1–J5 routes, i.e. every BFF route except
-`/api/health` and `/api/telemetry` (`route` label values are the web LLD's route templates; Issue 11).
+**SLI route selector (C4).** BFF availability counts the J1–J5 routes, i.e. every BFF route except the
+health routes and telemetry: `route!~"/api/livez|/api/readyz|/api/telemetry"`. `route` label values are
+the web LLD's route templates and `status` the numeric code (web LLD §7.2).
 "Heavy" routes are calculate and approve (p95 < 1.5 s); the rest are reads and simple writes (p95 < 300 ms).
 
 **`recording.yml`:**
@@ -1850,30 +1962,30 @@ groups:
     rules:
       - record: sli:bff_errors:ratio_rate5m
         expr: |
-          sum(rate(bff_request_duration_seconds_count{route!~"/api/health|/api/telemetry", status=~"5.."}[5m]))
+          sum(rate(bff_request_duration_seconds_count{route!~"/api/livez|/api/readyz|/api/telemetry", status=~"5.."}[5m]))
           /
-          sum(rate(bff_request_duration_seconds_count{route!~"/api/health|/api/telemetry"}[5m]))
+          sum(rate(bff_request_duration_seconds_count{route!~"/api/livez|/api/readyz|/api/telemetry"}[5m]))
       - record: sli:bff_errors:ratio_rate30m
         expr: |
-          sum(rate(bff_request_duration_seconds_count{route!~"/api/health|/api/telemetry", status=~"5.."}[30m]))
+          sum(rate(bff_request_duration_seconds_count{route!~"/api/livez|/api/readyz|/api/telemetry", status=~"5.."}[30m]))
           /
-          sum(rate(bff_request_duration_seconds_count{route!~"/api/health|/api/telemetry"}[30m]))
+          sum(rate(bff_request_duration_seconds_count{route!~"/api/livez|/api/readyz|/api/telemetry"}[30m]))
       - record: sli:bff_errors:ratio_rate1h
         expr: |
-          sum(rate(bff_request_duration_seconds_count{route!~"/api/health|/api/telemetry", status=~"5.."}[1h]))
+          sum(rate(bff_request_duration_seconds_count{route!~"/api/livez|/api/readyz|/api/telemetry", status=~"5.."}[1h]))
           /
-          sum(rate(bff_request_duration_seconds_count{route!~"/api/health|/api/telemetry"}[1h]))
+          sum(rate(bff_request_duration_seconds_count{route!~"/api/livez|/api/readyz|/api/telemetry"}[1h]))
       - record: sli:bff_errors:ratio_rate6h
         expr: |
-          sum(rate(bff_request_duration_seconds_count{route!~"/api/health|/api/telemetry", status=~"5.."}[6h]))
+          sum(rate(bff_request_duration_seconds_count{route!~"/api/livez|/api/readyz|/api/telemetry", status=~"5.."}[6h]))
           /
-          sum(rate(bff_request_duration_seconds_count{route!~"/api/health|/api/telemetry"}[6h]))
+          sum(rate(bff_request_duration_seconds_count{route!~"/api/livez|/api/readyz|/api/telemetry"}[6h]))
   - name: slo-bff-latency
     interval: 30s
     rules:
       - record: sli:bff_latency_p95:5m
         expr: |
-          histogram_quantile(0.95, sum by (le) (rate(bff_request_duration_seconds_bucket{route!~"/api/health|/api/telemetry|.*/calculate|.*/approve"}[5m])))
+          histogram_quantile(0.95, sum by (le) (rate(bff_request_duration_seconds_bucket{route!~"/api/livez|/api/readyz|/api/telemetry|.*/calculate|.*/approve"}[5m])))
       - record: sli:bff_latency_heavy_p95:5m
         expr: |
           histogram_quantile(0.95, sum by (le) (rate(bff_request_duration_seconds_bucket{route=~".*/calculate|.*/approve"}[5m])))
@@ -1908,21 +2020,23 @@ gives NaN, which compares false, so the burn alerts stay quiet when idle.
 | `PayoutNeedsOperator` | `max(payroll_attempts_needs_operator) > 0` | 1m † | page | `service_name: payroll` |
 | `PayoutsStuck` | `max(payroll_payouts_stuck) > 0` | 10m | page | `service_name: payroll` |
 | `PayoutStreamNearMaxlen` † | `max(redis_stream_length{stream="stream:payout.requested"}) > 0.8 * 100000` | 5m | warning | `service_name: redis` |
-| `EmailOutboxStuck` † | `max(identity_email_oldest_pending_age_seconds) > 900 or max(identity_emails_failed) > 0` | 5m | warning | `service_name: identity` |
+| `EmailOutboxStuck` † | `max(identity_email_oldest_pending_age_seconds) > 900 or sum(increase(identity_emails_failed_total[1h])) > 0` (R25, C20) | 5m | warning | `service_name: identity` |
 | `RateLimiterErrors` † | `sum by (service_name, component) (rate(rate_limiter_errors_total[5m])) > 0` | 5m | warning | — |
 | `OutboxStuck` † | `max by (service_name) (outbox_oldest_age_seconds) > 60` | 1m | warning | — |
 | `ConsumerLagGrowing` † | `max by (stream, group) (queue_consumer_lag) > 0 and max by (stream, group) (deriv(queue_consumer_lag[10m])) > 0` | 10m | warning | `service_name: payout-worker` |
 | `BankBreakerOpen` † | `max(circuit_breaker_state{target="bank"}) == 2` | 5m | warning | `service_name: payout-worker` |
 | `BankErrorRateHigh` † | `provider:external_errors:ratio_rate5m{provider="bank"} > 0.05` | 10m | warning | `service_name: payout-worker` |
-| `SigninFailuresSpike` † | `sum(increase(auth_signins_total{outcome="failed"}[15m])) > 50` | 0m | warning | `service_name: identity` |
+| `SigninFailuresSpike` † | `sum(increase(auth_signins_total{outcome="failure"}[15m])) > 50` (C19) | 0m | warning | `service_name: identity` |
 | `RedisMemoryHigh` † | `max(redis_memory_used_bytes / (redis_memory_max_bytes > 0)) > 0.8` | 5m | warning | `service_name: redis` |
-| `PodRestarts` † | `increase(kube_pod_container_status_restarts_total{namespace=~"payrun-.*"}[15m]) > 2` | 0m | warning | — (Issue 5) |
+| `PodRestarts` † | `increase(kube_pod_container_status_restarts_total{namespace=~"payrun-.*"}[15m]) > 2` | 0m | warning | — (Kubernetes only, R28) |
 | `CollectorDropping` † | `(sum(rate(otelcol_exporter_send_failed_spans_total[5m])) or vector(0)) + (sum(rate(otelcol_exporter_send_failed_metric_points_total[5m])) or vector(0)) + (sum(rate(otelcol_exporter_send_failed_log_records_total[5m])) or vector(0)) + (sum(rate(otelcol_receiver_refused_spans_total[5m])) or vector(0)) > 0` | 10m | warning | `service_name: otel-collector` |
 
 Notes:
 - **BankErrorRateHigh excludes business rejections by construction:** a bank `rejected` answer is HTTP 2xx, so the resilient client counts it as `outcome="ok"`; business outcomes are counted separately in `payouts_bank_transfers_total{outcome, reason}`.
-- **PayoutDLQ:** `queue_messages_total{outcome="dlq"}` is pre-initialised to 0 (§3.9 step 10). Without that, a counter that first appears at 1 has `increase() = 0` and the alert never fires; a promtool case documents this.
+- **PayoutDLQ:** the worker pre-initialises `queue_messages_total{outcome="dlq"}` to 0 (C21; payout-worker LLD §3.3). Without that, a counter that first appears at 1 has `increase() = 0` and the alert never fires; a promtool case documents this.
 - The `max()` in the payroll gauge alerts collapses replicas, as the plan requires.
+- **EmailOutboxStuck** uses the counter, not a gauge of failed rows, so it clears one hour after the last failure once SMTP is fixed (R25).
+- **PodRestarts** needs kube-state-metrics, a listed cluster dependency (R28). The rule ships in the Kubernetes observability install only, not in the Compose Prometheus; its promtool test still runs in CI.
 - Every alert has these annotations:
 
 ```yaml
@@ -1930,7 +2044,7 @@ annotations:
   summary: "<one line, e.g. 'Payouts were dead-lettered in the last 15 minutes'>"
   description: "<what it means and the first check, with {{ $value }} where useful>"
   runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/<AlertName>.md"
-  dashboard_url: "http://localhost:4101/d/<dashboard uid>"     # dev; overlays rewrite the host
+  dashboard_url: "http://127.0.0.1:4101/d/<dashboard uid>"     # dev; overlays rewrite the host
 ```
 
 Example, verbatim in the file:
@@ -1943,7 +2057,7 @@ Example, verbatim in the file:
     summary: "Payout messages were dead-lettered in the last 15 minutes"
     description: "{{ $value }} message(s) moved to {{ $labels.stream }}.dlq. Money may be stuck: follow the DLQ replay steps."
     runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutDLQ.md"
-    dashboard_url: "http://localhost:4101/d/payrun-queues"
+    dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
 ```
 
 **Alert → dashboard:** BFF burn alerts → `payrun-journeys`; Payout*, Outbox, ConsumerLag → `payrun-queues`; Bank* → `payrun-bank`; EmailOutboxStuck, RateLimiterErrors, SigninFailuresSpike → `payrun-service-overview`; Redis, Pod, Collector → `payrun-platform`.
@@ -1952,25 +2066,25 @@ Example, verbatim in the file:
 
 | Alert | Fires when (input series) | Stays quiet when |
 |---|---|---|
-| `BffAvailabilityFastBurn` | 10% of `bff_request_duration_seconds_count` are `status="500"` for 70 m (1 h ratio 0.1 > 0.072); expected at 65m with labels and the full annotations | 5% errors (< 0.072), and a 4 m spike of 100% errors (5 m window high, 1 h low); only `/api/health` failing |
+| `BffAvailabilityFastBurn` | 10% of `bff_request_duration_seconds_count` are `status="500"` for 70 m (1 h ratio 0.1 > 0.072); expected at 65m with labels and the full annotations | 5% errors (< 0.072), and a 4 m spike of 100% errors (5 m window high, 1 h low); only `/api/readyz` and `/api/livez` failing (C4) |
 | `BffAvailabilitySlowBurn` | 4% errors for 7 h (> 0.03) | 2% errors for 7 h; no traffic (NaN) |
 | `PayoutSettlementSlow` | gauge 0 then 90 for 5 m | 45 for 30 m; 90 for 1 m only |
 | `PayoutDLQ` | counter `0 0 0 1 1 1 …` (pre-initialised) | flat 0; **and the documented pitfall:** a series that first appears at 1 does not fire |
 | `PayoutNeedsOperator` | 1 for 3 m (one replica 0, another 1, so `max` matters) | 0 |
 | `PayoutsStuck` | 2 for 12 m | 2 for 8 m, then 0 |
 | `PayoutStreamNearMaxlen` | 85000 for 10 m | 79000 |
-| `EmailOutboxStuck` | oldest pending 1000 s for 6 m; separately `identity_emails_failed` 1 | pending 300 s and failed 0 |
+| `EmailOutboxStuck` | oldest pending 1000 s for 6 m; separately `identity_emails_failed_total` going 0 → 1 (fires after 5 m) | pending 300 s and the counter flat; **clears** 1 h after the counter stops rising (R25) |
 | `RateLimiterErrors` | counter rising for 10 m | flat |
 | `OutboxStuck` | oldest age 120 for 3 m | 20 |
 | `ConsumerLagGrowing` | lag rising 0 → 500 linearly over 25 m | a 500-message burst draining within 2 m |
 | `BankBreakerOpen` | 2 for 6 m | 2 for 3 m then 0; 1 (half-open) |
 | `BankErrorRateHigh` | 10% `timeout` outcomes for 15 m | 4%; 100% `ok` (including business rejections) |
-| `SigninFailuresSpike` | 60 failures in 15 m | 30 failures; 1000 `succeeded` |
+| `SigninFailuresSpike` | 60 `outcome="failure"` in 15 m | 30 failures; 1000 `success`; 100 `rate_limited` (C19) |
 | `RedisMemoryHigh` | used 0.9 × max for 6 m | 0.5 × max; `max = 0` (no limit) |
 | `PodRestarts` | +3 restarts in 15 m | +1 |
 | `CollectorDropping` | failed spans rising for 12 m | all counters flat; series absent (`or vector(0)`) |
 
-SLO recording tests check `sli:bff_errors:ratio_rate5m` = 0.1 for a 10% input, the route exclusion, and `sli:payout_settlement_p95:1h` against hand-computed bucket input (p95 within 45–60 s for a run settling in about 50 s).
+SLO recording tests check `sli:bff_errors:ratio_rate5m` = 0.1 for a 10% input, the route exclusion (5xx on `/api/livez`, `/api/readyz` and `/api/telemetry` don't count), and `sli:payout_settlement_p95:1h` against hand-computed bucket input (p95 within 45–60 s for a run settling in about 50 s).
 
 ### 8.4 `alertmanager.yml` (ADR 0010)
 
@@ -2138,8 +2252,8 @@ panels show exemplars; per-service metrics are filtered by `service_name`.
 | Dependency calls | `rate(external_requests_total{service_name="$service"}[5m])` by provider and outcome |
 | Breaker state | `circuit_breaker_state{service_name="$service"}` (state timeline) |
 | Rate limiting | `rate_limited_total` by scope; `rate_limiter_errors_total` by component |
-| Sign-ins (identity) | `auth_signins_total` by outcome |
-| Warnings and errors | Loki `{service_name="$service"} | severity_text=~"(?i)warn.*|error"` |
+| Sign-ins (identity) | `auth_signins_total` by outcome (`success`, `failure`, `rate_limited`) |
+| Warnings and errors | Loki `{service_name="$service"} \| severity_text=~"(?i)warn.*\|error"` |
 | Error traces | Tempo TraceQL `{resource.service.name="$service" && status=error}` |
 
 **`journeys.json`** (uid `payrun-journeys`): an SLO row, then one row per journey.
@@ -2153,7 +2267,7 @@ panels show exemplars; per-service metrics are filtered by `service_name`.
 | J4 Approve and pay | approve route success and p95; `payroll_pay_runs_total` by outcome; `payroll_payouts_total` by outcome; `payroll_runs_processing_oldest_age_seconds`; `payroll_payout_settlement_seconds` heatmap |
 | J5 Recover | retry route success; `payroll_payouts_total{outcome="failed"}` |
 
-**`queues.json`** (uid `payrun-queues`): `outbox_unsent` and `outbox_oldest_age_seconds` by service (60 s line); `queue_messages_total` rate by outcome; `queue_processing_seconds` p50 / p95; `queue_consumer_lag`; `queue_dlq_messages`; `redis_stream_length` for both streams (80000 line); `payroll_payouts_republished_total` rate; `payroll_payouts_stuck`; `payroll_attempts_needs_operator`; `payroll_runs_processing_oldest_age_seconds` (60 s line); `identity_emails_pending`, `identity_emails_failed`, `identity_email_oldest_pending_age_seconds`; a log panel for `queue.*`, `outbox.*` and `payout.*` events.
+**`queues.json`** (uid `payrun-queues`): `outbox_unsent` and `outbox_oldest_age_seconds` by service (60 s line); `queue_messages_total` rate by outcome; `queue_processing_seconds` p50 / p95; `queue_consumer_lag`; `queue_dlq_messages`; `redis_stream_length` for both streams (80000 line); `payroll_payouts_republished_total` rate; `payroll_payouts_stuck`; `payroll_attempts_needs_operator`; `payroll_runs_processing_oldest_age_seconds` (60 s line); `identity_emails_pending`, `increase(identity_emails_failed_total[1h])` (C20), `identity_email_oldest_pending_age_seconds`; a log panel for `queue.*`, `outbox.*` and `payout.*` events.
 
 **`bank.json`** (uid `payrun-bank`; the "Bank (stub) dependency" dashboard): `external_requests_total{provider="bank"}` by outcome; error ratio vs 5%; `external_request_duration_seconds{provider="bank"}` p50 / p95 / p99 (exemplars); `circuit_breaker_state{target="bank"}`; `payouts_bank_transfers_total` by outcome and reason; the same request, latency and breaker panels for `provider="payroll"` (worker → payroll); a log panel for `bank.transfer.*` events.
 
@@ -2173,9 +2287,12 @@ deploy/k8s/
     web/  identity/  payroll/  payout-worker/
       deployment.yaml  service.yaml (not payout-worker)  serviceaccount.yaml  configmap.yaml
       secret.yaml (placeholders)  pdb.yaml  networkpolicy.yaml
-    otel-collector/  deployment.yaml service.yaml configmap.yaml (from collector.yaml) networkpolicy.yaml
+    otel-collector/  deployment.yaml service.yaml networkpolicy.yaml
+      kustomization.yaml          # configMapGenerator otel-collector-config from collector.yaml
+      collector.yaml              # synced copy (sync-k8s-assets.sh; R32)
     bootstrap/
-      kustomization.yaml          # configMapGenerator db-init from ../../../compose/init/*.sql and lib/
+      kustomization.yaml          # configMapGenerator db-init from init/ (no load-restrictor flag; C36)
+      init/                       # synced copy of deploy/compose/init/ (R32); never edited by hand
       job-db-bootstrap.yaml  job-bootstrap-owner.yaml  networkpolicy.yaml
     migrations/
       kustomization.yaml          # nameSuffix: -0-1-0  (bumped by the release step)
@@ -2184,6 +2301,7 @@ deploy/k8s/
     bank-stub/                    # Deployment, Service, SA, ConfigMap, Secret, PDB, NetworkPolicies,
                                   # migrate-bank-stub Job, worker→bank-stub egress allow
     in-cluster-data/              # dev: postgres and redis StatefulSets (+ redis ACL entrypoint ConfigMap), allows
+      redis/                      # synced copy of redis.conf and entrypoint.sh (R32)
     mailpit/                      # dev, uat: in-cluster SMTP capture + identity→mailpit:1025 allow
     managed-data-egress/          # uat, prod: ipBlock egress to the managed Postgres (5432) and Redis (6379) CIDRs
     bank-egress-ipblock/          # prod: payout-worker → 0.0.0.0/0 minus private ranges, port 443
@@ -2191,6 +2309,7 @@ deploy/k8s/
     external-secrets/             # uat, prod: ExternalSecret per Secret; deletes the placeholder Secrets
     ingress/                      # uat, prod: Ingress for web only, TLS
   overlays/dev|uat|prod/kustomization.yaml (+ patches/)
+  overlays/prod/collector.prod.yaml   # synced copy; replaces the Collector ConfigMap in prod
   schemas/                        # vendored CRD JSON schemas for kubeconform (§9.6)
 ```
 
@@ -2227,6 +2346,7 @@ spec:
           env:
             - { name: OTEL_SEMCONV_STABILITY_OPT_IN, value: http }
             - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: http://otel-collector:4317 }
+            - { name: OTEL_TRACES_SAMPLER, value: parentbased_always_on }   # C23, every overlay
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -2236,17 +2356,17 @@ spec:
           readinessProbe: { httpGet: { path: /readyz, port: http }, periodSeconds: 5, timeoutSeconds: 2, failureThreshold: 3 }
           resources:
             requests: { cpu: 100m, memory: 192Mi }
-            limits:   { memory: 384Mi }            # no CPU limit (avoids throttling); revisit after load tests
+            limits:   { memory: 512Mi }            # identity: ≥ 512Mi for argon2 (identity LLD §4.2); others 384Mi; no CPU limit
           volumeMounts: [{ name: tmp, mountPath: /tmp }]
       volumes: [{ name: tmp, emptyDir: { sizeLimit: 64Mi } }]
 ```
 
-- **web:** port 3000, `/api/health` for all three probes (web LLD), an extra `emptyDir` at `/app/apps/web/.next/cache`, resources `250m`/`256Mi` requests, `512Mi` limit.
-- **payout-worker:** no Service; probes on its health port 8000; `terminationGracePeriodSeconds: 75`; `PAYOUT_CONCURRENCY=16`.
+- **web (C4):** `PORT=3000`, container port 3000; `startupProbe` and `livenessProbe` on `/api/livez`, `readinessProbe` on `/api/readyz`; an extra `emptyDir` at `/app/apps/web/.next/cache`; resources `250m`/`256Mi` requests, `512Mi` limit. Its ConfigMap has `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME=web` and its Secret `REDIS_PASSWORD` (C12; no `REDIS_URL`), and `OTEL_EXPORTER_OTLP_ENDPOINT` is `:4318`.
+- **payout-worker:** no Service; probes on its health port 8000; `terminationGracePeriodSeconds: 75`; ConfigMap `PAYOUT_CONCURRENCY=16`, `PAYOUT_CONSUMER_GC_IDLE_S=3600`, `PAYOUT_PAYROLL_BASE_URL=http://payroll:8000`, `PAYOUT_PAYROLL_CONNECT_TIMEOUT_S=1`, `PAYOUT_PAYROLL_READ_TIMEOUT_S=2`, `PAYOUT_PAYROLL_MAX_RETRIES=3` (C46), `BANK_BASE_URL`, `BANK_KEY_SAFE_WINDOW_S`; no `PAYOUT_MAX_ATTEMPTS` (C46).
 - **Service:** `ClusterIP`, port 8000 (web 3000), selector by `app.kubernetes.io/name`.
 - **ServiceAccount:** one per workload, `automountServiceAccountToken: false`.
-- **ConfigMap `<svc>-config`:** the non-secret keys of §4 and §7.3, including `INTERNAL_JWT_PUBLIC_KEYS` for identity (web keys only) and payroll (web and worker keys), as plan §8 requires ("ConfigMap per service (public keys)"). Base values are the dev ones; overlays patch them.
-- **Secret `<svc>-secrets`:** placeholders (`stringData` values `REPLACE_ME`). The startup checks refuse `REPLACE_ME` in uat and prod, so a forgotten secret fails loudly.
+- **ConfigMap `<svc>-config`:** the non-secret keys of §4 and §7.3 under their C1 names (`DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_SCHEMA`, `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`, `COMPANY_ID` for every Python service including bank-stub (C47), `LOG_LEVEL: INFO`, …), including `INTERNAL_JWT_PUBLIC_KEYS` for identity (web keys only) and payroll (web and worker keys), as plan §8 requires ("ConfigMap per service (public keys)"). No `DATABASE_URL` or `REDIS_URL` (C1). Base values are the dev ones; overlays patch them.
+- **Secret `<svc>-secrets`:** the secret keys under their process names (`DB_PASSWORD`, `REDIS_PASSWORD`, …); in base, placeholders (`stringData` values `REPLACE_ME`). The startup checks refuse `REPLACE_ME` in uat and prod, so a forgotten secret fails loudly.
 - **PDB:** `maxUnavailable: 1` (works with 1 replica in dev and 2 in uat/prod).
 - `topologySpreadConstraints` (zone, `maxSkew: 1`, `whenUnsatisfiable: ScheduleAnyway`) are added in the prod overlay.
 
@@ -2254,9 +2374,9 @@ spec:
 
 | Job | Image | Runs | Credentials | Notes |
 |---|---|---|---|---|
-| `db-bootstrap` | `postgres:16-alpine` (pinned) | `sh /init/run-init.sh` → `for f in $INIT_FILES; do psql -v ON_ERROR_STOP=1 -f /init/$f; done` | `PGHOST`, `PGUSER`, `PGPASSWORD` (the admin) and every role password, from the `db-bootstrap` Secret | Same SQL as Compose (PAY-606), mounted from the `db-init` ConfigMap generated from `deploy/compose/init` (D8). `INIT_FILES`: all six files in dev/uat; prod omits `40-bank-stub.sql`. Run once per environment and again to rotate passwords; `backoffLimit: 2`, `ttlSecondsAfterFinished: 86400` |
-| `migrate-identity-<version>`, `migrate-payroll-<version>`, `migrate-payouts-<version>` (+ `migrate-bank-stub-<version>` in the bank-stub component) | the service image | `alembic -c /app/alembic.ini upgrade head` | the `<svc>-migrator` Secret (`DB_USER=<schema>_migrator`, `DB_PASSWORD`) | Name per version (`nameSuffix` in `base/migrations/kustomization.yaml`, e.g. `-0-1-0`), because a Job's pod template is immutable; `backoffLimit: 1`, `activeDeadlineSeconds: 600`, `ttlSecondsAfterFinished: 604800`; same pod security context as the Deployments |
-| `bootstrap-owner` | identity | `python -m identity.bootstrap_owner --email $(OWNER_EMAIL) --company-id $(COMPANY_ID)` | `identity-migrator` Secret | PAY-100. `OWNER_EMAIL` from the overlay's ConfigMap. Exit 3 ("users not empty") would mark the Job failed; until identity adds an idempotent flag (Issue 3) the Job has `podFailurePolicy: {rules: [{action: Ignore, onExitCodes: {operator: In, values: [3]}}]}` and `backoffLimit: 0` |
+| `db-bootstrap` | `postgres:16-alpine` (pinned) | `sh /init/run-init.sh` → `for f in $INIT_FILES; do psql -v ON_ERROR_STOP=1 -f /init/$f; done` | `PGHOST`, `PGUSER`, `PGPASSWORD` (the admin) and every role password, from the `db-bootstrap` Secret | Same SQL as Compose (PAY-606), mounted from the `db-init` ConfigMap generated from the synced copy `deploy/k8s/base/bootstrap/init/` (D8, R32, C36), so `10-identity.sql`'s audit-log revoke (C50) runs on every rotation too. `INIT_FILES`: all six files in dev/uat; prod omits `40-bank-stub.sql`. Run once per environment and again to rotate passwords; `backoffLimit: 2`, `ttlSecondsAfterFinished: 86400` |
+| `migrate-identity-<version>`, `migrate-payroll-<version>`, `migrate-payouts-<version>` (+ `migrate-bank-stub-<version>` in the bank-stub component) | the service image | `alembic -c /app/alembic.ini upgrade head` | the service's ConfigMap (C1 keys, `COMPANY_ID`) with `DB_USER=<schema>_migrator`, and the `<svc>-migrator` Secret (`DB_PASSWORD`) | Name per version (`nameSuffix` in `base/migrations/kustomization.yaml`, e.g. `-0-1-0`), because a Job's pod template is immutable; `backoffLimit: 1`, `activeDeadlineSeconds: 600`, `ttlSecondsAfterFinished: 604800`; same pod security context as the Deployments |
+| `bootstrap-owner` | identity | `python -m identity.bootstrap_owner --if-empty --email $(OWNER_EMAIL) --company-id $(COMPANY_ID)` | identity ConfigMap with `DB_USER=identity_migrator`, `identity-migrator` Secret | PAY-100, R16. `OWNER_EMAIL` from the overlay's ConfigMap. `--if-empty` exits 0 when users exist, so the Job can be re-applied; no `podFailurePolicy`; `backoffLimit: 2`. uat and prod create a **pending** owner and email the invite; the dev overlay adds `--password-env SEED_OWNER_PASSWORD` (allowed only with `ENV=dev`) and the secret, like Compose |
 
 **Deploy order** (RUNBOOK): `db-bootstrap` (first time or rotation) → `migrate-*-<version>` (wait for complete) → services → web → `bootstrap-owner` (first time only). Rollback: previous image tags; migrations are expand-only, so the old version keeps working.
 
@@ -2293,18 +2413,18 @@ payrun namespaces has general internet egress.
 |---|---|---|---|
 | Namespace | `payrun-dev` | `payrun-uat` | `payrun-prod` |
 | Components | bank-stub, in-cluster-data, mailpit | bank-stub, mailpit, managed-data-egress, external-secrets, ingress | managed-data-egress, bank-egress-ipblock, smtp-egress, external-secrets, ingress |
-| Replicas | 1 each | 2 each (payout-worker 2) | 2 each (payout-worker 2), topology spread |
+| Replicas | 1 each | 2 each (payout-worker 2) | 2 each, topology spread; **payout-worker 0** until a bank-provider ADR exists (R14, C32; asserted by `test_k8s_policy.py`) |
 | Images | `payrun/<svc>:dev` (kind-loaded) | registry + `0.1.0` | registry + `0.1.0@sha256:…` (digest) |
 | `ENV` | dev | uat | prod |
-| `OTEL_TRACES_SAMPLER_ARG` | 1.0 | 1.0 | 0.1 (plus tail sampling, `collector.prod.yaml`) |
+| `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | `parentbased_always_on` | `parentbased_always_on`; the Collector's `tail_sampling` (`collector.prod.yaml`) keeps errors, > 300 ms and 10% (R27, C23) |
 | `TRUSTED_PROXY_HOPS` | 0 | 1 | 1 |
-| `BANK_BASE_URL` | `http://bank-stub:8000` | `http://bank-stub:8000` | provider placeholder `https://bank-provider.invalid`; the prod startup check refuses it until a real adapter exists (plan §13) |
+| `BANK_BASE_URL` | `http://bank-stub:8000` | `http://bank-stub:8000` | provider placeholder `https://bank-provider.invalid`; the prod startup check refuses it until a real adapter exists (plan §13), and with 0 replicas the worker never starts, so it can't crash-loop (R14) |
 | `BANK_KEY_SAFE_WINDOW_S` | 86400 | 86400 | provider's key retention (placeholder) |
 | SMTP | in-cluster Mailpit | in-cluster Mailpit | provider, via ExternalSecret |
 | Postgres / Redis | in-cluster StatefulSets | managed (ADR 0007) | managed |
-| Secrets | `secretGenerator` from `overlays/dev/secrets.env` (git-ignored, written by `dev-env.sh --k8s-dev`; `manifests.sh` writes dummy values when absent) | ExternalSecret | ExternalSecret |
+| Secrets | `secretGenerator` `payrun-dev-secrets` from `overlays/dev/secrets.env` (git-ignored, written by `dev-env.sh --k8s-dev` with the `.env` names; `manifests.sh` writes dummy values when absent). Per-service patches map the process names with `secretKeyRef`, e.g. identity `DB_PASSWORD` ← `IDENTITY_DB_PASSWORD`, `REDIS_PASSWORD` ← `REDIS_IDENTITY_PASSWORD` (C1) | ExternalSecret | ExternalSecret |
 | Ingress | none (port-forward) | TLS, host placeholder | TLS, host placeholder, HSTS at the BFF |
-| `LOG_LEVEL` | DEBUG off, INFO | INFO | INFO |
+| `LOG_LEVEL` | INFO | INFO | INFO |
 | Session cookie | `sid` | `__Host-sid` | `__Host-sid` |
 
 ### 9.6 ExternalSecrets (uat, prod) and kubeconform
@@ -2324,14 +2444,14 @@ spec:
     - { secretKey: PAYROLL_FIELD_ACTIVE_KID, remoteRef: { key: payrun/<env>/PAYROLL_FIELD_ACTIVE_KID } }
 ```
 
-| ExternalSecret | Keys (remote names from plan §8) |
+| ExternalSecret | Keys (`target key ← remote name` where they differ; remote names from plan §8; target keys are the C1 process names) |
 |---|---|
-| `web-secrets` | `INTERNAL_JWT_PRIVATE_KEY`, `INTERNAL_JWT_KID`, `REDIS_WEB_PASSWORD`, `SESSION_SECRET` |
-| `identity-secrets` | `IDENTITY_DB_PASSWORD`, `REDIS_IDENTITY_PASSWORD`, `AUDIT_IP_HASH_KEY`, `SMTP_HOST`, `SMTP_USERNAME`, `SMTP_PASSWORD` (prod) |
+| `web-secrets` | `INTERNAL_JWT_PRIVATE_KEY`, `INTERNAL_JWT_KID`, `REDIS_PASSWORD` ← `REDIS_WEB_PASSWORD`, `SESSION_SECRET` |
+| `identity-secrets` | `DB_PASSWORD` ← `IDENTITY_DB_PASSWORD`, `REDIS_PASSWORD` ← `REDIS_IDENTITY_PASSWORD`, `AUDIT_IP_HASH_KEY`, `SMTP_HOST`, `SMTP_USERNAME`, `SMTP_PASSWORD` (prod; C49) |
 | `payroll-secrets` | as above |
-| `payout-worker-secrets` | `PAYOUTS_DB_PASSWORD`, `REDIS_PAYOUT_WORKER_PASSWORD`, `PAYOUT_WORKER_JWT_PRIVATE_KEY`, `PAYOUT_WORKER_JWT_KID`, `BANK_STUB_API_KEY` (uat; the provider's key in prod) |
-| `bank-stub-secrets` (uat) | `BANK_STUB_DB_PASSWORD`, `BANK_STUB_API_KEY` |
-| `<svc>-migrator` | `<SVC>_DB_MIGRATOR_PASSWORD` (`BANK_STUB_DB_MIGRATOR_PASSWORD` in uat only) |
+| `payout-worker-secrets` | `DB_PASSWORD` ← `PAYOUTS_DB_PASSWORD`, `REDIS_PASSWORD` ← `REDIS_PAYOUT_WORKER_PASSWORD`, `PAYOUT_WORKER_JWT_PRIVATE_KEY`, `PAYOUT_WORKER_JWT_KID`, `BANK_STUB_API_KEY` (uat; the provider's key in prod) |
+| `bank-stub-secrets` (uat) | `DB_PASSWORD` ← `BANK_STUB_DB_PASSWORD`, `BANK_STUB_API_KEY` |
+| `<svc>-migrator` | `DB_PASSWORD` ← `<SVC>_DB_MIGRATOR_PASSWORD` (`BANK_STUB_DB_MIGRATOR_PASSWORD` in uat only) |
 | `db-bootstrap` | `POSTGRES_PASSWORD` (managed admin), every role password above, `POSTGRES_EXPORTER_PASSWORD` |
 | `observability` | `ALERT_PAGE_WEBHOOK_URL`, `ALERT_TICKET_WEBHOOK_URL`, `GRAFANA_ADMIN_PASSWORD`, `REDIS_EXPORTER_PASSWORD` (consumed by the Helm-installed or hosted stack) |
 
@@ -2340,7 +2460,8 @@ spec:
 **kubeconform** (`manifests.sh`, for `dev`, `uat`, `prod`):
 
 ```sh
-kustomize build --load-restrictor LoadRestrictionsNone "deploy/k8s/overlays/$env" \
+# no load-restrictor flag (C36): the shared assets are synced copies (§3.15)
+kustomize build "deploy/k8s/overlays/$env" \
   | kubeconform -strict -summary -kubernetes-version "$K8S_VERSION" \
       -schema-location default \
       -schema-location 'deploy/k8s/schemas/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
@@ -2511,9 +2632,9 @@ jobs:
 | `python` (matrix: `pycommon`, `identity`, `payroll`, `payout_worker`, `bank_stub`, `platform`) | ubuntu-latest (Docker for Testcontainers) / 20 min | checkout, setup-uv, `uv python install`, script, upload coverage | `python.sh <member>` | uv cache keyed on `uv.lock` |
 | `web` | ubuntu-latest / 15 min | checkout, setup-node (`.nvmrc`), corepack, script, upload coverage | `web.sh` | pnpm store keyed on `pnpm-lock.yaml`; `apps/web/.next/cache` |
 | `contract` | ubuntu-latest / 15 min | checkout with `fetch-depth: 0` (needs `origin/main`), setup-uv, setup-node, script | `contract.sh` | uv, pnpm |
-| `e2e` | ubuntu-latest / 40 min | checkout, setup-uv, setup-node, `docker/setup-buildx-action`, install k6 (pinned) and Playwright browsers (`pnpm exec playwright install --with-deps chromium`), script; `if: failure()` upload `playwright-report/`, `ci-logs/`; `if: always()` `stack.sh down -v` | `e2e.sh` | uv, pnpm, Playwright browsers keyed on the Playwright version, buildx `type=gha` per image |
-| `images` | ubuntu-latest / 30 min | checkout, setup-buildx, script (build `linux/amd64`, Trivy) | `images.sh` | buildx `type=gha`; Trivy DB cache |
-| `manifests` | ubuntu-latest / 10 min | checkout, setup-uv, script (kustomize, kubeconform, k8s policy test, promtool, amtool, collector validate, compose config) | `manifests.sh` | uv |
+| `e2e` (env `E2E_SUITE: skeleton` until F3, then `full`; C51) | ubuntu-latest / 40 min | checkout, setup-uv, setup-node, `docker/setup-buildx-action`, install k6 (pinned) and Playwright browsers (`pnpm exec playwright install --with-deps chromium`), script; `if: failure()` upload `playwright-report/`, `ci-logs/`; `if: always()` `stack.sh down -v` | `e2e.sh` | uv, pnpm, Playwright browsers keyed on the Playwright version, buildx `type=gha` per image |
+| `images` | ubuntu-latest / 30 min | checkout, setup-buildx, script (`.trivyignore` policy check, build `linux/amd64`, Trivy) | `images.sh` | buildx `type=gha`; Trivy DB cache |
+| `manifests` | ubuntu-latest / 10 min | checkout, setup-uv, script (k8s asset sync diff, kustomize, kubeconform, k8s policy test, promtool, amtool, collector validate, compose config) | `manifests.sh` | uv |
 | `security` | ubuntu-latest / 10 min | checkout with `fetch-depth: 0`, setup-uv, setup-node, script (pip-audit, pnpm audit, gitleaks over `base..head`) | `security.sh` | uv, pnpm |
 
 - **Permissions:** `contents: read` everywhere; no job needs more. No repository secrets: jobs that run the stack call `scripts/dev-env.sh` first (ADR 0008).
@@ -2567,21 +2688,26 @@ through the same scripts.
 | Breaking changes | `oasdiff breaking <main spec> <PR spec> --fail-on ERR` (skipped when `main` has no spec) | none | contract |
 | Event schemas | `check-jsonschema --check-metaschema` + examples; producer and consumer tests validate envelopes | pass | contract, python |
 | API fuzz | `schemathesis run … --checks all` per service | no 5xx, no schema violations | e2e |
-| End to end | Playwright (journeys, trace test, axe) | all pass; no serious/critical axe violations | e2e |
-| Fault smoke | `pytest tests/resilience -m smoke` (slow DB, identity down) | pass | e2e |
+| End to end | Playwright: `@skeleton` while `E2E_SUITE=skeleton`, then `@journeys` + trace test + axe (C51) | all pass; no serious/critical axe violations | e2e |
+| Fault smoke (C38) | `pytest tests/resilience -m smoke`: the 1–2 PR Toxiproxy tests (slow DB, identity down) | pass | e2e |
+| Seed (PAY-609) | `pytest tests/platform/test_seed.py -m stack` + `test_mint_token.py` | pass | e2e, python (platform) |
+| Start-up (PAY-NFR-15) | `stack.sh up --check-startup` | every service ready ≤ 20 s after its migrations | e2e |
 | Load smoke | `k6 run load/smoke.js` (5 VUs × 30 s) | p95 < 300 ms, errors < 1% | e2e |
 | Metric names | `check_metrics.sh` | every required series present | e2e |
 | Images | `trivy image --severity HIGH,CRITICAL --exit-code 1 --ignorefile .trivyignore` | no HIGH or CRITICAL | images |
+| Trivy ignore policy (C38) | `images.sh` policy check | every `.trivyignore` entry has a reason, an owner and an unexpired `exp:YYYY-MM-DD`, and is in `SECURITY_DEPENDENCIES.md` | images |
 | Python deps | `pip-audit --strict` | none, except accepted in `SECURITY_DEPENDENCIES.md` | security |
 | JS deps | `pnpm audit --audit-level high` | none above moderate, except accepted | security |
 | Secrets | `gitleaks git --log-opts="<base>..HEAD"` | nothing found | security |
-| Alert rules | `promtool check rules`, `promtool test rules` | pass | manifests |
+| Alert rules (C38) | `promtool check rules`, `promtool test rules` (every alert has a firing and a quiet case) | pass | manifests |
 | Prometheus config | `promtool check config` | pass | manifests |
-| Alertmanager | `amtool check-config` | pass | manifests |
+| Alertmanager (C38) | `amtool check-config` | pass | manifests |
 | Collector | `otelcol-contrib validate --config` (both files) | pass | manifests |
-| Kubernetes | `kustomize build … \| kubeconform -strict -summary` for dev, uat, prod (with CRD schemas) + `test_k8s_policy.py` | pass | manifests |
+| Kubernetes | `kustomize build … \| kubeconform -strict -summary` for dev, uat, prod (with CRD schemas; no load-restrictor flag) + `test_k8s_policy.py` | pass | manifests |
+| K8s asset copies (R32, C36) | `sync-k8s-assets.sh` + `git diff --exit-code` on the copies | no diff | manifests |
 | Compose | `docker compose config -q` (base and test override) + `test_compose.py` | pass | manifests, python (platform) |
-| Nightly load | `load/full.js`, `load/soak.js`, `load/settlement.js` | p95 < 300 ms (heavy < 1.5 s), errors < 1%, no memory or lag growth; settlement p95 ≤ 60 s | nightly |
+| Nightly load | `load/full.js`, `load/soak.js`, `load/settlement.js` | p95 < 300 ms (heavy < 1.5 s), errors < 1%, no memory or lag growth in soak (C38); settlement p95 ≤ 60 s | nightly |
+| Nightly failure issue (C38) | `report_failure.sh <job>` (§11.2) | a failed nightly job opens or updates its `nightly-failure` issue with the log tail | nightly |
 
 `docs/TESTING.md` records the table and the latest measured values (PAY-NFR-12 check).
 
@@ -2589,73 +2715,41 @@ through the same scripts.
 
 | Requirement | Platform modules / assets | Tests |
 |---|---|---|
-| PAY-100 (bootstrap owner runs as migrator) | Compose `bootstrap-owner`, K8s `bootstrap-owner` Job, identity migrator role | `test_compose.py`; identity `test_bootstrap_owner.py` |
+| PAY-100 (bootstrap owner runs as migrator) | Compose `bootstrap-owner` and K8s `bootstrap-owner` Job with `--if-empty` (R16), identity migrator role | `test_compose.py`; identity `test_bootstrap_owner.py` |
 | PAY-110 (email via resilient client) | `http.Guard` (`provider="smtp"`) | `test_http.py`, `test_breaker.py` |
-| PAY-402 (outbox and stream) | `streams.outbox_table`, `enqueue`, `OutboxRelay`, `StreamProducer`; Redis ACL for payroll | `test_outbox_relay.py`, `test_streams.py`, `test_redis_acl.py` |
-| PAY-403, 408 (consumer mechanics) | `streams.ConsumerBase`, `processed_events_table`, `redis_client` blocking client | `test_streams.py`, `test_streams_unit.py` |
+| PAY-402 (outbox and stream) | `streams.Envelope`, `StreamProducer`, `RelayLoop` over payroll's `OutboxRepository` (payroll owns the table; C22); Redis ACL for payroll | `test_relay_loop.py`, `test_streams.py`, `test_streams_unit.py`, `test_redis_acl.py` |
+| PAY-403, 408 (consumer mechanics) | The worker's own consumer (C21); pycommon gives `create_redis` for the blocking client and the traceparent helpers; worker ACL with `XGROUP DELCONSUMER` (C27) | `test_streams.py`, `test_redis_acl.py`; worker suite |
 | PAY-404 (bank classification input) | `http.ResilientClient.request_raw` | `test_http.py` |
 | PAY-407 (re-publish runner) | `maintenance.MaintenanceRunner`, `startup_checks.check_republish_after` | `test_maintenance.py`, `test_startup_checks.py` |
-| PAY-409 (poison → DLQ) | `ConsumerBase` `PoisonMessage` path, DLQ layout | `test_streams.py` |
+| PAY-409 (poison → DLQ) | DLQ schema `contracts/events/payout.requested.dlq.v1.json` (C21); worker ACL `XADD` on the DLQ | `contract.sh`, `test_redis_acl.py`; worker suite |
 | PAY-412 (bank-stub ledger) | `bank_stub` schema and roles, Toxiproxy `bank-stub` proxy | `test_bootstrap_sql.py`; bank-stub suite; resilience |
 | PAY-600 Internal JWT | `auth.Keyset`, `TokenVerifier`, `TokenSigner`; `dev-env.sh` keysets; per-service ConfigMaps | `test_jwt.py`, `test_dev_env.py` |
-| PAY-601 Authorization | `auth.require`, `create_app` router wiring | `test_auth_deps.py`, `test_app.py` |
+| PAY-601 Authorization | `auth.require` (the C30 401/403 rule), `create_app` router wiring | `test_auth_deps.py`, `test_app.py` |
 | PAY-602 Error format | `errors.*`, `install_handlers` | `test_errors.py` |
-| PAY-603 Rate limits | `ratelimit.RateLimiter`, `caller_rate_limit`, `compose.test.yaml` raised limits | `test_ratelimit.py`, `test_ratelimit_unit.py` |
+| PAY-603 Rate limits | `ratelimit.RateLimiter`, `caller_rate_limit(exempt_subs=("service:web",))` (C17), `compose.test.yaml` raised limits | `test_ratelimit.py`, `test_ratelimit_unit.py` |
 | PAY-604 Body limits, request id headers | `app.py` middleware (`MAX_BODY_BYTES`, `x-request-id`, `x-trace-id`) | `test_app.py` |
-| PAY-605 Health and startup | `health.py`, `startup_checks.py`, `db.py` timeouts | `test_health.py`, `test_startup_checks.py`, `test_db_pg.py` |
-| PAY-606 Data ownership | `deploy/compose/init/*`, `pycommon.testing.pg_bootstrapped`, K8s `db-bootstrap` Job, `run_alembic_env` | `test_bootstrap_sql.py`; each service's `test_grants.py` |
+| PAY-605 Health and startup | `health.py`, `startup_checks.py` (exit 2, `startup.check_failed`; C29), `db.py` timeouts; web `/api/livez`, `/api/readyz` in Compose and K8s (C4) | `test_health.py`, `test_startup_checks.py`, `test_db_pg.py`, `test_compose.py`, `test_k8s_policy.py` |
+| PAY-606 Data ownership | `deploy/compose/init/*` (with the C50 audit-log revoke), `pycommon.testing.pg_bootstrapped`, K8s `db-bootstrap` Job from the synced copy (R32), `run_alembic_env` | `test_bootstrap_sql.py`, `test_sync_k8s_assets.py`; each service's `test_grants.py` |
 | PAY-607 Redis ACLs | `deploy/compose/redis/*`, `redis_client.create_redis` | `test_redis_acl.py`; per-service ACL tests |
-| PAY-608 Maintenance and retention | `maintenance.py`, `streams.purge_*` | `test_maintenance.py`, `test_maintenance_unit.py` |
-| PAY-609 Seed data | `scripts/seed.py`, `dev-env.sh` seed passwords | used by e2e and k6 in CI |
-| PAY-NFR-02, 03 (no double payment, liveness) | Toxiproxy proxies, `compose.test.yaml`, consumer and relay mechanics | `test_streams.py`, `test_outbox_relay.py`; `tests/resilience` (nightly) |
+| PAY-608 Maintenance and retention | `maintenance.MaintenanceRunner` (services supply the purge tasks) | `test_maintenance.py`, `test_maintenance_unit.py`; each service's `test_maintenance.py` |
+| PAY-609 Seed data | `scripts/seed.py` (`--skeleton`, JSON summary; C33), `scripts/mint_token.py`, `scripts/ci/schemathesis_auth.py` (C35), `bootstrap-owner --if-empty --password-env`, `dev-env.sh` seed passwords | `test_seed.py`, `test_mint_token.py`; the e2e global setup |
+| PAY-NFR-02, 03 (no double payment, liveness) | Toxiproxy proxies, `compose.test.yaml`, relay mechanics | `test_relay_loop.py`; `tests/resilience` (smoke in PR, all nightly) |
 | PAY-NFR-04 Availability SLO | `recording.yml` `sli:bff_errors:*`, burn-rate alerts | `slo_test.yml`, `alerts_test.yml` |
 | PAY-NFR-05 Latency SLO | `sli:bff_latency_*`, k6 smoke in `e2e.sh`, nightly full and soak | k6 thresholds |
 | PAY-NFR-06 Settlement SLO | `SETTLEMENT_BUCKETS`, `sli:payout_settlement_p95:1h`, nightly `settlement.js` | `slo_test.yml`; nightly load |
 | PAY-NFR-07 No secrets in telemetry | `logging.redact`, `RedactingFilter`, OTel hooks, Collector `transform/redact` | `test_logging.py`, `test_otel.py`, `test_secret_not_logged.py`, `test_jwt.py`; e2e Loki/Tempo token search |
 | PAY-NFR-08 Privacy | hashed subjects in limiter keys, no PII metric labels | `test_ratelimit_unit.py`, `test_dashboards.py` |
-| PAY-NFR-09 Tracing | `otel.inject_traceparent` / `context_from_traceparent`, consumer child spans, Collector, Tempo, Loki | `test_streams.py` (child span), `test_otel.py`; e2e `trace.spec.ts` |
+| PAY-NFR-09 Tracing | `parentbased_always_on` everywhere (C23), `otel.inject_traceparent` / `new_traceparent` / `context_from_traceparent`, required `Envelope.traceparent` (C22), Collector (prod `tail_sampling`), Tempo, Loki | `test_streams.py` (same trace id), `test_otel.py`; e2e `trace.spec.ts` |
 | PAY-NFR-10 Observability assets | `otel.py` naming rule, Collector, Prometheus, rules, Alertmanager, alert-sink, Grafana, five dashboards, 17 runbooks | `test_rules_meta.py`, `test_dashboards.py`, `test_alert_sink.py`, `check_metrics.sh`, promtool, amtool; Step 6 drills |
 | PAY-NFR-11 Paging alerts | `PayoutDLQ`, `PayoutsStuck`, `PayoutNeedsOperator`, `PayoutSettlementSlow` rules; DLQ counter pre-initialisation | `alerts_test.yml` fire and quiet cases |
-| PAY-NFR-12 Quality gates | `ci.yml`, `scripts/ci/*.sh`, root `pyproject.toml` (ruff, mypy, coverage) | §12 |
-| PAY-NFR-13 Deployability | Compose profiles and override, Dockerfiles, Kustomize base, components, overlays, Jobs, NetworkPolicies | `test_compose.py`, `test_k8s_policy.py`, kubeconform, `stack.sh up --wait` in e2e |
+| PAY-NFR-12 Quality gates | `ci.yml`, `scripts/ci/*.sh` (promtool/amtool, fault smoke, Trivy ignore policy, nightly failure issue; C38), root `pyproject.toml` (ruff, mypy, coverage) | §12 |
+| PAY-NFR-13 Deployability | Compose profiles and override, Dockerfiles, Kustomize base, components, overlays (prod worker replicas 0; C32), Jobs, NetworkPolicies, `sync-k8s-assets.sh` | `test_compose.py`, `test_k8s_policy.py`, kubeconform, `stack.sh up --wait` in e2e |
+| PAY-NFR-15 Recovery and startup | Redis AOF (`redis.conf`), `stack.sh up --check-startup`, `start_period: 20s` health checks | `ci-logs/startup.json` in e2e; resilience `test_redis_restart.py` |
 | PAY-NFR-14 Accessibility | e2e job wiring (axe runs in Playwright) | web e2e |
 
-## Lead resolutions applied (2026-11-10; README R-table)
+## Change log
 
-These override anything earlier in this file that disagrees.
+- 2026-11-10: incorporated README R-table and C-table decisions (R1, R2, R12, R14, R16, R22, R25, R26, R27, R28, R29, R30, R31, R32; C1, C2, C3, C4, C10, C12, C17, C18, C19, C20, C21, C22, C23, C24, C27, C28, C29, C30, C32, C33, C35, C36, C38, C44, and the later lead decisions C46, C47, C49, C50, C51 and the `not_deployable` startup-check reason).
 
-- **R1:** `PAYOUT_REPUBLISH_AFTER_S` = 360 in `payout-timing`. **R2:** `PAYOUT_PAYROLL_CALL_DEADLINE_S`.
-- **R25:** `EmailOutboxStuck` expr = `max(identity_email_oldest_pending_age_seconds) > 900 or increase(identity_emails_failed_total[1h]) > 0`, for 5m. Update its promtool case (a failure fires it, and it clears after 1 h).
-- **R27:** apps use `OTEL_TRACES_SAMPLER=parentbased_always_on` in every environment. `collector.prod.yaml` `tail_sampling` policies keep: status_code ERROR, latency > 300 ms, and probabilistic 10%.
-- **R28:** `PodRestarts` is evaluated only where kube-state-metrics is installed. The rule ships in Kubernetes only; its promtool test still runs.
-- **R30:** `scripts/mint_token.py` plus a Schemathesis auth hook (`tests/contract/schemathesis_hooks.py`) mint a fresh token per request.
-- **R31:** alert-sink on 4135 (test override).
-- **R32:** `scripts/sync-k8s-assets.sh` copies `deploy/compose/init/*.sql` into `deploy/k8s/base/bootstrap/`; the `manifests` CI job fails on a diff.
-- **R12:** the Redis ACLs include PING for all users; for the worker, XINFO on `.dlq`, XGROUP DELCONSUMER and MKSTREAM writes; a read-only exporter user.
-- **R16:** the `bootstrap-owner` one-shot and Job run `bootstrap_owner --if-empty` (with `--password-env SEED_OWNER_PASSWORD` in dev only); this replaces the exit-3 workaround.
-- **R29:** ExternalSecrets in uat and prod.
-
-## Issues for the lead (all resolved: see the section above and the spec README R-table)
-
-Contradictions and gaps found in the source documents. None were fixed at the source; where this
-design had to choose to stay implementable, the choice is stated and can be reversed.
-
-1. **The republish timing invariant fails with the plan's own defaults (high).** Plan §2.2 requires `PAYOUT_REPUBLISH_AFTER_S` > `PAYOUT_MAX_DELIVERIES` × claim idle (s) + `BANK_TOTAL_DEADLINE_S`, i.e. 300 > 5 × 60 + 15 = 315, which is false. PAY-605 makes this a startup refusal in uat and prod, so uat and prod would not start. This design keeps 300 everywhere (dev only warns). Options: raise `PAYOUT_REPUBLISH_AFTER_S` to 360 (smallest change; the backoff cap of 900 still holds); or lower `PAYOUT_CLAIM_MIN_IDLE_MS` to 55000 (passes both checks: 55 > 35 and 300 > 290); or lower `PAYOUT_MAX_DELIVERIES` to 4. Recommendation: 360 s.
-2. **PAY-609 "prints test tokens for Schemathesis" conflicts with the 60 s token lifetime (PAY-600)**, and with the verifier's lifetime cap. A printed token expires before a Schemathesis run ends. This design has `seed.py --print-auth` print the subject, company and roles, and `scripts/ci/schemathesis_auth.py` mints a fresh token per request. Please confirm the change to PAY-609's wording.
-3. **Owner bootstrap (PAY-100 vs PAY-609, and re-runs).** PAY-100 creates a *pending* owner and emails an invite; PAY-609 says the `bootstrap-owner` one-shot "creates the owner with `SEED_OWNER_PASSWORD`". In this design the one-shot only creates the pending owner, and `seed.py` accepts the owner's invite from Mailpit with `SEED_OWNER_PASSWORD`. Separately, PAY-100's exit code 3 on a non-empty `users` table makes a second `stack.sh up` fail (`service_completed_successfully`) and marks the Kubernetes Job failed. This design wraps exit 3 as success in Compose and uses a `podFailurePolicy` Ignore rule in Kubernetes; a cleaner fix is an identity flag such as `--if-empty` that exits 0 with `identity.bootstrap.skipped`. The identity LLD owns the decision.
-4. **alert-sink has no host port** in plan §13 or HLD §5, but the alert drills (ADR 0010, Step 6) must read it from the host. Proposed: `ALERT_SINK_PORT` = `APP_PORT_BASE` + 35 = 4135, published in `compose.test.yaml`.
-5. **`PodRestarts` has no data source.** It needs `kube_pod_container_status_restarts_total` from kube-state-metrics, which isn't in the plan's Kubernetes or observability lists, and Compose has no equivalent (it would need cAdvisor or Docker events). In Compose the alert is inert; in Kubernetes it needs kube-state-metrics added (Helm chart, or the hosted provider's agent). Please decide whether to add kube-state-metrics to the k8s observability install, and whether Compose needs a restart signal.
-6. **Prod sampling: 10% head sampling cannot be combined with "tail sampling of errors"** (plan §11, §2.2 `OTEL_TRACES_SAMPLER_ARG` 0.1). With a 10% parent-based head sampler, 90% of error traces never reach the Collector, so tail sampling only sees errors in the sampled 10%. To keep every error, prod must head-sample at 1.0 and let the Collector's tail sampler keep errors, slow traces and a 10% baseline (this design's `collector.prod.yaml` policies), at the cost of exporting all spans to the gateway. This design keeps the plan's 0.1; please choose.
-7. **ExternalSecrets scope:** HLD §5 says "prod uses ExternalSecret custom resources"; ADR 0008 and plan §8's secrets inventory say uat **and** prod use External Secrets. This design follows the ADR (uat and prod); the HLD wording should be aligned.
-8. **Poison timing is inconsistent.** Plan §5 J4 says an amount mismatch is reported as `poison`, sent to the DLQ and ACKed (immediately); plan §12.1 and HLD §4 say "Poison message … DLQ after N deliveries", and PAY-408 lists an invalid message under "after `PAYOUT_MAX_DELIVERIES`". `ConsumerBase` dead-letters a `PoisonMessage` immediately (retrying a deterministic failure can't help); the §12.1 row and PAY-408 wording should say so, or the lead should require N deliveries.
-9. **Redis ACL additions beyond plan §6:** the worker needs `XINFO` on `stream:payout.requested.dlq` to export `queue_dlq_messages` (plan §6 grants only `XADD` on the DLQ), and the read-only `exporter` ACL user (secret `REDIS_EXPORTER_PASSWORD` in §8) isn't in §6's user list or ADR 0007. Both are added here (§2.2); please confirm.
-10. **Gap: Redis client timeout vs blocking reads.** `REDIS_SOCKET_TIMEOUT_MS` = 500 and `PAYOUT_XREAD_BLOCK_MS` = 5000 can't share a connection: every blocking `XREADGROUP` would time out. This design gives consumers a second client with `socket_timeout = block + 1000 ms` (§3.8). The plan's config table should note it.
-11. **Label values owned by other LLDs that the rules depend on:** the SLI excludes `/api/health` and `/api/telemetry`, and splits "heavy" routes by `route=~".*/calculate|.*/approve"`; `bff_request_duration_seconds` must carry `route` as the route template and `status` as the numeric code (web LLD). `SigninFailuresSpike` assumes `auth_signins_total{outcome="failed"}` (identity LLD). Please make the web and identity LLDs fix these values, or tell me theirs.
-12. **`external_requests_total` provider values:** plan §11 lists `provider="bank"|"smtp"`; the worker's payroll client is the same resilient client, so it also emits `provider="payroll"` (and `circuit_breaker_state{target="payroll"}`, which plan §12.1 implies). Please confirm that `payroll` is an accepted value.
-13. **Alert details the plan doesn't fix** are this design's choices, marked † in §8.3: the expressions of 11 warning alerts, and `for` on `BffAvailabilitySlowBurn` (15m), `PayoutNeedsOperator` (1m), `OutboxStuck` (1m), `EmailOutboxStuck` (5m), `PayoutStreamNearMaxlen` (5m), `RateLimiterErrors` (5m), `ConsumerLagGrowing` (10m), `BankErrorRateHigh` (10m), `SigninFailuresSpike` (50 failures in 15 m), `RedisMemoryHigh` (5m), `PodRestarts` (> 2 in 15 m), `CollectorDropping` (10m). Please review.
-14. **`EmailOutboxStuck` "any failed"** fires for as long as a failed email row exists, i.e. up to 7 days until the purge (plan §6), and can't be cleared by fixing SMTP. Consider `increase(identity_emails_failed_total[1h]) > 0` (a counter, identity LLD) instead of the gauge.
-15. **"Computed at scrape time" gauges** (plan §2.1, §11): with OTLP push there is no scrape of the service; this design refreshes them every export interval (15 s) per replica (D7). Same freshness guarantee per replica; the plan's wording should say "per export interval".
-16. **`/readyz` for bank-stub:** PAY-605 says `/readyz` checks DB, Redis and migrations on every service, but bank-stub doesn't use Redis (plan §1 diagram). bank-stub's `/readyz` checks DB and migrations only; PAY-605 should say "Redis where used".
-17. **Config key prefixes:** `architecture.md` §3 suggests a per-service env prefix; the plan's config table uses unprefixed names. This design uses the plan's unprefixed names (D1) and distinguishes the two keysets in `.env` as `IDENTITY_INTERNAL_JWT_PUBLIC_KEYS` / `PAYROLL_INTERNAL_JWT_PUBLIC_KEYS`, mapped to `INTERNAL_JWT_PUBLIC_KEYS` per service. These two `.env` names aren't in the plan's secrets inventory.
-18. **Shared bootstrap SQL in Kubernetes** needs `kustomize build --load-restrictor LoadRestrictionsNone` (D8), because the ConfigMap generator reads files outside the kustomization root. The alternative is a copy of `deploy/compose/init` under `deploy/k8s`, which PAY-606 ("shared by Compose, Testcontainers and the Kubernetes Job") argues against. Please accept the flag or choose the copy plus a drift check.
-19. **`dashboard_url` annotations** point at `http://localhost:4101` (dev Grafana). uat and prod need the real Grafana host, which isn't chosen yet (deployment target out of scope, plan §2.3); the overlays will rewrite it once known.
+Still open:
+- **Worker timing in the test stack:** payout-worker LLD §4 says `compose.test.yaml` lowers `PAYOUT_CLAIM_MIN_IDLE_MS`, `PAYOUT_CLAIM_INTERVAL_S` and the payroll/bank deadlines. This design's `compose.test.yaml` keeps the shared `x-payout-timing` values, because payroll's republish check reads the same keys and the e2e stack should run production timing. Integration fixtures may lower them; the lead to confirm whether the Compose test override should too.

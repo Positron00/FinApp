@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://payrun.local/contracts/events/payout.requested.dlq.v1.json",
+  "title": "payout.requested DLQ entry v1",
+  "description": "One entry of stream:payout.requested.dlq. payout-worker writes it (XADD ... MAXLEN ~ 10000) when it dead-letters a stream:payout.requested message, then XACKs the original. Redis stream fields are strings on the wire; this schema describes the entry after decoding, with delivery_count as an integer. It never contains bank details, names or exception text beyond the redacted summary in error. Sources: README C21, PAY-408, PAY-409.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["envelope", "source_id", "error_kind", "error_code", "error", "delivery_count", "consumer", "failed_at"],
+  "properties": {
+    "envelope": {
+      "description": "The original entry's envelope field, unchanged: the payout.requested v1 envelope as a JSON string. It may be empty or invalid JSON when the original entry was malformed (error_code schema_invalid).",
+      "type": "string"
+    },
+    "source_id": {
+      "description": "The original stream entry ID in stream:payout.requested. A crash between the DLQ XADD and the XACK can leave two DLQ entries with the same source_id.",
+      "type": "string",
+      "pattern": "^[0-9]+-[0-9]+$"
+    },
+    "error_kind": {
+      "description": "invalid: the message can never succeed (dead-lettered at once). payroll: payroll was unreachable or refused the call until the delivery budget ran out. internal: a worker failure (database error or timeout, handler deadline) until the budget ran out.",
+      "enum": ["invalid", "payroll", "internal"]
+    },
+    "error_code": {
+      "description": "Machine-readable cause, for example schema_invalid, amount_mismatch, payout_not_found, payroll_unavailable, invalid_token, db_timeout.",
+      "type": "string",
+      "pattern": "^[a-z0-9_]{1,100}$"
+    },
+    "error": {
+      "description": "Redacted summary of the exception (deny-listed keys masked); never an amount, account or routing number, token or API key.",
+      "type": "string",
+      "maxLength": 500
+    },
+    "delivery_count": {
+      "description": "The delivery number of the message when it was dead-lettered (1 for poison found on the first delivery).",
+      "type": "integer",
+      "minimum": 1
+    },
+    "consumer": {
+      "description": "The consumer name (PAYOUT_CONSUMER_NAME, by default the hostname) that dead-lettered the message.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "failed_at": {
+      "description": "UTC time of the dead-lettering, RFC 3339 with a Z suffix.",
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?Z$"
+    }
+  },
+  "examples": [
+    {
+      "envelope": "{\"event_id\":\"0193f1d2-6c4a-7b1e-9a3f-2c5d8e9f0a1b\",\"type\":\"payout.requested\",\"version\":1,\"occurred_at\":\"2026-11-10T14:03:07.123Z\",\"producer\":\"payroll\",\"traceparent\":\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\",\"data\":{\"payout_id\":\"0193f1d2-6c4a-7000-8000-000000000001\",\"pay_run_id\":\"0193f1d2-6c4a-7000-8000-000000000002\",\"company_id\":\"0193a000-0000-7000-8000-000000000001\",\"attempt\":1,\"amount_cents\":412345,\"currency\":\"USD\",\"republish_seq\":0}}",
+      "source_id": "1762783387123-0",
+      "error_kind": "payroll",
+      "error_code": "payroll_unavailable",
+      "error": "PayrollUnavailable: timeout after retries",
+      "delivery_count": 5,
+      "consumer": "payout-worker-7c9d5b6f4-x2k8p",
+      "failed_at": "2026-11-10T14:08:12.456Z"
+    }
+  ]
+}
