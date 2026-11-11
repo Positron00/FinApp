@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import type { Page, Response } from "@playwright/test";
+import type { Page, Request, Response } from "@playwright/test";
 
 import { apiFetch, expect, test } from "./fixtures";
 import { accountNumber, getSettings, ok, ROUTING, uniqueEmail, type Settings } from "./helpers/api";
@@ -14,11 +14,23 @@ import { rowWith } from "./helpers/ui";
  * PAY-200, PAY-201, PAY-202, PAY-203, PAY-601, PAY-NFR-08.
  */
 
-/** Collects every /api response body the page receives, to look for full account numbers. */
+/**
+ * Collects every /api response body the page fully receives, to look for full account numbers.
+ * On `requestfinished`, not `response`: a response whose loading is cancelled (the page navigates
+ * while a fetch is in flight) can leave `response.text()` pending forever, which hung this test
+ * in the second of three nightly runs (2026-11-11). A cancelled response never reached the app's
+ * code, so the masking check (NFR-08) loses nothing.
+ */
 function recordApiBodies(page: Page): Promise<string>[] {
   const bodies: Promise<string>[] = [];
-  page.on("response", (r: Response) => {
-    if (new URL(r.url()).pathname.startsWith("/api/")) bodies.push(r.text().catch(() => ""));
+  page.on("requestfinished", (req: Request) => {
+    if (!new URL(req.url()).pathname.startsWith("/api/")) return;
+    bodies.push(
+      req
+        .response()
+        .then((r: Response | null) => (r ? r.text() : ""))
+        .catch(() => ""),
+    );
   });
   return bodies;
 }
