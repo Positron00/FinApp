@@ -3,6 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { useRef, useState, type FormEvent } from "react";
+import { flushSync } from "react-dom";
 
 import {
   BankFields,
@@ -105,8 +106,9 @@ export function EmployeeForm({
       } else router.push(`/employees/${e.id}`);
     },
     onError: (err) => {
-      setErrors(saveErrors(err));
-      setTimeout(() => focusFirstInvalid(formRef.current), 0);
+      // Commit the errors before focusing: aria-invalid must be in the DOM (PAY-NFR-14).
+      flushSync(() => setErrors(saveErrors(err)));
+      focusFirstInvalid(formRef.current);
     },
   });
 
@@ -116,8 +118,8 @@ export function EmployeeForm({
   }
 
   function fail(fe: FieldErrors) {
-    setErrors(fe);
-    setTimeout(() => focusFirstInvalid(formRef.current), 0);
+    flushSync(() => setErrors(fe));
+    focusFirstInvalid(formRef.current);
   }
 
   function submit(e: FormEvent) {

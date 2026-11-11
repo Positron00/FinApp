@@ -113,6 +113,8 @@ describe("SettingsView", () => {
     await userEvent.click(screen.getByRole("button", { name: "Save settings" }));
     await screen.findByText(/can't change after biweekly runs exist/);
     expect(screen.getByLabelText(/^Biweekly anchor/).getAttribute("aria-invalid")).toBe("true");
+    // PAY-NFR-14: focus is on the field as soon as the error renders.
+    expect(document.activeElement).toBe(screen.getByLabelText(/^Biweekly anchor/));
     expect(screen.queryByRole("alert")).toBeNull();
   });
 

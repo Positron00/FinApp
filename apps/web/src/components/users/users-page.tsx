@@ -1,7 +1,8 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState, type FormEvent } from "react";
+import { useRef, useState, type FormEvent } from "react";
+import { flushSync } from "react-dom";
 
 import { CursorPager, useCursorStack } from "@/components/cursor-pager";
 import { ConfirmDialog, Dialog } from "@/components/dialog";
@@ -11,6 +12,7 @@ import { ApiError, apiFetch } from "@/lib/client/api";
 import {
   apiFieldErrors,
   errorText,
+  focusFirstInvalid,
   zodFieldErrors,
   type FieldErrors,
 } from "@/lib/client/form-errors";
@@ -243,31 +245,38 @@ export function InviteDialog({
   const [name, setName] = useState("");
   const [roles, setRoles] = useState<Role[]>([]);
   const [errors, setErrors] = useState<FieldErrors>({});
+  const formRef = useRef<HTMLFormElement>(null);
   const invite = useMutation({
     mutationFn: (body: InviteBody) => apiFetch<User>("/api/users/invite", { method: "POST", body }),
     retry: 0,
     onSuccess: onDone,
-    onError: (err) =>
-      setErrors(
-        err instanceof ApiError && err.code === "user_email_taken"
-          ? { email: err.message }
-          : apiFieldErrors(err),
-      ),
+    onError: (err) => {
+      // Commit the errors before focusing: aria-invalid must be in the DOM (PAY-NFR-14).
+      flushSync(() =>
+        setErrors(
+          err instanceof ApiError && err.code === "user_email_taken"
+            ? { email: err.message }
+            : apiFieldErrors(err),
+        ),
+      );
+      focusFirstInvalid(formRef.current);
+    },
   });
 
   function submit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    const form = e.currentTarget;
     const parsed = InviteBody.safeParse({ email, name, roles });
     if (!parsed.success) {
-      setErrors(
-        zodFieldErrors(parsed.error, {
-          email: "Enter a valid email address.",
-          roles: ROLES_REQUIRED,
-          name: "Enter a name.",
-        }),
+      flushSync(() =>
+        setErrors(
+          zodFieldErrors(parsed.error, {
+            email: "Enter a valid email address.",
+            roles: ROLES_REQUIRED,
+            name: "Enter a name.",
+          }),
+        ),
       );
-      setTimeout(() => form.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus(), 0);
+      focusFirstInvalid(formRef.current);
       return;
     }
     setErrors({});
@@ -277,7 +286,7 @@ export function InviteDialog({
   const err = invite.error;
   return (
     <Dialog title="Invite user" onClose={onClose}>
-      <form className="mt-3 flex flex-col gap-4" onSubmit={submit} noValidate>
+      <form ref={formRef} className="mt-3 flex flex-col gap-4" onSubmit={submit} noValidate>
         <TextField
           label="Email"
           name="email"

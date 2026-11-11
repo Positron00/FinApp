@@ -129,6 +129,33 @@ describe("EmployeeForm (create)", () => {
     expect(screen.queryByRole("alert")).toBeNull(); // on the field, not in the banner
   });
 
+  // PAY-NFR-14 (web LLD §6.3): after a 409 employee_email_taken, focus is on the Email field as
+  // soon as the error renders (flushSync commits the errors before focusing; no timer race).
+  it("moves focus to the Email field after a 409 employee_email_taken", async () => {
+    stubApi((c) =>
+      c.method === "POST"
+        ? apiError(409, "employee_email_taken", "An employee with this email already exists.")
+        : { body: settings() },
+    );
+    renderWithClient(<EmployeeForm />);
+    await fillCommon();
+    await userEvent.type(screen.getByLabelText(/^Annual salary \(USD\)/), "52000");
+    const email = screen.getByLabelText(/^Email/);
+    // Where focus is the moment the field turns invalid (a microtask after the commit): a deferred
+    // focus (setTimeout) would still be on the submit button here.
+    let focusedWhenInvalid: Element | null = null;
+    const seen = new MutationObserver(() => {
+      if (email.getAttribute("aria-invalid") === "true")
+        focusedWhenInvalid ??= document.activeElement;
+    });
+    seen.observe(email, { attributes: true, attributeFilter: ["aria-invalid"] });
+    await userEvent.click(screen.getByRole("button", { name: "Add employee" }));
+    await screen.findByText("An employee with this email already exists.");
+    seen.disconnect();
+    expect(focusedWhenInvalid).toBe(email);
+    expect(document.activeElement).toBe(email);
+  });
+
   // PAY-602, C14, C56: 422 details (body.<field>) show inline on that field.
   it("shows 422 details inline", async () => {
     stubApi((c) =>

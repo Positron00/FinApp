@@ -2,6 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useRef, useState, type FormEvent } from "react";
+import { flushSync } from "react-dom";
 
 import { ConfirmDialog } from "@/components/dialog";
 import { ErrorBanner } from "@/components/error-banner";
@@ -120,8 +121,9 @@ export function SettingsForm({ settings }: { settings: Settings }) {
         err instanceof ApiError && err.code === "anchor_locked"
           ? { biweekly_anchor: err.message }
           : apiFieldErrors(err);
-      setErrors(fe);
-      setTimeout(() => focusFirstInvalid(formRef.current), 0);
+      // Commit the errors before focusing: aria-invalid must be in the DOM (PAY-NFR-14).
+      flushSync(() => setErrors(fe));
+      focusFirstInvalid(formRef.current);
     },
   });
 
@@ -154,9 +156,9 @@ export function SettingsForm({ settings }: { settings: Settings }) {
           })),
       ...fe,
     };
-    setErrors(all);
+    flushSync(() => setErrors(all));
     if (!parsed.success || Object.keys(all).length > 0) {
-      setTimeout(() => focusFirstInvalid(formRef.current), 0);
+      focusFirstInvalid(formRef.current);
       return;
     }
     save.mutate(parsed.data);

@@ -21,7 +21,7 @@ env:
   UV_FROZEN: "1"
   FORCE_COLOR: "1"
   UV_VERSION: "0.12.13"
-  E2E_SUITE: skeleton # C51: until task F3
+  E2E_SUITE: full # C51: F3 is done, so nightly runs every journey
 
 defaults:
   run:

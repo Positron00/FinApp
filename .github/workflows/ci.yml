@@ -107,7 +107,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
-      E2E_SUITE: skeleton # C51: @skeleton until task F3, then full
+      E2E_SUITE: full # C51: J1–J5 journeys on the full seed since task F6
       PLAYWRIGHT_SKIP_INSTALL: "1" # installed below with the OS dependencies
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

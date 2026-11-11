@@ -126,6 +126,12 @@ export function RunCreateForm() {
   }
 
   const err = create.error instanceof ApiError ? create.error : null;
+  // LLD §3.3: the biweekly invalid_period_start names the anchor date; the BFF doesn't have it,
+  // but this page does (GET /api/settings), so the date is filled in here.
+  const errMessage =
+    err?.code === "invalid_period_start" && create.variables?.schedule === "biweekly" && anchor
+      ? `Biweekly runs must start on a period start date (every 14 days from ${anchor}).`
+      : err?.message;
   // No response at all (network down): a generic message rather than silence (§6.1).
   const offline = create.error !== null && !err;
   const overlapIds = errorEmployeeIds(create.error);
@@ -175,7 +181,7 @@ export function RunCreateForm() {
       {end ? <p className="text-sm">Period ends {end} (worked out by payroll).</p> : null}
       {err ? (
         <div role="alert" className="text-danger">
-          <p>{err.message}</p>
+          <p>{errMessage}</p>
           {overlapIds.length > 0 ? (
             <ul className="list-disc pl-5 text-sm">
               {overlapIds.map((id) => (

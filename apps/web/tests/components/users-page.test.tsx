@@ -132,6 +132,8 @@ describe("UsersPage", () => {
         .getByLabelText(/^Email/)
         .getAttribute("aria-invalid"),
     ).toBe("true");
+    // PAY-NFR-14: focus is on the Email field as soon as the error renders.
+    expect(document.activeElement).toBe(within(dialog).getByLabelText(/^Email/));
     expect(within(dialog).queryByRole("alert")).toBeNull();
   });
 

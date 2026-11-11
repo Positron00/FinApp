@@ -259,6 +259,40 @@ describe("RunCreateForm, both schedules", () => {
     expect(link.getAttribute("href")).toBe(`/pay-runs/${OTHER_RUN}`);
   });
 
+  // PAY-300 (web LLD §3.3): the biweekly invalid_period_start names the anchor date from settings;
+  // without the anchor (or for monthly) the BFF message stands.
+  it("names the anchor in the biweekly invalid_period_start message", async () => {
+    const bff =
+      "Biweekly runs must start on a period start date (every 14 days from the company's biweekly anchor).";
+    let anchorKnown = true;
+    stubApi((c) => {
+      if (c.path === "/api/settings")
+        return anchorKnown
+          ? { body: settings({ biweekly_anchor: "2026-01-05" }) }
+          : apiError(404, "company_settings_not_found", "x");
+      if (c.method === "POST") return apiError(422, "invalid_period_start", bff);
+      return undefined;
+    });
+    const { unmount } = renderWithClient(<RunCreateForm />);
+    await screen.findByText(/Period ends/);
+    await userEvent.selectOptions(screen.getByLabelText("Schedule"), "biweekly");
+    await screen.findByText(/Biweekly runs start every 14 days from 2026-01-05/);
+    await userEvent.clear(screen.getByLabelText("Period start"));
+    await userEvent.type(screen.getByLabelText("Period start"), "2026-01-06");
+    await userEvent.click(screen.getByRole("button", { name: "Create pay run" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain(
+      "Biweekly runs must start on a period start date (every 14 days from 2026-01-05).",
+    );
+    unmount();
+    anchorKnown = false;
+    renderWithClient(<RunCreateForm />);
+    await userEvent.selectOptions(screen.getByLabelText("Schedule"), "biweekly");
+    await userEvent.type(screen.getByLabelText("Period start"), "2026-01-06");
+    await userEvent.click(screen.getByRole("button", { name: "Create pay run" }));
+    expect((await screen.findByRole("alert")).textContent).toContain(bff);
+  });
+
   // PAY-300, C15: employee_in_overlapping_run lists the employees from details.employee_ids.
   it("lists overlapping employees", async () => {
     stubApi((c) => {

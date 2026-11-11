@@ -127,4 +127,32 @@ describe("ApproveButton", () => {
     await clickApprove();
     expect((await screen.findByRole("alert")).textContent).toMatch(/couldn't be confirmed/);
   });
+  // PAY-NFR-14 (web LLD §6.3): the confirm is a dialog; focus moves in, Escape closes it and focus
+  // returns to Approve, which stays mounted throughout.
+  it("moves focus into the confirm dialog and back to Approve on Escape", async () => {
+    const calls = stubApi(() => undefined);
+    renderWithClient(<ApproveButton run={run} meId={USER_ID} />);
+    const approveBtn = screen.getByRole("button", { name: "Approve" });
+    approveBtn.focus();
+    await userEvent.keyboard("{Enter}");
+    const dialog = screen.getByRole("alertdialog", { name: "Confirm approval" });
+    expect(screen.getByRole("button", { name: "Approve" })).toBe(approveBtn);
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Confirm approval" }));
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(document.activeElement).toBe(approveBtn);
+    expect(calls).toHaveLength(0);
+  });
+
+  // PAY-NFR-14: Cancel closes the dialog without a request and returns focus to Approve.
+  it("cancels without a request and returns focus", async () => {
+    const calls = stubApi(() => undefined);
+    renderWithClient(<ApproveButton run={run} meId={USER_ID} />);
+    await userEvent.click(screen.getByRole("button", { name: "Approve" }));
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Approve" }));
+    expect(calls).toHaveLength(0);
+  });
 });

@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # CI job `e2e` (platform LLD §3.15, §12; PAY-NFR-12, PAY-NFR-13, PAY-NFR-15; C38, C51, C65).
 #
-# Usage: E2E_SUITE=skeleton|full scripts/ci/e2e.sh     (default full; ci.yml sets skeleton until F3)
-#        E2E_KEEP_STACK=1 ...                          leave the stack running afterwards (debugging)
+# Usage: scripts/ci/e2e.sh                       the full suite (default; ci.yml since F6, C51)
+#        E2E_SUITE=skeleton scripts/ci/e2e.sh    only the walking skeleton (@skeleton)
+#        E2E_KEEP_STACK=1 ...                    leave the stack running afterwards (debugging)
 #
 #   1. scripts/dev-env.sh (throwaway secrets; an existing .env is kept), images via bake (the CI
 #      gha cache scopes of the images job), scripts/stack.sh up --check-startup (core, obs, test;
 #      every service ready <= 20 s after its migrations, PAY-NFR-15).
-#   2. Seed: skeleton `seed.py --skeleton`; full `seed.py` then `seed.py --employees 500` (C33).
-#   3. Playwright: skeleton `--grep @skeleton`; full `--grep @journeys` plus the trace and axe specs.
-#   4. Both suites: tests/platform/test_seed.py (when present), Schemathesis per service
-#      (after Playwright, C65), k6 smoke, the PR fault smoke tests (tests/resilience -m smoke, C38),
-#      check_metrics.sh.
+#   2. Seed: skeleton `seed.py --skeleton`; full `seed.py` then `seed.py --employees 500` (C33, C54).
+#   3. Playwright: skeleton `--grep @skeleton`; full `--grep "@journeys|@trace|@a11y"` (J1–J5,
+#      role changes, errors, the trace test and axe; web LLD §9.2).
+#   4. Both suites: tests/platform/test_seed.py -m stack (PAY-609), k6 smoke, Schemathesis per
+#      service (after Playwright and k6: its stateful phase deletes and changes seeded data; C65),
+#      the PR fault smoke tests (tests/resilience -m smoke, C38), check_metrics.sh.
 # On failure the Compose logs go to ci-logs/compose.log; the stack is always torn down with -v.
 # shellcheck source=scripts/ci/lib.sh disable=SC1091  # followed with -x; single-file runs (pre-commit) cannot
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -68,19 +70,17 @@ else
   pnpm --filter web exec playwright test --grep "@journeys|@trace|@a11y"
 fi
 
-if [[ -f tests/platform/test_seed.py ]]; then
-  group "seed tests (PAY-609)"
-  uv run pytest -p no:cacheprovider tests/platform/test_seed.py
-else
-  log "tests/platform/test_seed.py does not exist yet: seed tests skipped (platform LLD §6.2)"
-fi
+group "seed tests (PAY-609)"
+uv run pytest -p no:cacheprovider tests/platform/test_seed.py -m stack --junitxml=ci-logs/seed-tests.xml
+
+group "k6 smoke"
+# Before Schemathesis: its stateful phase deletes the still-calculated runs.current of the full
+# seed and changes seeded users and settings (C65 only needs it after Playwright).
+# k6.sh maps a repo-relative SEED_JSON into its container; the absolute one is for Playwright.
+SEED_JSON=ci-logs/seed.json scripts/ci/k6.sh load/smoke.js
 
 group "schemathesis (identity, payroll, bank_stub)"
 scripts/ci/schemathesis.sh
-
-group "k6 smoke"
-# k6.sh maps a repo-relative SEED_JSON into its container; the absolute one is for Playwright.
-SEED_JSON=ci-logs/seed.json scripts/ci/k6.sh load/smoke.js
 
 group "fault smoke (tests/resilience -m smoke; C38)"
 uv run pytest -p no:cacheprovider tests/resilience -m smoke --junitxml=ci-logs/resilience-smoke.xml

@@ -1,7 +1,7 @@
 // k6 smoke through the BFF (web LLD §9.3; PAY-NFR-05): 5 VUs x 30 s as LOAD_USER_EMAIL,
 // p95 < 300 ms and < 1% errors. Run with scripts/ci/k6.sh load/smoke.js.
-// The skeleton BFF (S7) has no /api/employees or /api/settings yet; F5 adds them and F6 adds them
-// to this mix (web LLD §9.3 lists both).
+// Per iteration: me, employees, pay runs, the seeded run (seed.runs.current, C33) and its
+// payslips, settings.
 import http from "k6/http";
 import { check, sleep } from "k6";
 
@@ -37,8 +37,10 @@ function get(path, name, cookie) {
 export default function (data) {
   const run = seed.runs.current;
   get("/api/auth/me", "/api/auth/me", data.cookie);
+  get("/api/employees?limit=50", "/api/employees", data.cookie);
   get("/api/pay-runs?limit=20", "/api/pay-runs", data.cookie);
   get(`/api/pay-runs/${run}`, "/api/pay-runs/[id]", data.cookie);
   get(`/api/pay-runs/${run}/payslips?limit=50`, "/api/pay-runs/[id]/payslips", data.cookie);
+  get("/api/settings", "/api/settings", data.cookie);
   sleep(1);
 }
