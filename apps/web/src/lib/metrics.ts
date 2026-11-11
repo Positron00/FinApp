@@ -57,6 +57,9 @@ function inst(): Instruments {
     sessionsCreated: m.createCounter("bff_sessions_created", { description: "Sessions created" }),
     sessionsRevoked: m.createCounter("bff_sessions_revoked", { description: "Sessions revoked" }),
   };
+  // C72: a counter that backs an alert starts at 0, so its first error is an increase that
+  // `rate()` sees (RateLimiterErrors reads rate_limiter_errors_total{component="web"}).
+  i.rateLimiterErrors.add(0, { component: "web" });
   cache = { provider, inst: i };
   return i;
 }
@@ -65,6 +68,10 @@ export type UpstreamOutcome =
   "ok" | "http_4xx" | "http_5xx" | "timeout" | "connect_error" | "breaker_open";
 
 export const metricsApi = {
+  /** Create the instruments now (server start), so the pre-initialised series export at once. */
+  init(): void {
+    inst();
+  },
   requestDuration(route: string, status: number, seconds: number): void {
     inst().requestDuration.record(seconds, { route, status: String(status) });
   },

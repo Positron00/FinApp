@@ -4,6 +4,7 @@ import { http, HttpResponse } from "msw";
 import { POST as login, GET as loginGet } from "@/app/api/auth/login/route";
 import { POST as logout } from "@/app/api/auth/logout/route";
 import { GET as me } from "@/app/api/auth/me/route";
+import { metricsApi } from "@/lib/metrics";
 import { sessKey, sessionKeyOf, userSessKey } from "@/lib/session";
 
 import { COMPANY_ID, IDENTITY } from "../helpers/env";
@@ -218,14 +219,19 @@ describe("POST /api/auth/logout", () => {
     expect(res.status).toBe(204);
   });
 
-  // PAY-106 §4.5: best effort when Redis is down.
+  // PAY-106 §4.5: best effort when Redis is down; logged at error and counted (§7.1, §7.2).
   it("still clears the cookie when Redis fails", async () => {
     const cookie = await signIn();
+    const counted = vi.spyOn(metricsApi, "sessionBackendError");
     t.redis.fail = true;
     const res = await logout(makeReq("/api/auth/logout", { method: "POST", cookie }), params());
     expect(res.status).toBe(204);
     expect(res.cookies.get("sid")?.maxAge).toBe(0);
-    expect(t.logs.events("session.backend_error").length).toBeGreaterThan(0);
+    const errors = t.logs.events("session.backend_error");
+    expect(errors.find((e) => e.op === "logout")).toMatchObject({ level: "error" });
+    // one count per logged backend error (the optional session load fails first)
+    expect(counted).toHaveBeenCalledTimes(errors.length);
+    counted.mockRestore();
   });
 });
 

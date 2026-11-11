@@ -1,25 +1,25 @@
-"""Pay-run reads (design §4.4 "Read endpoints"; PAY-303, PAY-501, C8, C9): no locks."""
+"""Unlocked reads: pay runs (design §4.4 "Read endpoints"; PAY-303, PAY-501, C8, C9) and audit
+events (§4.5)."""
 
 from __future__ import annotations
 
-from typing import cast
 from uuid import UUID
 
 from payroll.api.pagination import decode_cursor, encode_cursor
-from payroll.api.schemas import (
-    AttemptOut,
-    Page,
-    PayoutOut,
-    PayoutStatusName,
-    PayRunOut,
-    PayslipOut,
-)
-from payroll.db.repositories import AttemptRepo, PayoutRepo, PayRunRepo, PayslipRepo
+from payroll.api.schemas import AuditEventOut, Page, PayoutOut, PayRunOut, PayslipOut
+from payroll.db.repositories import AttemptRepo, AuditRepo, PayoutRepo, PayRunRepo, PayslipRepo
 from payroll.db.session import session_scope
-from payroll.services.common import pay_run_out, pay_run_view
+from payroll.services.common import pay_run_out, pay_run_view, payout_out
 from payroll.services.runtime import Runtime
 
-__all__ = ["get_payslip", "get_run", "list_payouts", "list_payslips", "list_runs"]
+__all__ = [
+    "get_payslip",
+    "get_run",
+    "list_audit_events",
+    "list_payouts",
+    "list_payslips",
+    "list_runs",
+]
 
 
 def _after(cursor: str | None) -> UUID | None:
@@ -83,22 +83,33 @@ async def list_payouts(
         )
         page = rows[:limit]
         attempts = await AttemptRepo.for_payouts(session, company_id, [p.id for p, _ in page])
-    items = [
-        PayoutOut(
-            id=p.id,
-            pay_run_id=p.pay_run_id,
-            payslip_id=p.payslip_id,
-            employee_id=p.employee_id,
-            employee_name=name,
-            amount_cents=p.amount_cents,
-            currency="USD",
-            status=cast(PayoutStatusName, p.status),
-            no_transfer=p.no_transfer,
-            current_attempt=p.current_attempt,
-            attempts=[AttemptOut.model_validate(a) for a in attempts[p.id]],
-        )
-        for p, name in page
-    ]
+    items = [payout_out(p, name, attempts[p.id]) for p, name in page]
     return Page[PayoutOut](
         items=items, next_cursor=encode_cursor(items[-1].id) if len(rows) > limit else None
     )
+
+
+async def list_audit_events(
+    rt: Runtime,
+    company_id: UUID,
+    *,
+    entity_type: str | None,
+    entity_id: UUID | None,
+    event: str | None,
+    cursor: str | None,
+    limit: int,
+) -> Page[AuditEventOut]:
+    after = _after(cursor)
+    async with session_scope(rt.sessions, "audit_events.list") as session:
+        rows = await AuditRepo.page(
+            session,
+            company_id,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            event=event,
+            after=after,
+            limit=limit,
+        )
+        items = [AuditEventOut.model_validate(r) for r in rows[:limit]]
+    next_cursor = encode_cursor(items[-1].id) if len(rows) > limit else None
+    return Page[AuditEventOut](items=items, next_cursor=next_cursor)

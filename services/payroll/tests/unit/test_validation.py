@@ -1,4 +1,4 @@
-"""Input validation (PAY-200, PAY-201, PAY-405, PAY-602; C14, C26)."""
+"""Input validation (PAY-200, PAY-201, PAY-301, PAY-405, PAY-602; C14, C26)."""
 
 # ruff: noqa: E501  (one case per line in the parameter tables)
 
@@ -6,9 +6,18 @@ from __future__ import annotations
 
 from datetime import date
 from typing import Any
+from uuid import uuid4
 
 import pytest
-from payroll.api.schemas import CompanySettingsIn, EmployeeCreate, ResultIn
+from payroll.api import schemas
+from payroll.api.schemas import (
+    CompanySettingsIn,
+    EmployeeCreate,
+    EmployeeUpdate,
+    HoursIn,
+    ResolveIn,
+    ResultIn,
+)
 from payroll.domain.validation import aba_checksum_ok, is_monday, is_valid_timezone
 from pydantic import ValidationError
 
@@ -111,6 +120,48 @@ def test_employee_invalid(overrides: dict[str, Any], issue: str) -> None:
 @pytest.mark.parametrize(
     "body",
     [
+        {"name": "Ada King"},
+        {"status": "inactive"},
+        {"status": "active", "bank_routing": VALID_ROUTING, "bank_account": "1234"},
+        {"pay_type": "hourly", "hourly_rate_cents": 2500},
+        {"schedule": "biweekly"},
+    ],
+)
+def test_employee_update_valid(body: dict[str, Any]) -> None:
+    """PAY-203: any single PAY-201 field, or status, is a valid PATCH body."""
+    assert EmployeeUpdate.model_validate(body).model_fields_set == set(body)
+
+
+@pytest.mark.parametrize(
+    ("body", "field", "issue"),
+    [
+        ({}, "", "no_fields"),
+        ({"name": None}, "name", "null_not_allowed"),
+        ({"status": None}, "status", "null_not_allowed"),
+        ({"status": "deleted"}, "status", "literal_error"),
+        ({"bank_routing": "021000022"}, "bank_routing", "aba_checksum"),
+        ({"bank_account": "12"}, "bank_account", "string_pattern_mismatch"),
+        ({"hourly_rate_cents": 0}, "hourly_rate_cents", "greater_than_equal"),
+        ({"name": "A\x00B"}, "name", "nul_character"),
+        ({"deactivated_at": "2026-01-01T00:00:00Z"}, "deactivated_at", "extra_forbidden"),
+    ],
+)
+def test_employee_update_invalid(body: dict[str, Any], field: str, issue: str) -> None:
+    """PAY-203, PAY-602, C14: an empty PATCH, an explicit null, an unknown key or a bad value is
+    422 with the field's location; the value is never echoed."""
+    with pytest.raises(ValidationError) as err:
+        EmployeeUpdate.model_validate(body)
+    errors = err.value.errors()
+    assert {(".".join(str(p) for p in e["loc"]), str(e["type"])) for e in errors} == {
+        (field, issue)
+    }
+    if "bank_routing" in body:
+        assert body["bank_routing"] not in str([e["msg"] for e in errors])
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
         {"attempt": 1, "outcome": "settled", "bank_reference": "ref-1"},
         {"attempt": 1, "outcome": "rejected", "reason": "account_closed"},
         {"attempt": 2, "outcome": "indeterminate"},
@@ -171,3 +222,79 @@ def test_result_attempt_fits_smallint() -> None:
     with pytest.raises(ValidationError) as info:
         ResultIn.model_validate({"attempt": 32768, "outcome": "indeterminate"})
     assert _issues(info.value) == {"less_than_equal"}
+
+
+E1, E2 = str(uuid4()), str(uuid4())
+
+
+@pytest.mark.parametrize("hours", [0, 1, 33_600, 74_400])
+def test_hours_valid(hours: int) -> None:
+    """PAY-301: hundredths 0 to 74,400 (the outer bound; the schedule bound is the domain's)."""
+    body = HoursIn.model_validate({"entries": [{"employee_id": E1, "hours_hundredths": hours}]})
+    assert body.entries[0].hours_hundredths == hours
+
+
+@pytest.mark.parametrize(
+    ("body", "field", "issue"),
+    [
+        ({"entries": []}, "entries", "too_short"),
+        ({"entries": [{"employee_id": str(uuid4()), "hours_hundredths": 1} for _ in range(501)]}, "entries", "too_long"),
+        ({"entries": [{"employee_id": E1, "hours_hundredths": 1}, {"employee_id": E2, "hours_hundredths": 2}, {"employee_id": E1, "hours_hundredths": 3}]}, "entries", "duplicate_employee_id"),
+        ({"entries": [{"employee_id": E1, "hours_hundredths": -1}]}, "entries.0.hours_hundredths", "greater_than_equal"),
+        ({"entries": [{"employee_id": E1, "hours_hundredths": 74_401}]}, "entries.0.hours_hundredths", "less_than_equal"),
+        ({"entries": [{"employee_id": E1, "hours_hundredths": 1.5}]}, "entries.0.hours_hundredths", "int_type"),  # strict ints
+        ({"entries": [{"employee_id": "nope", "hours_hundredths": 1}]}, "entries.0.employee_id", "uuid_parsing"),
+        ({"entries": [{"employee_id": E1, "hours_hundredths": 1, "rate": 2}]}, "entries.0.rate", "extra_forbidden"),
+        ({"entries": [{"employee_id": E1, "hours_hundredths": 1}], "run": 1}, "run", "extra_forbidden"),
+    ],
+    ids=["empty", "501", "duplicate", "negative", "over-74400", "float", "bad-uuid", "extra-entry-key", "extra-key"],
+)  # fmt: skip
+def test_hours_invalid(body: dict[str, Any], field: str, issue: str) -> None:
+    """PAY-301, PAY-602, C14: 1 to 500 entries, unique employee IDs, integer hundredths in
+    0..74,400 and no unknown keys; each error carries the field's location."""
+    with pytest.raises(ValidationError) as err:
+        HoursIn.model_validate(body)
+    assert {(".".join(str(p) for p in e["loc"]), str(e["type"])) for e in err.value.errors()} == {
+        (field, issue)
+    }
+
+
+@pytest.mark.parametrize(
+    "body", [{"action": "redrive", "note": "x"}, {"action": "mark_rejected", "note": "n" * 500}]
+)
+def test_resolve_valid(body: dict[str, Any]) -> None:
+    """PAY-502: both actions with a 1-500 character note."""
+    ResolveIn.model_validate(body)
+
+
+@pytest.mark.parametrize(
+    ("body", "issue"),
+    [
+        ({"action": "void", "note": "x"}, "literal_error"),
+        ({"action": "redrive"}, "missing"),
+        ({"action": "redrive", "note": ""}, "string_too_short"),
+        ({"action": "redrive", "note": "   "}, "string_too_short"),
+        ({"action": "redrive", "note": "n" * 501}, "string_too_long"),
+        ({"action": "redrive", "note": "a\x00b"}, "nul_character"),
+        ({"action": "redrive", "note": "x", "extra": 1}, "extra_forbidden"),
+    ],
+)
+def test_resolve_invalid(body: dict[str, Any], issue: str) -> None:
+    """PAY-502, C14: an unknown action, a missing, empty or 501-character note → 422."""
+    with pytest.raises(ValidationError) as err:
+        ResolveIn.model_validate(body)
+    assert issue in _issues(err.value)
+
+
+@pytest.mark.parametrize(
+    ("model", "payload"),
+    [
+        ("HoursIn", {"entries": [{"employee_id": str(uuid4()), "hours_hundredths": False}]}),
+        ("HoursIn", {"entries": [{"employee_id": str(uuid4()), "hours_hundredths": True}]}),
+        ("ResultIn", {"attempt": True, "outcome": "settled", "bank_reference": "BSR-1"}),
+    ],
+)
+def test_json_booleans_never_coerce_to_integers(model: str, payload: dict[str, object]) -> None:
+    """PAY-301, PAY-405, PAY-602: true/false is not an integer (Schemathesis ST201)."""
+    with pytest.raises(ValidationError):
+        getattr(schemas, model).model_validate(payload)

@@ -26,10 +26,17 @@ from payroll.domain.validation import aba_checksum_ok, is_monday, is_valid_timez
 __all__ = [
     "Account",
     "AttemptOut",
+    "AuditEventName",
+    "AuditEventOut",
     "CompanySettingsIn",
     "CompanySettingsOut",
     "EmployeeCreate",
     "EmployeeOut",
+    "EmployeeUpdate",
+    "EntityType",
+    "HoursEntry",
+    "HoursIn",
+    "HoursOut",
     "IdemKey",
     "InstructionOut",
     "Page",
@@ -38,6 +45,7 @@ __all__ = [
     "PayoutCounts",
     "PayoutOut",
     "PayslipOut",
+    "ResolveIn",
     "ResultIn",
     "ResultOut",
     "Routing",
@@ -57,11 +65,12 @@ def _no_nul(v: str) -> str:
 NoNul = AfterValidator(_no_nul)
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200), NoNul]
 Email = Annotated[EmailStr, StringConstraints(max_length=320)]
-SalaryCents = Annotated[int, Field(ge=1, le=1_000_000_000)]
-RateCents = Annotated[int, Field(ge=1, le=100_000)]
+SalaryCents = Annotated[int, Field(ge=1, le=1_000_000_000, strict=True)]
+RateCents = Annotated[int, Field(ge=1, le=100_000, strict=True)]
 Routing = Annotated[str, StringConstraints(pattern=r"^[0-9]{9}$")]
 Account = Annotated[str, StringConstraints(pattern=r"^[0-9]{4,17}$")]
-HoursHundredths = Annotated[int, Field(ge=0, le=74_400)]
+# strict: JSON booleans must not coerce to 0/1 (Schemathesis ST201, F4a e2e run)
+HoursHundredths = Annotated[int, Field(ge=0, le=74_400, strict=True)]
 Limit = Annotated[int, Field(ge=1, le=100)]
 IdemKey = Annotated[str, StringConstraints(pattern=IDEM_KEY_PATTERN)]
 Schedule = Literal["biweekly", "monthly"]
@@ -86,8 +95,8 @@ class CompanySettingsIn(BaseModel):
     model_config = _REQUEST
 
     name: Name
-    tax_rate_bps: Annotated[int, Field(ge=0, le=5000)]
-    retirement_bps: Annotated[int, Field(ge=0, le=2000)]
+    tax_rate_bps: Annotated[int, Field(ge=0, le=5000, strict=True)]
+    retirement_bps: Annotated[int, Field(ge=0, le=2000, strict=True)]
     timezone: Annotated[str, StringConstraints(min_length=1, max_length=64), NoNul]
     biweekly_anchor: date
     require_dual_approval: bool
@@ -120,7 +129,7 @@ class CompanySettingsOut(BaseModel):
     updated_by: str | None
 
 
-# --- employees (PAY-201, PAY-202) --------------------------------------------------------------
+# --- employees (PAY-201, PAY-202, PAY-203) -----------------------------------------------------
 
 
 class EmployeeCreate(BaseModel):
@@ -157,6 +166,44 @@ class EmployeeCreate(BaseModel):
         return self
 
 
+class EmployeeUpdate(BaseModel):
+    """PATCH body (PAY-203): any PAY-201 field, or ``status``. At least one field; an explicit
+    ``null`` is refused (omit the field instead). The merged pay basis is checked by the service
+    against the stored row (design §4.3)."""
+
+    model_config = _REQUEST
+
+    name: Name | None = None
+    email: Email | None = None
+    pay_type: PayType | None = None
+    annual_salary_cents: SalaryCents | None = None
+    hourly_rate_cents: RateCents | None = None
+    schedule: Schedule | None = None
+    bank_routing: Routing | None = None
+    bank_account: Account | None = None
+    status: Literal["active", "inactive"] | None = None
+
+    @field_validator("*")
+    @classmethod
+    def _not_null(cls, v: Any) -> Any:
+        if v is None:  # validators run only on supplied values, so None was an explicit null
+            raise PydanticCustomError("null_not_allowed", "Omit the field instead of null.")
+        return v
+
+    @field_validator("bank_routing")
+    @classmethod
+    def _aba(cls, v: str) -> str:
+        if not aba_checksum_ok(v):
+            raise PydanticCustomError("aba_checksum", "The routing number checksum is invalid.")
+        return v
+
+    @model_validator(mode="after")
+    def _not_empty(self) -> Self:
+        if not self.model_fields_set:
+            raise PydanticCustomError("no_fields", "The update has no fields.")
+        return self
+
+
 class EmployeeOut(BaseModel):
     model_config = _RESPONSE
 
@@ -187,7 +234,34 @@ class EmployeeOut(BaseModel):
         return values
 
 
-# --- pay runs (PAY-300, PAY-302, PAY-303, PAY-400) ---------------------------------------------
+# --- audit events (design §4.5) ----------------------------------------------------------------
+
+EntityType = Literal["company_settings", "employee", "pay_run", "payout"]
+AuditEventName = Annotated[str, StringConstraints(pattern=r"^[a-z_]+\.[a-z_]+$", max_length=64)]
+
+
+class AuditEventOut(BaseModel):
+    """C5 ``PayrollAuditEvent``; ``details`` holds IDs, counts, codes and ``account_last4`` only."""
+
+    model_config = _RESPONSE
+
+    id: UUID
+    at: datetime  # created_at
+    actor_id: str
+    event: str
+    entity_type: EntityType
+    entity_id: UUID
+    details: dict[str, Any]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_row(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            return data
+        return {n: getattr(data, "created_at" if n == "at" else n) for n in cls.model_fields}
+
+
+# --- pay runs (PAY-300 to PAY-304, PAY-400) ------------------------------------------------
 
 
 class PayRunCreate(BaseModel):
@@ -243,6 +317,36 @@ class PayRunOut(BaseModel):
     updated_at: datetime
 
 
+class HoursEntry(BaseModel):
+    model_config = _REQUEST
+
+    employee_id: UUID
+    hours_hundredths: HoursHundredths  # the schedule bound (33,600 biweekly) is the domain's
+
+
+class HoursIn(BaseModel):
+    """PUT …/hours body (PAY-301): 1 to 500 entries with unique ``employee_id`` values."""
+
+    model_config = _REQUEST
+
+    entries: Annotated[list[HoursEntry], Field(min_length=1, max_length=500)]
+
+    @field_validator("entries")
+    @classmethod
+    def _unique(cls, v: list[HoursEntry]) -> list[HoursEntry]:
+        if len({e.employee_id for e in v}) != len(v):
+            raise PydanticCustomError("duplicate_employee_id", "Each employee_id may appear once.")
+        return v
+
+
+class HoursOut(BaseModel):
+    """PUT …/hours response (C7): every hours row now stored for the run, by ``employee_id``."""
+
+    pay_run_id: UUID
+    status: Literal["draft"]
+    entries: list[HoursEntry]
+
+
 class PayslipOut(BaseModel):
     model_config = _RESPONSE
 
@@ -287,6 +391,18 @@ class PayoutOut(BaseModel):
     attempts: list[AttemptOut]  # ascending by attempt; [] when no_transfer (PAY-501)
 
 
+class ResolveIn(BaseModel):
+    """PAY-502, R8: the operator's action and a note (1 to 500 characters; only its length is ever
+    stored or logged, PAY-NFR-07)."""
+
+    model_config = _REQUEST
+
+    action: Literal["redrive", "mark_rejected"]
+    note: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500), NoNul
+    ]
+
+
 # --- internal (PAY-405, PAY-411) ---------------------------------------------------------------
 
 
@@ -307,7 +423,9 @@ BankReference = Annotated[str, StringConstraints(min_length=1, max_length=64), N
 class ResultIn(BaseModel):
     model_config = _REQUEST
 
-    attempt: Annotated[int, Field(ge=1, le=32767)]  # payout_attempts.attempt is smallint (C63)
+    attempt: Annotated[
+        int, Field(ge=1, le=32767, strict=True)
+    ]  # payout_attempts.attempt is smallint (C63)
     outcome: Literal["settled", "rejected", "indeterminate", "poison"]
     reason: Reason | None = None
     bank_reference: BankReference | None = None

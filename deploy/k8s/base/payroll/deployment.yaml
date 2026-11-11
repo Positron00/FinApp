@@ -41,6 +41,7 @@ spec:
           env:
             - { name: OTEL_SEMCONV_STABILITY_OPT_IN, value: http }
             - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector:4317" }
+            - { name: OTEL_EXPORTER_OTLP_TIMEOUT, value: "3" } # seconds (Python gRPC exporter); bounds shutdown flush (C67)
             - { name: OTEL_TRACES_SAMPLER, value: parentbased_always_on } # C23, every overlay
           securityContext:
             allowPrivilegeEscalation: false

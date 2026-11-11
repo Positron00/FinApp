@@ -47,7 +47,7 @@ class Harness:
 @pytest.fixture
 async def harness(token_factory: TokenFactory) -> AsyncIterator[Harness]:
     settings = make_settings(internal_jwt_public_keys=token_factory.keyset_json)
-    app = build_app(settings, instrument=False, relay=False)
+    app = build_app(settings, instrument=False, relay=False, maintenance=False)
     async with app.router.lifespan_context(app):
         app.state.ctx.limiter = None  # no Redis in unit tests: the caller limit is skipped
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
@@ -96,14 +96,20 @@ ROUTES: list[tuple[str, str, tuple[str, ...]]] = [
     ("GET", "/v1/employees", ANY),
     ("POST", "/v1/employees", ("payroll_admin",)),
     ("GET", f"/v1/employees/{PID}", ANY),
+    ("PATCH", f"/v1/employees/{PID}", ("payroll_admin",)),
+    ("GET", "/v1/audit-events", ("admin",)),
     ("GET", "/v1/pay-runs", ANY),
     ("POST", "/v1/pay-runs", ("payroll_admin",)),
     ("GET", f"/v1/pay-runs/{RID}", ANY),
+    ("DELETE", f"/v1/pay-runs/{RID}", ("payroll_admin",)),
+    ("PUT", f"/v1/pay-runs/{RID}/hours", ("payroll_admin",)),
     ("POST", f"/v1/pay-runs/{RID}/calculate", ("payroll_admin",)),
     ("POST", f"/v1/pay-runs/{RID}/approve", ("approver",)),
     ("GET", f"/v1/pay-runs/{RID}/payslips", ANY),
     ("GET", f"/v1/pay-runs/{RID}/payslips/{PID}", ANY),
     ("GET", f"/v1/pay-runs/{RID}/payouts", ANY),
+    ("POST", f"/v1/pay-runs/{RID}/payouts/{PID}/retry", ("approver",)),
+    ("POST", f"/v1/pay-runs/{RID}/payouts/{PID}/resolve", ("approver",)),
 ]
 INTERNAL = [
     ("GET", f"/v1/internal/payouts/{PID}/instruction?attempt=1"),
@@ -212,3 +218,13 @@ async def test_approve_key_rules(harness: Harness) -> None:
 def test_migrations_dir_is_found() -> None:
     """PAY-605: /readyz compares against the head of services/payroll/migrations."""
     assert migrations_dir().endswith("migrations")
+
+
+async def test_retry_key_is_optional_but_pattern_checked(harness: Harness) -> None:
+    """PAY-500, C34, C52: retry takes no key (not 400) but a malformed one is 422."""
+    headers = harness.bearer(roles=("approver",))
+    url = f"/v1/pay-runs/{RID}/payouts/{PID}/retry"
+    r = await harness.client.post(url, headers=headers)
+    assert r.status_code != 400
+    r = await harness.client.post(url, headers={**headers, "Idempotency-Key": "bad key!"})
+    assert _code(r) == (422, "validation_error")

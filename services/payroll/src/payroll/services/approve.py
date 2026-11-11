@@ -3,6 +3,15 @@
 One transaction: idempotency row (lock 1) → run ``FOR UPDATE`` (3) → employees ``FOR SHARE`` (6)
 → inserts (payouts, attempts with encrypted bank snapshots, outbox rows, audit). The run moves to
 ``processing``, or straight to ``paid`` when every payout is ``no_transfer``.
+
+Dual approval (PAY-401, C73) reads the run's hours editors and the unvetted bank edits of the
+employees who get a transfer (net above 0), after the employee locks. A denial is audited
+(``payrun.approve_denied``) in its own transaction after the rollback.
+
+Every attempt's ``requested_at`` is one ``clock_timestamp()`` read **after** the ``FOR SHARE``
+locks, not ``now()`` (the transaction start): a PATCH waiting on those locks commits its
+``bank_updated_at`` (also ``clock_timestamp()``, at its UPDATE) strictly later, so details this
+snapshot didn't see can never count as vetted by it (C73, design §3.4).
 """
 
 from __future__ import annotations
@@ -25,10 +34,18 @@ from sqlalchemy import func, insert, update
 from payroll.api.schemas import PayRunOut
 from payroll.crypto import employee_aad, snapshot_aad
 from payroll.db.models import Payout, PayoutAttempt, PayRun
-from payroll.db.repositories import AuditRepo, EmployeeRepo, PayRunRepo, PayslipRepo, rowcount
+from payroll.db.repositories import (
+    AuditRepo,
+    DualApprovalRepo,
+    EmployeeRepo,
+    PayRunRepo,
+    PayslipRepo,
+    clock_timestamp,
+    rowcount,
+)
 from payroll.db.session import session_scope
 from payroll.domain import ApproverMustDiffer, EmployeeBankDetailsMissing, PayRunNotApprovable
-from payroll.domain.dual_approval import BankEdit, check_approve_dual
+from payroll.domain.dual_approval import check_approve_dual
 from payroll.domain.state import (
     PayoutStatus,
     RunStatus,
@@ -37,6 +54,7 @@ from payroll.domain.state import (
 )
 from payroll.services import idempotency
 from payroll.services.common import decrypt_or_500, pay_run_view
+from payroll.services.dual_denied import record_dual_denied
 from payroll.services.runtime import Runtime
 
 __all__ = ["ApproveResult", "approve"]
@@ -85,6 +103,9 @@ async def approve(
                 action="approve", rule=exc.rule, employee_count=len(exc.employee_ids),
                 actor_id=principal.sub,
             )  # fmt: skip
+            await record_dual_denied(
+                rt, principal, exc, action="approve", entity_id=run_id, pay_run_id=run_id
+            )
             raise
         span.set_attribute("payroll.payouts", stats["payouts"])
         span.set_attribute("payroll.transfers", stats["transfers"])
@@ -135,15 +156,20 @@ async def _approve_in_tx(
     employees = await EmployeeRepo.for_share(
         session, cid, sorted({p.employee_id for p in payslips})
     )
-    check_approve_dual(
-        require_dual_approval=bool(run.require_dual_approval),
-        approver_id=principal.sub,
-        calculated_by=run.calculated_by or "",
-        run_created_at=run.created_at,
-        bank_edits=[
-            BankEdit(e.id, e.bank_updated_by, e.bank_updated_at) for e in employees.values()
-        ],
-    )
+    # After the locks (C73): the snapshot time of every attempt below.
+    snapshot_at = await clock_timestamp(session)
+    if run.require_dual_approval:
+        # Only employees who get a transfer: a no-transfer payout has no attempt, so it neither
+        # releases nor vets their bank details (C73).
+        paid = sorted({p.employee_id for p in payslips if (p.net_cents or 0) > 0})
+        check_approve_dual(
+            require_dual_approval=True,
+            approver_id=principal.sub,
+            calculated_by=run.calculated_by or "",
+            created_by=run.created_by,
+            hours_edits=await DualApprovalRepo.hours_edits(session, cid, run_id),
+            bank_edits=await DualApprovalRepo.bank_edits(session, cid, paid, principal.sub),
+        )
     missing = [
         p.employee_id
         for p in payslips
@@ -194,7 +220,7 @@ async def _approve_in_tx(
                 "status": "requested",
                 "bank_snapshot_enc": rt.keyring.encrypt(snapshot, aad=snapshot_aad(payout_id, 1)),
                 "account_last4": account[-4:], "requested_by": principal.sub,
-                "requested_at": func.now(), "last_published_at": func.now(), "publish_count": 1,
+                "requested_at": snapshot_at, "last_published_at": func.now(), "publish_count": 1,
             }
         )  # fmt: skip
         transfers.append((payout_id, net))

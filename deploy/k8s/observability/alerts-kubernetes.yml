@@ -2,6 +2,8 @@
 # Prometheus next to deploy/observability/prometheus/rules/*.yml. It needs kube-state-metrics, a
 # cluster dependency listed in the prod overlay; Compose has no pods, so it isn't loaded there.
 # scripts/ci/manifests.sh runs `promtool check rules` and `promtool test rules` on it.
+# dashboard_url points at the dev Grafana (127.0.0.1:4101); a cluster install must template its own
+# Grafana host (platform LLD §8.3), as for alerts.yml.
 groups:
   - name: payrun-kubernetes
     rules:

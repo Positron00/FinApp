@@ -82,7 +82,7 @@ describe("ApproveButton", () => {
   // PAY-401: the dual-approval message in role="alert", linked to the button.
   it("shows approver_must_differ in an alert", async () => {
     const msg =
-      "Dual approval is on: you can't approve this run because you calculated it, or you changed bank details for an employee in it. Ask another approver.";
+      "Dual approval is on: someone else must approve. You created, calculated or entered hours for this run, or changed bank details that a second person hasn't released yet.";
     stubApi(() => apiError(403, "approver_must_differ", msg));
     renderWithClient(<ApproveButton run={run} meId={USER_ID} />);
     await clickApprove();
@@ -94,13 +94,20 @@ describe("ApproveButton", () => {
     );
   });
 
-  // PAY-401: the hint when the current user calculated a dual-approval run.
-  it("hints when the user calculated the run", () => {
+  // PAY-401, C73: the hint when the current user calculated or created a dual-approval run, and
+  // none for someone who did neither or when dual approval is off.
+  it.each([
+    ["calculated", { created_by: "someone-else", calculated_by: USER_ID }, true],
+    ["created", { created_by: USER_ID, calculated_by: "someone-else" }, true],
+    ["did neither", { created_by: "someone-else", calculated_by: "someone-else" }, false],
+    ["dual off", { require_dual_approval: false }, false],
+  ])("hints when the user %s the run", (_name, over, shown) => {
     stubApi(() => undefined);
-    renderWithClient(
-      <ApproveButton run={payRun({ calculated_by: USER_ID }) as PayRun} meId={USER_ID} />,
+    renderWithClient(<ApproveButton run={payRun(over) as PayRun} meId={USER_ID} />);
+    const hint = screen.queryByText(
+      "You created or calculated this run. With dual approval on, another approver must approve it.",
     );
-    expect(screen.getByText(/You calculated this run/)).toBeTruthy();
+    expect(hint !== null).toBe(shown);
   });
 
   // PAY-400: a network error refetches the run; processing means it landed.
@@ -126,5 +133,33 @@ describe("ApproveButton", () => {
     renderWithClient(<ApproveButton run={run} meId={USER_ID} />);
     await clickApprove();
     expect((await screen.findByRole("alert")).textContent).toMatch(/couldn't be confirmed/);
+  });
+  // PAY-NFR-14 (web LLD §6.3): the confirm is a dialog; focus moves in, Escape closes it and focus
+  // returns to Approve, which stays mounted throughout.
+  it("moves focus into the confirm dialog and back to Approve on Escape", async () => {
+    const calls = stubApi(() => undefined);
+    renderWithClient(<ApproveButton run={run} meId={USER_ID} />);
+    const approveBtn = screen.getByRole("button", { name: "Approve" });
+    approveBtn.focus();
+    await userEvent.keyboard("{Enter}");
+    const dialog = screen.getByRole("alertdialog", { name: "Confirm approval" });
+    expect(screen.getByRole("button", { name: "Approve" })).toBe(approveBtn);
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Confirm approval" }));
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(document.activeElement).toBe(approveBtn);
+    expect(calls).toHaveLength(0);
+  });
+
+  // PAY-NFR-14: Cancel closes the dialog without a request and returns focus to Approve.
+  it("cancels without a request and returns focus", async () => {
+    const calls = stubApi(() => undefined);
+    renderWithClient(<ApproveButton run={run} meId={USER_ID} />);
+    await userEvent.click(screen.getByRole("button", { name: "Approve" }));
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Approve" }));
+    expect(calls).toHaveLength(0);
   });
 });

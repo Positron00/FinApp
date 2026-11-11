@@ -69,8 +69,8 @@ async def test_runtime_role_grants(migrated: PgBootstrapped) -> None:
 async def test_audit_log_stays_append_only_after_bootstrap_rerun(
     migrated: PgBootstrapped,
 ) -> None:
-    """C50: re-running 10-identity.sql (whose template re-grants DML) keeps UPDATE and DELETE
-    on identity.audit_log revoked."""
+    """PAY-606, C50: re-running 10-identity.sql (whose template re-grants DML) keeps UPDATE
+    and DELETE on identity.audit_log revoked."""
     rerun_bootstrap(migrated)
     conn = await connect(migrated, "identity_app")
     try:
@@ -99,8 +99,9 @@ async def test_purge_audit_log_deletes_only_older_rows(migrated: PgBootstrapped)
 
 
 async def test_purge_audit_log_clamps_the_cutoff(migrated: PgBootstrapped) -> None:
-    """C50, C63: a future (or any recent) cutoff is clamped to now() - 400 days, so the runtime
-    role can't wipe recent entries through the definer-rights function."""
+    """PAY-606, PAY-608, C50, C63: a future (or any recent) cutoff is clamped to
+    now() - 400 days, so the runtime role can't wipe recent entries through the definer-rights
+    function."""
     conn = await connect(migrated, "identity_app")
     try:
         await _insert_audit(conn, "now() - interval '399 days'")
@@ -113,7 +114,7 @@ async def test_purge_audit_log_clamps_the_cutoff(migrated: PgBootstrapped) -> No
 
 
 async def test_purge_function_is_not_public(admin_db: Any) -> None:
-    """C50: only identity_app (and the owner) can execute the purge function."""
+    """PAY-606, C50: only identity_app (and the owner) can execute the purge function."""
     acl = await admin_db.fetchval(
         "SELECT proacl::text FROM pg_proc "
         "WHERE oid = 'identity.purge_audit_log(timestamptz)'::regprocedure"

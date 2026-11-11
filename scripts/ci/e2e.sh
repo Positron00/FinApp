@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 # CI job `e2e` (platform LLD §3.15, §12; PAY-NFR-12, PAY-NFR-13, PAY-NFR-15; C38, C51, C65).
 #
-# Usage: E2E_SUITE=skeleton|full scripts/ci/e2e.sh     (default full; ci.yml sets skeleton until F3)
-#        E2E_KEEP_STACK=1 ...                          leave the stack running afterwards (debugging)
+# Usage: scripts/ci/e2e.sh                       the full suite (default; ci.yml since F6, C51)
+#        E2E_SUITE=skeleton scripts/ci/e2e.sh    only the walking skeleton (@skeleton)
+#        E2E_KEEP_STACK=1 ...                    leave the stack running afterwards (debugging)
 #
 #   1. scripts/dev-env.sh (throwaway secrets; an existing .env is kept), images via bake (the CI
 #      gha cache scopes of the images job), scripts/stack.sh up --check-startup (core, obs, test;
 #      every service ready <= 20 s after its migrations, PAY-NFR-15).
-#   2. Seed: skeleton `seed.py --skeleton`; full `seed.py` then `seed.py --employees 500` (C33).
-#   3. Playwright: skeleton `--grep @skeleton`; full `--grep @journeys` plus the trace and axe specs.
-#   4. Both suites: tests/platform/test_seed.py (when present), Schemathesis per service
-#      (after Playwright, C65), k6 smoke, the PR fault smoke tests (tests/resilience -m smoke, C38),
-#      check_metrics.sh.
+#   2. Seed: skeleton `seed.py --skeleton`; full `seed.py` then `seed.py --employees 500` (C33, C54).
+#   3. Playwright: skeleton `--grep @skeleton`; full `--grep "@journeys|@trace|@a11y"` (J1–J5,
+#      role changes, errors, the trace test and axe; web LLD §9.2).
+#   4. Both suites: tests/platform/test_seed.py -m stack (PAY-609), k6 smoke, Schemathesis per
+#      service (after Playwright and k6: its stateful phase deletes and changes seeded data; C65),
+#      the PR fault smoke tests (tests/resilience -m smoke, C38: slow DB and identity down; the
+#      other faults run nightly in nightly-resilience.sh), check_metrics.sh. The seed tests
+#      and the fault smoke must run every test: a skip (stack or summary missing) fails the job.
 # On failure the Compose logs go to ci-logs/compose.log; the stack is always torn down with -v.
 # shellcheck source=scripts/ci/lib.sh disable=SC1091  # followed with -x; single-file runs (pre-commit) cannot
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -38,11 +42,30 @@ on_failure_logs() {
 }
 on_exit on_failure_logs
 
+# all_ran LABEL JUNIT_XML: fail unless at least one test ran and none skipped. The stack suites
+# (test_seed.py, tests/resilience -m smoke) skip themselves when the stack or the seed summary is
+# missing; in this job a skip would turn a broken gate green.
+all_ran() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+label, path = sys.argv[1], sys.argv[2]
+root = ET.parse(path).getroot()
+suites = [root] if root.tag == "testsuite" else list(root)
+tests = sum(int(s.get("tests", 0)) for s in suites)
+skipped = sum(int(s.get("skipped", 0)) for s in suites)
+if tests == 0 or skipped:
+    sys.exit(f"{label}: {tests} test(s), {skipped} skipped; every test must run")
+print(f"{label}: {tests} test(s) ran")
+PY
+}
+
 group "dependencies"
 uv sync --locked --all-packages
 pnpm install --frozen-lockfile
 if [[ "${PLAYWRIGHT_SKIP_INSTALL:-0}" != 1 ]]; then
-  pnpm --filter web exec playwright install chromium # CI installs it with --with-deps first
+  pnpm --filter web exec playwright install chromium # CI installs it in a workflow step first
 fi
 
 group "dev-env and images"
@@ -68,35 +91,22 @@ else
   pnpm --filter web exec playwright test --grep "@journeys|@trace|@a11y"
 fi
 
-if [[ -f tests/platform/test_seed.py ]]; then
-  group "seed tests (PAY-609)"
-  uv run pytest -p no:cacheprovider tests/platform/test_seed.py
-else
-  log "tests/platform/test_seed.py does not exist yet: seed tests skipped (platform LLD §6.2)"
-fi
+group "seed tests (PAY-609)"
+uv run pytest -p no:cacheprovider tests/platform/test_seed.py -m stack --junitxml=ci-logs/seed-tests.xml
+all_ran "seed tests" ci-logs/seed-tests.xml
+
+group "k6 smoke"
+# Before Schemathesis: its stateful phase deletes the still-calculated runs.current of the full
+# seed and changes seeded users and settings (C65 only needs it after Playwright).
+# k6.sh maps a repo-relative SEED_JSON into its container; the absolute one is for Playwright.
+SEED_JSON=ci-logs/seed.json scripts/ci/k6.sh load/smoke.js
 
 group "schemathesis (identity, payroll, bank_stub)"
 scripts/ci/schemathesis.sh
 
-group "k6 smoke"
-# k6.sh maps a repo-relative SEED_JSON into its container; the absolute one is for Playwright.
-SEED_JSON=ci-logs/seed.json scripts/ci/k6.sh load/smoke.js
-
 group "fault smoke (tests/resilience -m smoke; C38)"
 uv run pytest -p no:cacheprovider tests/resilience -m smoke --junitxml=ci-logs/resilience-smoke.xml
-# The suite skips itself when the stack is unreachable; here that would hide a broken gate.
-python3 - ci-logs/resilience-smoke.xml <<'PY'
-import sys
-import xml.etree.ElementTree as ET
-
-root = ET.parse(sys.argv[1]).getroot()
-suites = [root] if root.tag == "testsuite" else list(root)
-tests = sum(int(s.get("tests", 0)) for s in suites)
-skipped = sum(int(s.get("skipped", 0)) for s in suites)
-if tests == 0 or skipped:
-    sys.exit(f"fault smoke: {tests} test(s), {skipped} skipped; every smoke test must run")
-print(f"fault smoke: {tests} test(s) ran")
-PY
+all_ran "fault smoke" ci-logs/resilience-smoke.xml
 
 group "metric names"
 scripts/ci/check_metrics.sh

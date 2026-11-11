@@ -1,8 +1,10 @@
 """Policy checks on the rendered Kubernetes overlays (platform LLD §6.2, §9; PAY-NFR-13).
 
 Each overlay (dev, uat, prod) is rendered with kustomize (no load-restrictor flag, C36) and checked:
-pod security, probes and resources, the C1 env contract, sampling (C23), the web's port and probes
-(C4), NetworkPolicies (ADR 0011), bank-stub placement and prod's payout-worker replicas (R14, C32),
+pod security, probes and resources, the C1 env contract, sampling (C23), the OTLP flush bound
+(C67; Compose's x-py-env is checked alongside), the web's port and probes (C4), NetworkPolicies
+(ADR 0011), bank-stub placement, prod's payout-worker replicas (R14, C32), the single-replica
+Collector gateway (§8.1),
 and ExternalSecrets without plaintext Secrets in uat and prod (R29).
 
 ``scripts/ci/manifests.sh`` sets ``K8S_RENDERED_DIR`` to the output it already validated with
@@ -231,6 +233,35 @@ def test_sampling_is_parentbased_always_on(rendered: dict[str, list[Obj]], env: 
     assert checked >= 5
 
 
+@pytest.mark.parametrize("env", ENVS)
+def test_python_deployments_bound_the_otlp_flush(rendered: dict[str, list[Obj]], env: str) -> None:
+    """PAY-408, C67: every Python Deployment sets OTEL_EXPORTER_OTLP_TIMEOUT (seconds) <= 3, so a
+    60 s drain plus three exporters flushed in turn to an unreachable Collector stay inside the
+    75 s grace (test_shutdown.py measures it at 3). Jobs and the web (JS exporter) are exempt."""
+    objs = rendered[env]
+    checked = []
+    for o in _of(objs, "Deployment"):
+        app = _app(o)
+        if app not in PAYRUN_APPS - {"web"}:
+            continue
+        for c in _containers(o):
+            value = _env_view(objs, c).get("OTEL_EXPORTER_OTLP_TIMEOUT")
+            assert value is not None, f"{env}:{app}"
+            assert 0 < int(value) <= 3, f"{env}:{app}: {value}"
+        checked.append(app)
+    expected = {"identity", "payroll", "payout-worker"} | (
+        {"bank-stub"} if env != "prod" else set()
+    )
+    assert set(checked) == expected
+
+
+def test_compose_python_services_bound_the_otlp_flush() -> None:
+    """PAY-408, C67: Compose's shared Python env (x-py-env) sets OTEL_EXPORTER_OTLP_TIMEOUT <= 3."""
+    compose = yaml.safe_load((ROOT / "deploy" / "compose" / "compose.yaml").read_text())
+    value = compose["x-py-env"]["OTEL_EXPORTER_OTLP_TIMEOUT"]
+    assert 0 < int(value) <= 3
+
+
 def test_prod_collector_tail_samples(rendered: dict[str, list[Obj]]) -> None:
     """R27, C23: only prod's Collector config has tail_sampling (errors, > 300 ms, 10%)."""
     for env in ENVS:
@@ -276,6 +307,20 @@ def test_prod_payout_worker_has_zero_replicas(rendered: dict[str, list[Obj]]) ->
     assert _named(rendered["prod"], "Deployment", "payout-worker")["spec"]["replicas"] == 0
     assert _named(rendered["uat"], "Deployment", "payout-worker")["spec"]["replicas"] == 2
     assert _named(rendered["dev"], "Deployment", "payout-worker")["spec"]["replicas"] == 1
+
+
+@pytest.mark.parametrize("env", ENVS)
+def test_collector_is_a_single_replica_gateway(rendered: dict[str, list[Obj]], env: str) -> None:
+    """PAY-NFR-10 (C77), platform LLD §8.1: one Collector per environment, so every span of a trace
+    reaches the same tail sampler (prod) and each series has one exporter. Rollouts recreate the pod
+    (a RollingUpdate surge would run two gateways at once), and the PDB still lets a drain evict it.
+    """
+    dep = _named(rendered[env], "Deployment", "otel-collector")
+    assert dep["spec"]["replicas"] == 1
+    assert dep["spec"]["strategy"] == {"type": "Recreate"}
+    pdb = _named(rendered[env], "PodDisruptionBudget", "otel-collector")["spec"]
+    assert pdb.get("maxUnavailable") == 1
+    assert "minAvailable" not in pdb
 
 
 def test_prod_bank_base_url_is_a_placeholder(rendered: dict[str, list[Obj]]) -> None:

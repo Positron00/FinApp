@@ -34,3 +34,59 @@ tests:
         exp_samples:
           - labels: 'provider:external_errors:ratio_rate5m{provider="bank"}'
             value: 0.1
+  - name: settlement p95 for runs settling in about 50 s lies in the 45-60 s bucket (PAY-NFR-06)
+    # SETTLEMENT_BUCKETS (pycommon.otel): ... 30, 45, 60, 90 ...; one run per minute, all in (45, 60].
+    interval: 1m
+    input_series:
+      - series: 'payroll_payout_settlement_seconds_bucket{le="30"}'
+        values: "0x70"
+      - series: 'payroll_payout_settlement_seconds_bucket{le="45"}'
+        values: "0x70"
+      - series: 'payroll_payout_settlement_seconds_bucket{le="60"}'
+        values: "0+1x70"
+      - series: 'payroll_payout_settlement_seconds_bucket{le="90"}'
+        values: "0+1x70"
+      - series: 'payroll_payout_settlement_seconds_bucket{le="+Inf"}'
+        values: "0+1x70"
+    promql_expr_test:
+      - expr: sli:payout_settlement_p95:1h
+        eval_time: 65m
+        exp_samples:
+          - labels: "sli:payout_settlement_p95:1h"
+            value: 59.25
+  - name: latency SLIs split reads from calculate/approve and skip health and telemetry routes (C4)
+    interval: 1m
+    input_series:
+      # reads: every request in (0.1, 0.2]; health and telemetry are slow but excluded
+      - series: 'bff_request_duration_seconds_bucket{route="/api/pay-runs", status="200", le="0.1"}'
+        values: "0x20"
+      - series: 'bff_request_duration_seconds_bucket{route="/api/pay-runs", status="200", le="0.2"}'
+        values: "0+10x20"
+      - series: 'bff_request_duration_seconds_bucket{route="/api/pay-runs", status="200", le="+Inf"}'
+        values: "0+10x20"
+      - series: 'bff_request_duration_seconds_bucket{route="/api/readyz", status="200", le="0.2"}'
+        values: "0x20"
+      - series: 'bff_request_duration_seconds_bucket{route="/api/readyz", status="200", le="+Inf"}'
+        values: "0+50x20"
+      - series: 'bff_request_duration_seconds_bucket{route="/api/telemetry", status="204", le="0.2"}'
+        values: "0x20"
+      - series: 'bff_request_duration_seconds_bucket{route="/api/telemetry", status="204", le="+Inf"}'
+        values: "0+50x20"
+      # heavy: calculate in (1, 1.5]; p95 is about 1.475 (float), so the case checks 1.4 < p95 < 1.5
+      - series: 'bff_request_duration_seconds_bucket{route="/api/pay-runs/[id]/calculate", status="200", le="1"}'
+        values: "0x20"
+      - series: 'bff_request_duration_seconds_bucket{route="/api/pay-runs/[id]/calculate", status="200", le="1.5"}'
+        values: "0+2x20"
+      - series: 'bff_request_duration_seconds_bucket{route="/api/pay-runs/[id]/calculate", status="200", le="+Inf"}'
+        values: "0+2x20"
+    promql_expr_test:
+      - expr: sli:bff_latency_p95:5m
+        eval_time: 10m
+        exp_samples:
+          - labels: "sli:bff_latency_p95:5m"
+            value: 0.195
+      - expr: (sli:bff_latency_heavy_p95:5m > bool 1.4) * (sli:bff_latency_heavy_p95:5m < bool 1.5)
+        eval_time: 10m
+        exp_samples:
+          - labels: "{}"
+            value: 1

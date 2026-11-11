@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import hashlib
 import math
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Final
 
 import redis.exceptions
+from opentelemetry.trace import Span
 from pycommon import Clock, SystemClock
 from pycommon.errors import ServiceUnavailable
+from pycommon.otel import tracer
 from pycommon.ratelimit import FailMode, Limit, RateLimiter
 from redis.asyncio import Redis
 
@@ -68,11 +71,15 @@ class AuthLimits:
         self._clock = clock or SystemClock()
         self.login = RateLimiter(redis, prefix=PREFIX, component="login", clock=self._clock)
         self.accept = RateLimiter(redis, prefix=PREFIX, component="accept", clock=self._clock)
+        self.reset = RateLimiter(redis, prefix=PREFIX, component="reset", clock=self._clock)
         window = s.identity_login_window_s
         closed = FailMode.closed
         self.login_ip = Limit("login_ip", s.auth_login_limit_ip, window, closed)
         self.login_account = Limit("login_account", s.auth_login_limit_account, window, closed)
         self.accept_ip = Limit("accept_ip", s.auth_login_limit_ip, window, closed)
+        # Reset requests are limited like login (PAY-105): per IP and per account, no lock.
+        self.reset_ip = Limit("reset_ip", s.auth_login_limit_ip, window, closed)
+        self.reset_account = Limit("reset_account", s.auth_login_limit_account, window, closed)
 
     @staticmethod
     def lock_key(ek: str) -> str:
@@ -145,10 +152,43 @@ class AuthLimits:
         except _REDIS_ERRORS as exc:
             self._backend_error(exc)
 
+    async def clear_lockout(self, ek: str) -> None:
+        """After a confirmed password reset or an accepted invite (C74): end the account's lock,
+        drop its level and the current window's level-0 failure count, so the next login starts
+        fresh. Only the mailbox owner holds the token, so this is the owner's way out of a lock
+        someone else caused. Best effort, like ``clear_level``: the password is already set, so
+        a Redis error is logged and counted, and the lock simply runs out (§6.4)."""
+        keys = (self.lock_key(ek), self.level_key(ek), self.account_counter_key(f"{ek}:0"))
+        try:
+            await self._redis.delete(*keys)
+        except _REDIS_ERRORS as exc:
+            self._backend_error(exc)
+
     async def check_accept(self, ip_subject: str) -> int | None:
-        """``accept_ip`` (R18); the ``Retry-After`` seconds when denied, else ``None``."""
-        decision = await self.accept.hit(self.accept_ip, ip_subject)
+        """``accept_ip`` (R18); the ``Retry-After`` seconds when denied, else ``None``.
+
+        Used by invite accept and reset confirm; traced as ``identity.ratelimit.check`` (§5.3).
+        """
+        with _check_span("accept") as span:
+            decision = await self.accept.hit(self.accept_ip, ip_subject)
+            span.set_attribute("identity.allowed", decision.allowed)
         return None if decision.allowed else decision.retry_after_s
+
+    async def check_reset(self, ip_subject: str, ek: str) -> int | None:
+        """``reset_ip`` then ``reset_account`` (§6.4); ``Retry-After`` when denied."""
+        with _check_span("reset") as span:
+            decision = await self.reset.hit(self.reset_ip, ip_subject)
+            if decision.allowed:
+                decision = await self.reset.hit(self.reset_account, ek)
+            span.set_attribute("identity.allowed", decision.allowed)
+        return None if decision.allowed else decision.retry_after_s
+
+
+def _check_span(component: str) -> AbstractContextManager[Span]:
+    """The ``identity.ratelimit.check`` span (§5.3); login opens its own in ``usecases/signin``."""
+    return tracer("identity").start_as_current_span(
+        "identity.ratelimit.check", attributes={"identity.component": component}
+    )
 
 
 def _ceil_s(pttl_ms: int) -> int:

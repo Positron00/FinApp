@@ -22,9 +22,11 @@ name="$(basename "$script" .js)"
 mkdir -p load/results
 
 # Credentials travel in the environment (k6 copies it into __ENV), never on a command line.
+# settlement.js (and the payouts reads of full.js/soak.js) approve as approver@payrun.example.com.
 LOAD_USER_EMAIL="$(val LOAD_USER_EMAIL)"
 LOAD_USER_PASSWORD="$(val LOAD_USER_PASSWORD)"
-export LOAD_USER_EMAIL LOAD_USER_PASSWORD
+SEED_APPROVER_PASSWORD="$(val SEED_APPROVER_PASSWORD)"
+export LOAD_USER_EMAIL LOAD_USER_PASSWORD SEED_APPROVER_PASSWORD
 common=(
   -e "BASE_URL=http://127.0.0.1:${web_port}"
   --summary-export "load/results/${name}.json"
@@ -36,7 +38,8 @@ if command -v k6 >/dev/null 2>&1; then
   exec k6 run "${common[@]}" -e "SEED_JSON=${seed_json//@ROOT@/$ROOT}" \
     -e "TARGET_URL=http://127.0.0.1:${web_port}" "$@" "$script"
 fi
-exec docker run --rm -i --network "${project:-payrun}_payrun" -e LOAD_USER_EMAIL -e LOAD_USER_PASSWORD \
+exec docker run --rm -i --network "${project:-payrun}_payrun" \
+  -e LOAD_USER_EMAIL -e LOAD_USER_PASSWORD -e SEED_APPROVER_PASSWORD \
   -u "$(id -u):$(id -g)" -v "$ROOT:/work" -w /work "$K6_IMAGE" \
   run "${common[@]}" -e "SEED_JSON=${seed_json//@ROOT@//work}" \
   -e "TARGET_URL=http://web:3000" "$@" "$script"

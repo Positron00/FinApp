@@ -6,6 +6,7 @@ admin DB re-check are covered by the integration suites.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Iterator
 
 import pytest
@@ -19,11 +20,25 @@ from tests.helpers import COMPANY_ID, make_settings, web_only_keyset
 USER = "0193a000-0000-7000-8000-0000000000aa"
 ROUTES = [
     ("POST", "/v1/auth/login", "public"),
+    ("POST", "/v1/auth/password-reset/request", "public"),
+    ("POST", "/v1/auth/password-reset/confirm", "public"),
     ("POST", "/v1/invites/accept", "public"),
     ("GET", "/v1/users/me", "user"),
     ("POST", "/v1/users/invite", "user"),
+    ("GET", "/v1/users", "user"),
+    ("PATCH", f"/v1/users/{USER}", "user"),
+    ("POST", f"/v1/invites/{USER}/resend", "user"),
+    ("GET", "/v1/audit-log", "user"),
 ]
 BODY = {"email": "a@b.example", "password": "x" * 12, "token": "t", "name": "A", "roles": ["admin"]}
+BODIES: dict[str, dict[str, object]] = {
+    "/v1/auth/login": {"email": BODY["email"], "password": BODY["password"]},
+    "/v1/auth/password-reset/request": {"email": BODY["email"]},
+    "/v1/auth/password-reset/confirm": {"token": BODY["token"], "password": BODY["password"]},
+    "/v1/invites/accept": {"token": BODY["token"], "password": BODY["password"]},
+    "/v1/users/invite": {"email": BODY["email"], "name": BODY["name"], "roles": BODY["roles"]},
+    f"/v1/users/{USER}": {"status": "inactive"},
+}
 
 
 @pytest.fixture
@@ -36,13 +51,7 @@ def client(token_factory: TokenFactory) -> Iterator[TestClient]:
 
 
 def _body(path: str) -> dict[str, object] | None:
-    if path == "/v1/auth/login":
-        return {"email": BODY["email"], "password": BODY["password"]}
-    if path == "/v1/invites/accept":
-        return {"token": BODY["token"], "password": BODY["password"]}
-    if path == "/v1/users/invite":
-        return {"email": BODY["email"], "name": BODY["name"], "roles": BODY["roles"]}
-    return None
+    return BODIES.get(path)
 
 
 def _call(c: TestClient, method: str, path: str, token: str | None) -> tuple[int, str]:
@@ -144,3 +153,18 @@ def test_livez(client: TestClient) -> None:
     """PAY-605: /livez needs no token and no dependency."""
     r = client.get("/livez")
     assert r.status_code == 200
+
+
+@pytest.mark.parametrize("path", ["/v1/users/invite", "/v1/users/me"])
+def test_patch_on_literal_user_paths_is_405(
+    client: TestClient, token_factory: TokenFactory, path: str
+) -> None:
+    """PAY-602, C65: PATCH /v1/users/{id} only matches a UUID, so a literal sibling path answers
+    405 with a complete Allow header rather than 422 (Schemathesis ST204)."""
+    token = token_factory.mint(
+        aud="identity", sub=str(uuid.uuid4()), cid=COMPANY_ID, roles=["admin"], name="Ann"
+    )
+    r = client.patch(path, json={}, headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 405
+    assert r.json()["error"]["code"] == "method_not_allowed"
+    assert "PATCH" not in r.headers["allow"]

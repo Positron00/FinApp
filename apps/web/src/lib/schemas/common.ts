@@ -9,9 +9,16 @@ export const DateTime = z.iso.datetime({ offset: true });
 export const Cents = z.number().int();
 export const Email = z.string().trim().toLowerCase().pipe(z.email().max(254));
 export const Password = z.string().min(12).max(256);
+/** Payroll's list cursors (maxLength 512). */
 export const Cursor = z
   .string()
   .max(512)
+  .regex(/^[A-Za-z0-9_-]+$/)
+  .optional();
+/** Identity's list cursors (maxLength 64). */
+export const IdentityCursor = z
+  .string()
+  .max(64)
   .regex(/^[A-Za-z0-9_-]+$/)
   .optional();
 export const Limit = z.coerce.number().int().min(1).max(100).default(50);

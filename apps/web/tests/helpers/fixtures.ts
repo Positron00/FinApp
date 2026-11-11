@@ -161,3 +161,80 @@ export function errorBody(code: string, details?: unknown) {
     },
   };
 }
+
+// ---- F5 fixtures (identity UserOut, PendingInviteOut, AuditEntryOut; payroll
+// CompanySettingsOut, HoursOut, AuditEventOut), every field as the service models (C5).
+
+export const TARGET_USER_ID = "0193a000-0000-7000-8000-0000000000a3";
+export const INVITE_ID = "0193a000-0000-7000-8000-0000000000f1";
+export const AUDIT_ID = "0193a000-0000-7000-8000-0000000000f2";
+
+export function user(over: Record<string, unknown> = {}) {
+  return {
+    id: TARGET_USER_ID,
+    email: "pat@payrun.example.com",
+    name: "Pat Pending",
+    roles: ["payroll_admin"],
+    roles_version: 1,
+    status: "pending",
+    created_at: TS,
+    updated_at: TS,
+    activated_at: null,
+    deactivated_at: null,
+    pending_invite_id: INVITE_ID,
+    ...over,
+  };
+}
+
+export function pendingInvite(over: Record<string, unknown> = {}) {
+  return { id: INVITE_ID, expires_at: null, email_status: "pending", ...over };
+}
+
+export function settings(over: Record<string, unknown> = {}) {
+  return {
+    name: "Acme Ltd",
+    tax_rate_bps: 2000,
+    retirement_bps: 500,
+    timezone: "America/New_York",
+    biweekly_anchor: "2026-01-05",
+    require_dual_approval: true,
+    updated_at: TS,
+    updated_by: USER_ID,
+    ...over,
+  };
+}
+
+export function hours(over: Record<string, unknown> = {}) {
+  return {
+    pay_run_id: RUN_ID,
+    status: "draft",
+    entries: [{ employee_id: EMPLOYEE_ID, hours_hundredths: 8050 }],
+    ...over,
+  };
+}
+
+export function authAuditEvent(over: Record<string, unknown> = {}) {
+  return {
+    id: AUDIT_ID,
+    at: TS,
+    actor_user_id: USER_ID,
+    event: "user.invited",
+    target_user_id: TARGET_USER_ID,
+    ip_hash: "abcd1234abcd1234",
+    details: { roles: ["payroll_admin"] },
+    ...over,
+  };
+}
+
+export function payrollAuditEvent(over: Record<string, unknown> = {}) {
+  return {
+    id: AUDIT_ID,
+    at: TS,
+    actor_id: USER_ID,
+    event: "employee.updated",
+    entity_type: "employee",
+    entity_id: EMPLOYEE_ID,
+    details: { fields: ["name"] },
+    ...over,
+  };
+}

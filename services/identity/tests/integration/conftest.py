@@ -255,6 +255,31 @@ class Harness:
             headers=self.web_headers(ip),
         )
 
+    def admin_headers(self, admin: UUID, ip: str | None = CLIENT_IP) -> dict[str, str]:
+        headers = self.user_headers(admin, ("admin",))
+        if ip is not None:
+            headers["X-Client-IP"] = ip
+        return headers
+
+    async def reset_request(self, email: str, *, ip: str | None = CLIENT_IP) -> httpx.Response:
+        return await self.client.post(
+            "/v1/auth/password-reset/request", json={"email": email}, headers=self.web_headers(ip)
+        )
+
+    async def reset_confirm(
+        self, token: str, password: str, *, ip: str | None = CLIENT_IP
+    ) -> httpx.Response:
+        return await self.client.post(
+            "/v1/auth/password-reset/confirm",
+            json={"token": token, "password": password},
+            headers=self.web_headers(ip),
+        )
+
+    async def patch_user(self, admin: UUID, target: UUID, body: Any) -> httpx.Response:
+        return await self.client.patch(
+            f"/v1/users/{target}", json=body, headers=self.admin_headers(admin)
+        )
+
     async def accept(self, token: str, password: str) -> httpx.Response:
         return await self.client.post(
             "/v1/invites/accept",
@@ -308,7 +333,9 @@ def harness(
     """``async with harness(**settings_overrides) as h``: a started app and a client.
 
     ``sender="capture"`` (the default) keeps emails in memory; ``sender="smtp"`` uses the real
-    SmtpSender against the aiosmtpd server. The relay task runs only with ``run_relay=True``.
+    SmtpSender against the aiosmtpd server. The relay task runs only with ``run_relay=True``,
+    and the maintenance runner only with ``run_maintenance=True`` (tests call its tasks
+    directly instead, so no tick lands in the middle of a test).
     """
 
     @asynccontextmanager
@@ -316,6 +343,7 @@ def harness(
         *,
         sender: str = "capture",
         run_relay: bool = False,
+        run_maintenance: bool = False,
         instrument: bool = False,
         clock: Any = None,
         **overrides: Any,
@@ -324,7 +352,12 @@ def harness(
         capture: CapturingSender | None = CapturingSender() if sender == "capture" else None
         email_sender: EmailSender | None = capture
         app = build_app(
-            s, instrument=instrument, clock=clock, sender=email_sender, run_relay=run_relay
+            s,
+            instrument=instrument,
+            clock=clock,
+            sender=email_sender,
+            run_relay=run_relay,
+            run_maintenance=run_maintenance,
         )
         async with run_app(app) as client:
             yield Harness(app, client, token_factory, capture)

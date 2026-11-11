@@ -1,5 +1,5 @@
 import { GET as fallbackGet, POST as fallbackPost } from "@/app/api/[...path]/route";
-import { DELETE as runDelete } from "@/app/api/pay-runs/[id]/route";
+import { POST as runPost } from "@/app/api/pay-runs/[id]/route";
 import { GET as livez } from "@/app/api/livez/route";
 import { GET as listRuns } from "@/app/api/pay-runs/route";
 import { GET as readyz } from "@/app/api/readyz/route";
@@ -61,12 +61,12 @@ describe("fallbacks", () => {
 
   // PAY-602, PAY-604: an unexported method → 405 with Allow and the standard headers.
   it("unexported method → 405 method_not_allowed", async () => {
-    const res = await runDelete(
-      makeReq(`/api/pay-runs/${RUN_ID}`, { method: "DELETE" }),
+    const res = await runPost(
+      makeReq(`/api/pay-runs/${RUN_ID}`, { method: "POST" }),
       params({ id: RUN_ID }),
     );
     expect(res.status).toBe(405);
-    expect(res.headers.get("allow")).toBe("GET");
+    expect(res.headers.get("allow")).toBe("GET, DELETE");
     expect(res.headers.get("x-trace-id")).toMatch(/^[0-9a-f]{32}$/);
     expect(res.headers.get("cache-control")).toBe("no-store");
   });

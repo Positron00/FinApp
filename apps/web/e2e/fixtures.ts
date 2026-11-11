@@ -12,7 +12,7 @@ import { authDir } from "./helpers/env";
  * - `apiFetch(page, path, init)` runs `fetch` inside the page, so cookies and Origin behave as in
  *   the browser (testing.md §6).
  */
-function watchCsp(page: Page, violations: string[]): void {
+export function watchCsp(page: Page, violations: string[]): void {
   page.on("console", (msg) => {
     if (msg.text().includes("Content Security Policy")) violations.push(msg.text());
   });
@@ -72,6 +72,8 @@ export async function apiFetch(
   urlPath: string,
   init: { method?: string; headers?: Record<string, string>; body?: unknown } = {},
 ): Promise<InPageResponse> {
+  // fetch needs a document on the app's origin; a fresh page is on about:blank.
+  if (!page.url().startsWith("http")) await page.goto("/api/livez");
   return page.evaluate(
     async ({ urlPath, init }) => {
       const res = await fetch(urlPath, {

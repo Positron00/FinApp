@@ -9,6 +9,7 @@ from identity import paths
 
 
 def test_repo_layout() -> None:
+    """PAY-605: in the repo, the migrations dir (readiness's head check) is found."""
     found = paths.migrations_dir()
     assert found == paths.MIGRATIONS_DIR
     assert (found / "env.py").is_file()
@@ -23,7 +24,8 @@ def _fake_module(root: Path) -> Path:
 
 
 def test_image_layout_non_editable_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """/app/.venv/…/site-packages/identity/paths.py → /app/migrations (not the venv's lib dir)."""
+    """PAY-605: /app/.venv/…/site-packages/identity/paths.py → /app/migrations (not the
+    venv's lib dir)."""
     app = tmp_path / "app"
     (app / "migrations").mkdir(parents=True)
     (app / "migrations" / "env.py").touch()
@@ -33,6 +35,7 @@ def test_image_layout_non_editable_install(tmp_path: Path, monkeypatch: pytest.M
 
 
 def test_not_found_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """PAY-605: no migrations dir anywhere → FileNotFoundError, never a wrong path."""
     monkeypatch.setattr(paths, "__file__", str(_fake_module(tmp_path / "elsewhere")))
     monkeypatch.chdir(tmp_path)
     with pytest.raises(FileNotFoundError, match="identity migrations"):

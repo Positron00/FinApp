@@ -60,6 +60,11 @@ def create_metrics() -> IdentityMetrics:
         "identity_emails_failed", unit="1", description="Emails that reached status failed (R25)"
     )
     emails_failed.add(0)
+    # Every outcome exports 0 from the start (C21, C72): SigninFailuresSpike reads
+    # increase(auth_signins_total{outcome="failure"}), which misses failures that arrive before
+    # the series exists.
+    for outcome in ("success", "failure", "rate_limited"):
+        signins.add(0, {"outcome": outcome})
     hash_seconds = histogram(
         "identity_password_hash_seconds",
         unit="s",

@@ -5,19 +5,33 @@
 from __future__ import annotations
 
 import logging
-from typing import Final, Literal
+from typing import Final, Literal, cast
 from uuid import UUID
 
 from pycommon.errors import AppError
 from pycommon.logging import get_logger, log_event
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from payroll.api.schemas import PayoutCounts, PayRunOut, RunTotalsOut
+from payroll.api.schemas import (
+    AttemptOut,
+    PayoutCounts,
+    PayoutOut,
+    PayoutStatusName,
+    PayRunOut,
+    RunTotalsOut,
+)
 from payroll.crypto import FieldDecryptError, FieldKeyring
-from payroll.db.models import PayRun
-from payroll.db.repositories import PayRunRepo
+from payroll.db.models import Payout, PayoutAttempt, PayRun
+from payroll.db.repositories import AttemptRepo, PayoutRepo, PayRunRepo
 
-__all__ = ["DecryptFailed", "decrypt_or_500", "pay_run_out", "pay_run_view"]
+__all__ = [
+    "DecryptFailed",
+    "decrypt_or_500",
+    "pay_run_out",
+    "pay_run_view",
+    "payout_out",
+    "payout_view",
+]
 
 _log: Final = get_logger("payroll.crypto")
 
@@ -92,3 +106,27 @@ async def pay_run_view(session: AsyncSession, company_id: UUID, run_id: UUID) ->
     """Re-read the run (fresh values) plus its counts."""
     run = await PayRunRepo.get(session, company_id, run_id)
     return pay_run_out(run, await PayRunRepo.counts(session, company_id, run_id))
+
+
+def payout_out(p: Payout, employee_name: str, attempts: list[PayoutAttempt]) -> PayoutOut:
+    """PAY-501, C5: the payout with its attempt history (``account_last4`` only)."""
+    return PayoutOut(
+        id=p.id,
+        pay_run_id=p.pay_run_id,
+        payslip_id=p.payslip_id,
+        employee_id=p.employee_id,
+        employee_name=employee_name,
+        amount_cents=p.amount_cents,
+        currency="USD",
+        status=cast(PayoutStatusName, p.status),
+        no_transfer=p.no_transfer,
+        current_attempt=p.current_attempt,
+        attempts=[AttemptOut.model_validate(a) for a in attempts],
+    )
+
+
+async def payout_view(session: AsyncSession, company_id: UUID, payout_id: UUID) -> PayoutOut:
+    """Re-read one payout (fresh values) with its attempts, for the retry and resolve bodies."""
+    payout, name = await PayoutRepo.with_name(session, company_id, payout_id)
+    attempts = await AttemptRepo.for_payouts(session, company_id, [payout_id])
+    return payout_out(payout, name, attempts[payout_id])

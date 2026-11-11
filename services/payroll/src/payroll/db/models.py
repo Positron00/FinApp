@@ -195,6 +195,7 @@ class PayoutAttempt(_Timestamps, Base):
     requested_at: Mapped[datetime] = _ts(nullable=False)
     last_published_at: Mapped[datetime] = _ts(nullable=False)
     needs_operator_at: Mapped[datetime | None] = _ts()
+    resolved_by: Mapped[str | None] = mapped_column(Text)  # last operator resolve (C73)
     publish_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
     final_at: Mapped[datetime | None] = _ts()
 

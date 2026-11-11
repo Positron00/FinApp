@@ -3,10 +3,14 @@
 #
 # Usage: scripts/ci/nightly-resilience.sh
 #
-# Stack up (core, obs, test), the skeleton seed, then every fault test in tests/resilience (plan
-# §12.1), not only the PR smoke subset. Fails if any test is skipped: a skip here means the stack
-# wasn't reachable, which would hide the gate. Today the suite holds the slow-DB test; the rest
-# of the faults arrive with task H1 and run here unchanged.
+# Stack up (core, obs, test), the skeleton seed, then every fault test in tests/resilience (HLD §4,
+# plan §12.1; task H1), not only the PR smoke subset: worker crash before and after the bank call,
+# bank down then up, bank timeout after settling, bank-stub restart, payroll down, Redis down,
+# Redis FLUSHALL, Redis restart (PAY-NFR-15), Postgres down, slow DB, identity down, SMTP down.
+# Payout timing is production's (C53), so the bank-down, payroll-down and FLUSHALL tests each wait
+# out a re-publish (about 8 minutes); the whole suite takes about 28 minutes (27.6 measured 2026-11-11). Fails if any test
+# is skipped: a skip here means the stack wasn't reachable, which would hide the gate. --durations
+# prints the slowest tests, for the job's timeout (C70).
 # shellcheck source=scripts/ci/lib.sh disable=SC1091  # followed with -x; single-file runs (pre-commit) cannot
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 need docker uv python3
@@ -23,7 +27,7 @@ group "seed"
 uv run python scripts/seed.py --skeleton --out ci-logs/seed.json
 
 group "tests/resilience (all faults)"
-uv run pytest -p no:cacheprovider tests/resilience -rs --junitxml=ci-logs/resilience.xml
+uv run pytest -p no:cacheprovider tests/resilience -rs --durations=0 --junitxml=ci-logs/resilience.xml
 python3 - ci-logs/resilience.xml <<'PY'
 import sys
 import xml.etree.ElementTree as ET

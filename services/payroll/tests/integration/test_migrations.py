@@ -1,4 +1,4 @@
-"""Migrations up, down and up; the settings seed (design §2.11; PAY-200, PAY-606)."""
+"""Migrations up, down and up; the settings seed (design §2.11; PAY-200, PAY-606, C73)."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from tests.integration.conftest import TABLES, admin_connect
 pytestmark = pytest.mark.integration
 
 SERVICE_DIR = find_repo_root() / "services" / "payroll"
+HEAD = "0003_c73_four_eyes"
 
 
 @pytest.fixture
@@ -38,23 +39,50 @@ async def _version(conn: Any) -> str | None:
     return value
 
 
+async def _audit_privileges(conn: Any) -> set[str]:
+    rows = await conn.fetch(
+        "SELECT privilege_type FROM information_schema.role_table_grants "
+        "WHERE table_schema = 'payroll' AND table_name = 'audit_events' "
+        "AND grantee = 'payroll_app'"
+    )
+    return {r["privilege_type"] for r in rows}
+
+
+async def _has_resolved_by(conn: Any) -> bool:
+    return bool(
+        await conn.fetchval(
+            "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'payroll' "
+            "AND table_name = 'payout_attempts' AND column_name = 'resolved_by'"
+        )
+    )
+
+
 async def test_upgrade_downgrade_upgrade(
     migrated: PgBootstrapped, as_migrator: Config, db: Any
 ) -> None:
-    """PAY-606: head → down one step (seed removed) → base (tables gone) → head again."""
+    """PAY-606, C73: head → 0002 (resolved_by gone, audit DML re-granted) → 0001 (seed removed)
+    → base (tables gone) → head again (audit append-only, resolved_by back)."""
     conn = await admin_connect(migrated)
     try:
         assert await _tables(conn) >= set(TABLES)
-        assert await _version(conn) == "0002_seed_company_settings"
+        assert await _version(conn) == HEAD
+        assert await _audit_privileges(conn) == {"SELECT", "INSERT"}
+        assert await _has_resolved_by(conn)
         await conn.execute("TRUNCATE payroll.company_settings CASCADE")
         command.upgrade(as_migrator, "head")  # re-running is a no-op
+        command.downgrade(as_migrator, "-1")
+        assert await _version(conn) == "0002_seed_company_settings"
+        assert await _audit_privileges(conn) == {"SELECT", "INSERT", "UPDATE", "DELETE"}
+        assert not await _has_resolved_by(conn)
         command.downgrade(as_migrator, "-1")
         assert await _version(conn) == "0001_initial_schema"
         command.downgrade(as_migrator, "base")
         assert await _tables(conn) == {"alembic_version"}
         command.upgrade(as_migrator, "head")
         assert await _tables(conn) >= set(TABLES)
-        assert await _version(conn) == "0002_seed_company_settings"
+        assert await _version(conn) == HEAD
+        assert await _audit_privileges(conn) == {"SELECT", "INSERT"}
+        assert await _has_resolved_by(conn)
     finally:
         await conn.close()
 

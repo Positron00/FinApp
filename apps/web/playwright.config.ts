@@ -6,8 +6,12 @@ import { defineConfig, devices } from "@playwright/test";
 
 /**
  * Playwright against the running Compose stack (web LLD §9.2; C12, C51).
- * Start it first: `scripts/stack.sh up` then `scripts/seed.py --skeleton --out ci-logs/seed.json`.
- * Run: `pnpm --filter web exec playwright test --grep @skeleton`.
+ * Start it first: `scripts/stack.sh up`, then the full seed
+ * `scripts/seed.py --out ci-logs/seed.json && scripts/seed.py --employees 500 --out ci-logs/seed.json`.
+ * Run: `pnpm --filter web exec playwright test --grep "@journeys|@trace|@a11y"` (the full suite;
+ * scripts/ci/e2e.sh), or `--grep @skeleton` on `seed.py --skeleton` (C51).
+ * Specs run one at a time in file order (workers: 1): the journeys share one company, and the
+ * fault tests (identity stopped, Toxiproxy proxies disabled) must not overlap other specs.
  *
  * Settings come from the environment, else from the repo's `.env` (written by scripts/dev-env.sh);
  * no value is ever printed. The browser always uses 127.0.0.1, never localhost (C12).
@@ -31,6 +35,7 @@ function loadDotEnv(file: string): void {
 }
 loadDotEnv(path.join(repoRoot, ".env"));
 
+process.env.E2E_REPO_ROOT ??= repoRoot;
 process.env.SEED_JSON ??= path.join(repoRoot, "ci-logs/seed.json");
 process.env.E2E_AUTH_DIR ??= path.join(repoRoot, "ci-logs/e2e-auth");
 const baseURL = process.env.BASE_URL ?? `http://127.0.0.1:${process.env.WEB_PORT ?? "4100"}`;

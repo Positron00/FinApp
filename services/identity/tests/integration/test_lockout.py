@@ -11,10 +11,11 @@ from identity.limits import AuthLimits
 from pycommon.testing import FakeClock, OtelMemory
 
 from tests.helpers import AUDIT_KEY, PRODUCTION_ARGON2
-from tests.integration.conftest import Harness, HarnessFactory
+from tests.integration.conftest import Harness, HarnessFactory, token_in
 
 PW = "correct horse battery staple"
 BAD = "wrong password!!"
+NEW_PW = "a brand new passphrase"
 PRODUCTION_LIMITS = {
     "auth_login_limit_account": 5,
     "auth_login_limit_ip": 20,
@@ -139,3 +140,53 @@ async def test_lockout_production_values(  # noqa: PLR0915  (one scripted scenar
     assert signins["success"] == 11  # ann once, carl ten times
     assert signins["rate_limited"] >= 8
     assert signins["failure"] >= 45
+
+
+async def lock_out(h: Harness, email: str, ip: str) -> None:
+    """Five failures and a sixth attempt from someone else's IP: the account is locked."""
+    await fail_n(h, email, 5, ip=ip)
+    r = await h.login(email, BAD, ip=ip)
+    assert (r.status_code, int(r.headers["retry-after"])) == (429, 60)
+
+
+async def test_reset_confirm_clears_the_lockout(
+    harness: HarnessFactory, redis_admin_client: aioredis.Redis
+) -> None:
+    """PAY-104, PAY-105, C74: an attacker who locks an account (from any IP) can't keep its
+    owner out: a confirmed reset deletes the lock, its level and the level-0 failure count, so
+    the owner signs in at once with the new password, and the next lock starts at level 1."""
+    async with harness(clock=FakeClock(), **PRODUCTION_LIMITS) as h:
+        await h.create_user("ann@example.com", password=PW)
+        await lock_out(h, "ann@example.com", ip="203.0.113.66")
+        assert (await h.login("ann@example.com", PW)).status_code == 429  # R15: locked
+        assert (await h.reset_request("ann@example.com")).status_code == 202
+        assert h.sender is not None
+        await h.rt.relay.run_once()
+        token = token_in(h.sender.messages[-1])
+        assert (await h.reset_confirm(token, NEW_PW)).status_code == 200
+        for key in (
+            AuthLimits.lock_key(ek("ann@example.com")),
+            AuthLimits.level_key(ek("ann@example.com")),
+        ):
+            assert await redis_admin_client.exists(key) == 0
+        assert (await h.login("ann@example.com", NEW_PW)).status_code == 200
+        # The attacker starts over: five more 401s, then a level-1 (60 s) lock again.
+        await lock_out(h, "ann@example.com", ip="203.0.113.66")
+
+
+async def test_invite_accept_clears_a_lockout_on_the_pending_email(harness: HarnessFactory) -> None:
+    """PAY-103, PAY-104, C74: failed logins against an invited (pending) email lock it like any
+    other; accepting the invite clears the lock, so the new user can sign in at once."""
+    async with harness(clock=FakeClock(), **PRODUCTION_LIMITS) as h:
+        admin = await h.create_user("admin@example.com", password=PW)
+        r = await h.client.post(
+            "/v1/users/invite",
+            json={"email": "bea@example.com", "name": "Bea", "roles": ["approver"]},
+            headers=h.user_headers(admin, ("admin",)),
+        )
+        assert r.status_code == 201, r.text
+        await lock_out(h, "bea@example.com", ip="203.0.113.66")
+        assert h.sender is not None
+        await h.rt.relay.run_once()
+        assert (await h.accept(token_in(h.sender.messages[-1]), NEW_PW)).status_code == 200
+        assert (await h.login("bea@example.com", NEW_PW)).status_code == 200

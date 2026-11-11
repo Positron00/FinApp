@@ -29,6 +29,7 @@ from tests.helpers import COMPANY_ID, OTHER_COMPANY_ID, employee_body, make_sett
 PAYROLL_ADMIN = str(UUID("0193a000-0000-7000-8000-0000000000a1"))
 APPROVER = str(UUID("0193a000-0000-7000-8000-0000000000a2"))
 ADMIN = str(UUID("0193a000-0000-7000-8000-0000000000a3"))
+APPROVER_2 = str(UUID("0193a000-0000-7000-8000-0000000000a4"))  # a second approver (C73)
 WORKER = "service:payout-worker"
 TABLES = (
     "idempotency_keys",
@@ -158,6 +159,9 @@ class Api:
     def approver(self, **kw: Any) -> dict[str, str]:
         return self.headers(APPROVER, ("approver",), **kw)
 
+    def approver2(self, **kw: Any) -> dict[str, str]:
+        return self.headers(APPROVER_2, ("approver",), **kw)
+
     def admin(self, **kw: Any) -> dict[str, str]:
         return self.headers(ADMIN, ("admin",), **kw)
 
@@ -230,6 +234,38 @@ class Api:
             f"/v1/internal/payouts/{payout_id}/result", json=body, headers=h
         )
 
+    async def retry(
+        self,
+        run_id: str,
+        payout_id: str,
+        *,
+        key: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        h = dict(headers or self.approver())
+        if key is not None:
+            h["Idempotency-Key"] = key
+        return await self.client.post(f"/v1/pay-runs/{run_id}/payouts/{payout_id}/retry", headers=h)
+
+    async def resolve(
+        self,
+        run_id: str,
+        payout_id: str,
+        action: str,
+        note: str = "checked the bank: no transfer",
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        return await self.client.post(
+            f"/v1/pay-runs/{run_id}/payouts/{payout_id}/resolve",
+            json={"action": action, "note": note},
+            headers=headers or self.approver(),
+        )
+
+    async def mark_outbox_sent(self, db: Any) -> None:
+        """Stand in for the relay: every unsent outbox row counts as published."""
+        await db.execute("UPDATE payroll.outbox SET sent_at = now() WHERE sent_at IS NULL")
+
 
 ApiFactory = Callable[..., Awaitable[Api]]
 
@@ -240,9 +276,15 @@ async def api_factory(
 ) -> AsyncIterator[ApiFactory]:
     async with contextlib.AsyncExitStack() as stack:
 
-        async def make(*, relay: bool = False, instrument: bool = False, **over: Any) -> Api:
+        async def make(
+            *,
+            relay: bool = False,
+            instrument: bool = False,
+            maintenance: bool = False,
+            **over: Any,
+        ) -> Api:
             settings = settings_for(migrated, redis_acl, token_factory, **over)
-            app = build_app(settings, instrument=instrument, relay=relay)
+            app = build_app(settings, instrument=instrument, relay=relay, maintenance=maintenance)
             await stack.enter_async_context(app.router.lifespan_context(app))
             transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
             client = await stack.enter_async_context(

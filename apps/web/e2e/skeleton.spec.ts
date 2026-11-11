@@ -43,8 +43,11 @@ test.describe("@skeleton", () => {
       await page.goto(runPath);
       await expect(page.getByRole("heading", { level: 1, name: /^Pay run / })).toBeVisible();
       await expect(runBadge(page, /^∑\s*Calculated$/)).toBeVisible();
-      // Dual approval: the owner calculated this run, so another approver must approve (PAY-401).
-      await expect(page.getByText("You calculated this run.", { exact: false })).toBeVisible();
+      // Dual approval: the owner created and calculated this run, so another approver must approve
+      // (PAY-401, C73).
+      await expect(
+        page.getByText("You created or calculated this run.", { exact: false }),
+      ).toBeVisible();
     });
 
     await test.step("axe: no serious or critical violations on the run page (PAY-NFR-14)", async () => {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import timedelta
 from typing import Any
 from uuid import UUID
@@ -287,3 +288,112 @@ async def test_accept_is_public_only_and_ip_limited(harness: HarnessFactory) -> 
         assert int(r.headers["retry-after"]) >= 1
         # Another IP still has its own bucket.
         assert (await h.accept("x", NEW_PW)).status_code == 400
+
+
+async def resend(h: Harness, admin: UUID, invite_id: object) -> Any:
+    return await h.client.post(f"/v1/invites/{invite_id}/resend", headers=h.admin_headers(admin))
+
+
+async def test_resend_revokes_the_old_token_and_queues_a_new_invite(
+    harness: HarnessFactory, admin_db: Any, caplog_json: JsonLogCapture
+) -> None:
+    """PAY-102, R17, C31: 200 PendingInviteOut for a new invite (expires_at null until sent,
+    email_status pending); the old token then gives invite_invalid; the new email's token
+    accepts; user.invite_resent is audited with both invite ids and the client's ip_hash."""
+    async with harness() as h:
+        admin = await h.create_user("admin@example.com", password=PW)
+        created = (await invite(h, admin)).json()
+        old_token = await send_and_get_token(h)
+        r = await resend(h, admin, created["pending_invite_id"])
+        assert r.status_code == 200, r.text
+        out = r.json()
+        assert out["expires_at"] is None
+        assert out["email_status"] == "pending"
+        assert out["id"] != created["pending_invite_id"]
+        listed = await h.client.get("/v1/users", headers=h.admin_headers(admin))
+        bea = next(u for u in listed.json()["items"] if u["id"] == created["id"])
+        assert bea["pending_invite_id"] == out["id"]
+        r = await h.accept(old_token, NEW_PW)
+        assert (r.status_code, r.json()["error"]["code"]) == (400, "invite_invalid")
+        new_token = await send_and_get_token(h)
+        assert new_token != old_token
+        assert (await h.accept(new_token, NEW_PW)).status_code == 200
+    invites = await admin_db.fetch(
+        "SELECT id, status, revoked_at FROM identity.invites ORDER BY id"
+    )
+    assert [(str(i["id"]), i["status"]) for i in invites] == [
+        (created["pending_invite_id"], "revoked"),
+        (out["id"], "accepted"),
+    ]
+    assert invites[0]["revoked_at"] is not None
+    [audit] = await admin_db.fetch(
+        "SELECT * FROM identity.audit_log WHERE event = 'user.invite_resent'"
+    )
+    assert (audit["actor_user_id"], str(audit["target_user_id"])) == (admin, created["id"])
+    assert json.loads(audit["details"]) == {
+        "invite_id": out["id"],
+        "revoked_invite_id": created["pending_invite_id"],
+    }
+    assert audit["ip_hash"] == ip_hash(CLIENT_IP, AUDIT_KEY.encode())
+    [log] = caplog_json.events("user.invite_resent")
+    assert (log["invite_id"], log["revoked_invite_id"]) == (out["id"], created["pending_invite_id"])
+
+
+async def test_resend_before_the_first_send_cancels_the_unsent_email(
+    harness: HarnessFactory, admin_db: Any
+) -> None:
+    """PAY-102, PAY-110: resending before the relay sent the first email cancels that email,
+    so exactly one message goes out; a stale (revoked) invite id still works for resend."""
+    async with harness() as h:
+        admin = await h.create_user("admin@example.com", password=PW)
+        first = (await invite(h, admin)).json()["pending_invite_id"]
+        assert (await resend(h, admin, first)).status_code == 200
+        assert (await resend(h, admin, first)).status_code == 200  # stale id: same user
+        await h.rt.relay.run_once()
+        assert h.sender is not None
+        assert len(h.sender.messages) == 1
+    rows = await admin_db.fetch("SELECT status FROM identity.email_outbox ORDER BY id")
+    assert [r["status"] for r in rows] == ["cancelled", "cancelled", "sent"]
+    statuses = [
+        r["status"] for r in await admin_db.fetch("SELECT status FROM identity.invites ORDER BY id")
+    ]
+    assert statuses == ["revoked", "revoked", "pending"]
+
+
+async def test_resend_errors(harness: HarnessFactory, admin_db: Any) -> None:
+    """PAY-102, PAY-602, PAY-601: an active user's invite → 409 invite_not_pending; an unknown
+    id, or another company's invite → 404 invite_not_found; a non-admin → 403."""
+    async with harness() as h:
+        admin = await h.create_user("admin@example.com", password=PW)
+        await invite(h, admin)
+        token = await send_and_get_token(h)
+        invite_id = await admin_db.fetchval("SELECT id FROM identity.invites")
+        assert (await h.accept(token, NEW_PW)).status_code == 200
+        r = await resend(h, admin, invite_id)
+        assert (r.status_code, r.json()["error"]["code"]) == (409, "invite_not_pending")
+        r = await resend(h, admin, "0193a000-0000-7000-8000-0000000000ff")
+        assert (r.status_code, r.json()["error"]["code"]) == (404, "invite_not_found")
+        await admin_db.execute(
+            "UPDATE identity.invites SET company_id = '0193a000-0000-7000-8000-0000000000ee'"
+        )
+        r = await resend(h, admin, invite_id)
+        assert (r.status_code, r.json()["error"]["code"]) == (404, "invite_not_found")
+        approver = await h.create_user("ap@example.com", password=PW, roles=("approver",))
+        r = await resend(h, approver, invite_id)
+        assert (r.status_code, r.json()["error"]["code"]) == (403, "forbidden_role")
+        r = await h.client.post(f"/v1/invites/{invite_id}/resend", headers=h.web_headers())
+        assert (r.status_code, r.json()["error"]["code"]) == (403, "forbidden_role")
+
+
+async def test_concurrent_resends_leave_one_pending_invite(
+    harness: HarnessFactory, admin_db: Any
+) -> None:
+    """PAY-102: concurrent resends serialise on the user row; exactly one invite stays pending
+    and the others are revoked."""
+    async with harness() as h:
+        admin = await h.create_user("admin@example.com", password=PW)
+        first = (await invite(h, admin)).json()["pending_invite_id"]
+        results = await asyncio.gather(*(resend(h, admin, first) for _ in range(3)))
+        assert [r.status_code for r in results] == [200, 200, 200]
+    statuses = [r["status"] for r in await admin_db.fetch("SELECT status FROM identity.invites")]
+    assert sorted(statuses) == ["pending", "revoked", "revoked", "revoked"]

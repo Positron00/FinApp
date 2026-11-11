@@ -3,10 +3,11 @@
 #
 # Usage: scripts/ci/check_metrics.sh      (against the running stack; e2e.sh runs it last)
 #
-# Queries /api/v1/series on 127.0.0.1:$PROMETHEUS_PORT for each name below and fails listing the
-# missing ones. This guards the metric-naming rule (unit suffixes and _total added by the
-# Collector's Prometheus exporter): a renamed instrument breaks dashboards and alerts silently,
-# so it breaks CI instead. Waits up to CHECK_METRICS_WAIT_S (default 90 s) for late series, since
+# Queries /api/v1/series on 127.0.0.1:$PROMETHEUS_PORT for each entry below and fails listing the
+# missing ones. An entry is a metric name, or a full series selector when it contains `{` (a
+# pre-initialised label set an alert reads, which the bare name would not prove). This guards the
+# metric-naming rule (unit suffixes and _total added by the Collector's Prometheus exporter): a
+# renamed instrument breaks dashboards and alerts silently, so it breaks CI instead. Waits up to CHECK_METRICS_WAIT_S (default 90 s) for late series, since
 # the SDKs export every 15 s and Prometheus scrapes every 15 s.
 # shellcheck source=scripts/ci/lib.sh disable=SC1091  # followed with -x; single-file runs (pre-commit) cannot
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -22,27 +23,38 @@ REQUIRED=(
   payroll_payout_settlement_seconds_count    # payroll (SETTLEMENT_BUCKETS)
   identity_emails_pending                    # identity
   rate_limiter_errors_total                  # pycommon RateLimiter, pre-initialised
+  # the web limiter's series, pre-initialised at server start (RateLimiterErrors; C72, C77)
+  'rate_limiter_errors_total{service_name="web",component="web"}'
   redis_stream_length                        # redis_exporter --check-single-streams
   pg_up                                      # postgres-exporter
   otelcol_exporter_sent_spans                # Collector self-metrics: 0.164 has no _total (C65)
-)
-# The scrape-free payroll gauges arrive with task F4a (C65). Listed so the gap stays visible;
-# move them into REQUIRED when F4a lands.
-NOT_YET=(
+  outbox_unsent                              # payroll collection-time gauges (F4a; R26, C18)
   outbox_oldest_age_seconds
   payroll_payouts_stuck
   payroll_runs_processing_oldest_age_seconds
   payroll_attempts_needs_operator
+  payroll_late_settlements_total             # pre-initialised to 0 (PayoutLateSettlement, C71)
+  identity_emails_failed_total               # identity, pre-initialised (EmailOutboxStuck)
+  identity_email_oldest_pending_age_seconds  # identity collection-time gauge (EmailOutboxStuck)
+  redis_memory_used_bytes                    # redis_exporter (RedisMemoryHigh)
+  redis_memory_max_bytes
+  queue_dlq_messages                         # worker collection-time gauge (Queues, PayoutDLQ drill)
+  process_memory_usage_bytes                 # Python services' RSS (nightly soak resources gate)
+  # identity pre-initialises every outcome at start, so this exists before any sign-in
+  # (SigninFailuresSpike; C77)
+  'auth_signins_total{service_name="identity",outcome="failure"}'
+  external_request_duration_seconds_count    # pycommon ResilientClient histogram (Bank dashboard)
 )
 
 port="${PROMETHEUS_PORT:-$(env_val PROMETHEUS_PORT)}"
 [[ -n "$port" ]] || die "PROMETHEUS_PORT is not set and not in .env (run scripts/dev-env.sh)"
 url="http://127.0.0.1:$port"
 
-present() { # present NAME -> 0 when Prometheus has at least one series for NAME in the last hour
-  local start
+present() { # present ENTRY -> 0 when Prometheus has at least one series for ENTRY in the last hour
+  local start match="$1"
+  [[ "$match" == *"{"* ]] || match="{__name__=\"$1\"}"
   start="$(($(date +%s) - 3600))"
-  curl -fsS --max-time 5 -G "$url/api/v1/series" --data-urlencode "match[]={__name__=\"$1\"}" \
+  curl -fsS --max-time 5 -G "$url/api/v1/series" --data-urlencode "match[]=$match" \
     --data-urlencode "start=$start" |
     python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["data"] else 1)'
 }
@@ -64,14 +76,6 @@ while :; do
   (($(date +%s) < deadline)) || break
   log "waiting for ${#missing[@]} series: ${missing[*]}"
   sleep 10
-done
-
-for name in "${NOT_YET[@]}"; do
-  if present "$name"; then
-    log "note: $name is present now; move it into REQUIRED (F4a)"
-  else
-    log "not expected yet (F4a): $name"
-  fi
 done
 
 if ((${#missing[@]} > 0)); then

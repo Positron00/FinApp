@@ -164,22 +164,62 @@ async def test_relay_revalidates_and_holds_back_an_invalid_envelope(
 ) -> None:
     """PAY-402, C60, C63: with PAYROLL_VALIDATE_EVENTS the relay re-validates each envelope after
     the traceparent rewrite. An invalid row isn't published: it's marked failed, logged and left
-    unsent, while the valid rows of the batch go out. With validation off it is published."""
-    await api.approved_run(2)
+    unsent, while the valid rows of the batch go out. With validation off an invalid row that
+    was never refused is published."""
+    await api.approved_run(3)
     bad = await db.fetchval("SELECT id FROM payroll.outbox ORDER BY id LIMIT 1")
     await db.execute(
         "UPDATE payroll.outbox SET payload = jsonb_set(payload, '{data,currency}', '\"EUR\"') "
         "WHERE id = $1",
         bad,
     )
-    assert await _relay(api).relay_once() == 1
+    assert await _relay(api).relay_once() == 2
     row = await db.fetchrow("SELECT * FROM payroll.outbox WHERE id = $1", bad)
     assert row["sent_at"] is None
     assert (row["relay_attempts"], row["last_error"]) == (1, "EnvelopeInvalidError")
     published = [f[b"event_id"].decode() for _, f in await _entries(redis_admin)]
-    assert len(published) == 1
+    assert len(published) == 2
     assert str(bad) not in published
     [event] = caplog_json.events("outbox.relay.error")
     assert (event["error_type"], event["failed"]) == ("EnvelopeInvalidError", 1)
+    # Validation off: a corrupted row the relay never refused goes out (the C76 exclusion keys on
+    # last_error, not on the payload).
+    other = await db.fetchval(
+        "SELECT id FROM payroll.outbox WHERE id <> $1 ORDER BY id LIMIT 1", bad
+    )
+    await db.execute(
+        "UPDATE payroll.outbox SET payload = jsonb_set(payload, '{data,currency}', '\"EUR\"'), "
+        "sent_at = NULL WHERE id = $1",
+        other,
+    )
     assert await _relay(api, validate=False).relay_once() == 1
-    assert len(await _entries(redis_admin)) == 2
+    published = [f[b"event_id"].decode() for _, f in await _entries(redis_admin)]
+    assert published.count(str(other)) == 2
+    assert str(bad) not in published
+
+
+async def test_relay_never_reclaims_a_refused_row(
+    api: Api, db: Any, redis_admin: aioredis.Redis, caplog_json: JsonLogCapture
+) -> None:
+    """PAY-NFR-03, PAY-402, C76: a row refused as EnvelopeInvalidError is skipped by every later
+    poll: it is logged once, its relay_attempts stays 1, and with a batch of one it can't crowd
+    out the valid rows behind it. It stays unsent, so outbox_unsent and OutboxStuck still see it."""
+    await api.approved_run(3)
+    bad = await db.fetchval("SELECT id FROM payroll.outbox ORDER BY created_at, id LIMIT 1")
+    await db.execute(
+        "UPDATE payroll.outbox SET payload = jsonb_set(payload, '{data,currency}', '\"EUR\"') "
+        "WHERE id = $1",
+        bad,
+    )
+    relay = _relay(api, batch_size=1)
+    assert await relay.relay_once() == 0  # the first poll claims and refuses the oldest row
+    for _ in range(5):  # later polls never see it again; the two valid rows go out one by one
+        await relay.relay_once()
+    published = [f[b"event_id"].decode() for _, f in await _entries(redis_admin)]
+    assert len(published) == 2
+    assert str(bad) not in published
+    row = await db.fetchrow("SELECT * FROM payroll.outbox WHERE id = $1", bad)
+    assert row["sent_at"] is None
+    assert (row["relay_attempts"], row["last_error"]) == (1, "EnvelopeInvalidError")
+    assert len(caplog_json.events("outbox.relay.error")) == 1
+    assert await db.fetchval("SELECT count(*) FROM payroll.outbox WHERE sent_at IS NULL") == 1

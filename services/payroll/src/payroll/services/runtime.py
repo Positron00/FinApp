@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from pycommon import Clock, SystemClock
+from pycommon.maintenance import MaintenanceRunner
 from pycommon.streams import RelayLoop
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -24,6 +25,7 @@ class Runtime:
     metrics: Metrics
     outbox: OutboxWriter
     relay: RelayLoop | None = None
+    maintenance: MaintenanceRunner | None = None
     clock: Clock = SystemClock()  # noqa: RUF009  (stateless default)
 
     def wake_relay(self) -> None:

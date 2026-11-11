@@ -16,7 +16,10 @@
 # shellcheck source=scripts/ci/lib.sh disable=SC1091  # followed with -x; single-file runs (pre-commit) cannot
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-member="${1:?usage: scripts/ci/python.sh <pycommon|identity|payroll|payout_worker|bank_stub|platform>}"
+# An explicit check, not ${1:?}: on bash 3.2 (macOS) a failed ${1:?} reaches the EXIT trap with
+# status 0, so the script would log "passed".
+[[ $# -ge 1 && -n "$1" ]] || die "usage: scripts/ci/python.sh <pycommon|identity|payroll|payout_worker|bank_stub|platform>"
+member="$1"
 need uv docker
 
 case "$member" in

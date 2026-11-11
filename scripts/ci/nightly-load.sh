@@ -1,25 +1,34 @@
 #!/usr/bin/env bash
-# Nightly job `load` (platform LLD §3.15, §11.2; PAY-NFR-05, PAY-NFR-06; C38).
+# Nightly job `load` (platform LLD §3.15, §11.2; web LLD §9.3; PAY-NFR-04, PAY-NFR-05, PAY-NFR-06).
 #
 # Usage: scripts/ci/nightly-load.sh
+#        LOAD_SCENARIOS="settlement" FULL_HOLD=2m SOAK_DURATION=10m ...   (a shorter local check)
 #
-# Stack up, `seed.py --employees 500`, then the k6 scenarios: load/full.js (30 req/s, 10 min),
-# load/soak.js (5 req/s, 30 min; no memory or lag growth) and load/settlement.js (settlement p95
-# <= 60 s for 500 employees, approving as approver@payrun.example.com, R22). Summaries go to
+# Stack up, `seed.py --employees 500`, then the k6 scenarios, each through scripts/ci/k6.sh:
+#   load/full.js        ramping-arrival-rate to 30 journey operations/s, held 10 min; errors < 1%,
+#                       p95 < 300 ms (simple) and < 1.5 s (calculate) (PAY-NFR-05)
+#   load/soak.js        5 operations/s for 30 min; the same thresholds, plus three checks here:
+#                       no latency drift (p95 of the last 5 min within 20% of the first 5 min, from
+#                       the summary export's window:first / window:last sub-metrics); no memory
+#                       growth (RSS slope < 5% over the soak for every Python service, from
+#                       Prometheus process_memory_usage_bytes); no consumer-lag growth
+#                       (queue_consumer_lag not both > 0 and rising). The last two are
+#                       scripts/ci/soak_resources.py over the soak window (PAY-NFR-05).
+#   load/settlement.js  five 500-employee runs approved as approver@payrun.example.com (R22);
+#                       settlement p95 <= 60 s (PAY-NFR-06), cross-checked here against payroll's
+#                       payroll_payout_settlement_seconds histogram in Prometheus
+# Every scenario runs even when an earlier one fails; the job fails if any did. Summaries go to
 # load/results/<scenario>.json, which the workflow uploads.
-#
-# STUB STATUS (2026-11-10): full.js and settlement.js arrive with task F6 and soak.js with H2. Until
-# a scenario file exists this script says so (a GitHub warning annotation, and NOT RUN in the log)
-# and runs load/smoke.js in its place as a sanity check. It never reports a missing scenario as
-# passed: the summary at the end lists which scenarios ran.
 # shellcheck source=scripts/ci/lib.sh disable=SC1091  # followed with -x; single-file runs (pre-commit) cannot
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-need docker uv
+need docker uv python3 curl
 
 export SEED_JSON="$CI_ROOT/ci-logs/seed.json"
 on_exit 'scripts/stack.sh logs >ci-logs/compose.log 2>&1 || true; scripts/stack.sh down -v >/dev/null 2>&1 || true'
+read -r -a scenarios <<<"${LOAD_SCENARIOS:-full soak settlement}"
 
 group "stack up"
+mkdir -p ci-logs load/results
 scripts/dev-env.sh >/dev/null
 bake_images "$(env_val APP_VERSION)"
 scripts/stack.sh up
@@ -28,23 +37,75 @@ uv sync --locked --all-packages
 group "seed (500 employees)"
 uv run python scripts/seed.py --employees 500 --out ci-logs/seed.json
 
-ran=() not_built=()
-for scenario in full soak settlement; do
+# The soak's drift check: p95 of the last window within 20% of the first (simple requests).
+soak_drift() {
+  python3 - load/results/soak.json <<'PY'
+import json
+import sys
+
+metrics = json.load(open(sys.argv[1], encoding="utf-8"))["metrics"]
+first = metrics.get("http_req_duration{window:first,kind:simple}", {}).get("p(95)")
+last = metrics.get("http_req_duration{window:last,kind:simple}", {}).get("p(95)")
+if first is None or last is None:
+    sys.exit("soak drift: the window:first / window:last sub-metrics are missing")
+verdict = "ok" if last <= first * 1.2 else "FAILED"
+print(f"soak drift: p95 first window {first:.1f} ms, last window {last:.1f} ms (limit +20%): {verdict}")
+sys.exit(0 if verdict == "ok" else 1)
+PY
+}
+
+# PAY-NFR-05 resources over the soak scenario's own window (k6 setup excluded): the window ends
+# when k6 exits and is SOAK_DURATION long (soak.js's default 30m).
+soak_resources() {
+  local ended="$1" duration="${SOAK_DURATION:-30m}" seconds
+  case "$duration" in
+    *s) seconds="${duration%s}" ;;
+    *m) seconds="$((${duration%m} * 60))" ;;
+    *h) seconds="$((${duration%h} * 3600))" ;;
+    *) log "SOAK_DURATION must look like 30m: $duration"; return 1 ;;
+  esac
+  python3 scripts/ci/soak_resources.py --prometheus "http://127.0.0.1:$(env_val PROMETHEUS_PORT)" \
+    --start "$((ended - seconds))" --end "$ended"
+}
+
+# Cross-check: payroll's own settlement histogram over the settlement step (PAY-NFR-06).
+settlement_prometheus() {
+  local since="$1" window p95
+  window="$(($(date +%s) - since + 30))"
+  p95="$(curl -fsS -G "http://127.0.0.1:$(env_val PROMETHEUS_PORT)/api/v1/query" \
+    --data-urlencode "query=histogram_quantile(0.95, sum by (le) (increase(payroll_payout_settlement_seconds_bucket[${window}s])))" |
+    python3 -c 'import json, sys; r = json.load(sys.stdin)["data"]["result"]; print(r[0]["value"][1] if r else "none")')"
+  log "Prometheus payroll_payout_settlement_seconds p95 over the last ${window}s: ${p95} s"
+  [[ "$p95" != none && "$p95" != NaN ]] || { log "no settlement observations in Prometheus"; return 1; }
+  python3 -c "import sys; sys.exit(0 if float('$p95') <= 60 else 1)"
+}
+
+failed=() ran=()
+for scenario in "${scenarios[@]}"; do
   group "k6 $scenario"
-  if [[ -f "load/$scenario.js" ]]; then
-    SEED_JSON=ci-logs/seed.json scripts/ci/k6.sh "load/$scenario.js"
+  [[ -f "load/$scenario.js" ]] || die "load/$scenario.js does not exist"
+  started="$(date +%s)"
+  extra=()
+  [[ "$scenario" == full && -n "${FULL_HOLD:-}" ]] && extra+=(-e "FULL_HOLD=$FULL_HOLD")
+  [[ "$scenario" == soak && -n "${SOAK_DURATION:-}" ]] && extra+=(-e "SOAK_DURATION=$SOAK_DURATION")
+  if SEED_JSON=ci-logs/seed.json scripts/ci/k6.sh "load/$scenario.js" ${extra[@]+"${extra[@]}"}; then
     ran+=("$scenario")
   else
-    not_built+=("$scenario")
-    msg="load/$scenario.js is NOT BUILT YET (tasks F6/H2): scenario NOT RUN"
-    log "$msg"
-    [[ -n "${GITHUB_ACTIONS:-}" ]] && echo "::warning title=nightly load::$msg"
+    failed+=("$scenario")
+  fi
+  if [[ "$scenario" == soak ]]; then
+    ended="$(date +%s)"
+    soak_drift || failed+=("soak-drift")
+    soak_resources "$ended" || failed+=("soak-resources")
+  fi
+  if [[ "$scenario" == settlement ]] && ! settlement_prometheus "$started"; then
+    failed+=("settlement-prometheus")
   fi
 done
-
-if ((${#not_built[@]} > 0)); then
-  group "k6 smoke (stand-in while scenarios are missing)"
-  SEED_JSON=ci-logs/seed.json scripts/ci/k6.sh load/smoke.js
-fi
 endgroup
-log "scenarios run: ${ran[*]:-none}; not built yet: ${not_built[*]:-none}"
+
+log "scenarios passed: ${ran[*]:-none}; failed: ${failed[*]:-none}"
+if ((${#failed[@]} > 0)); then
+  [[ -n "${GITHUB_ACTIONS:-}" ]] && echo "::error title=nightly load::failed: ${failed[*]}"
+  die "load scenarios failed: ${failed[*]}"
+fi

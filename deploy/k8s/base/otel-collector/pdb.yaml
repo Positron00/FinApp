@@ -1,4 +1,6 @@
-# maxUnavailable 1 works with 1 replica (dev) and 2 (uat, prod) (platform LLD §9.2).
+# maxUnavailable 1: the Collector is a single-replica gateway in every overlay (platform LLD §8.1, §9.2),
+# so a node drain may evict it (minAvailable 1 would block every drain). A PDB doesn't gate the
+# Deployment's own Recreate rollouts.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

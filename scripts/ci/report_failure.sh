@@ -15,7 +15,8 @@
 # shellcheck source=scripts/ci/lib.sh disable=SC1091  # followed with -x; single-file runs (pre-commit) cannot
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-job="${1:?usage: scripts/ci/report_failure.sh <job> [log-file]}"
+[[ $# -ge 1 && -n "$1" ]] || die "usage: scripts/ci/report_failure.sh <job> [log-file]" # not ${1:?} (bash 3.2 trap status)
+job="$1"
 logfile="${2:-ci-logs/$job.log}"
 title="Nightly failure: $job"
 label="nightly-failure"

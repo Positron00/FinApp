@@ -1,25 +1,26 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useRouter } from "next/navigation";
+import { useEffect, useRef, useState } from "react";
 
 import { CursorPager, useCursorStack } from "@/components/cursor-pager";
+import { ConfirmDialog } from "@/components/dialog";
 import { ErrorBanner } from "@/components/error-banner";
 import { LiveRegion } from "@/components/live-region";
+import { TabList, TabPanel } from "@/components/tabs";
 import { ApiError, apiFetch } from "@/lib/client/api";
-import { queryKeys } from "@/lib/client/query-keys";
-import { formatBps, formatCents } from "@/lib/money";
-import { payoutBadge } from "@/lib/payout-badge";
+import { errorEmployeeIds, errorText } from "@/lib/client/form-errors";
+import { listQuery, queryKeys, type PageOf } from "@/lib/client/query-keys";
+import { formatBps, formatCents, formatHours } from "@/lib/money";
 import type { Role } from "@/lib/roles";
-import type { PayRun, PayRunStatus, Payout, Payslip } from "@/lib/schemas/responses";
+import type { PayRun, PayRunStatus, Payslip } from "@/lib/schemas/responses";
 
 import { ApproveButton } from "./approve-button";
-import { PayoutStatusBadge, RunStatusBadge } from "./run-status-badge";
-
-interface PageOf<T> {
-  items: T[];
-  next_cursor: string | null;
-}
+import { HoursEditor } from "./hours-editor";
+import { PayoutsTab, type PayoutFilter } from "./payouts-tab";
+import { PayslipDialog } from "./payslip-dialog";
+import { RunStatusBadge } from "./run-status-badge";
 
 export const POLL_MS = 2000;
 const FINAL: PayRunStatus[] = ["paid", "partially_failed"];
@@ -44,12 +45,14 @@ export function announcement(run: PayRun): string {
 }
 
 /**
- * The run page (web LLD §6.3; PAY-303, PAY-400, PAY-413). The run query polls every 2 s while
- * `processing` and stops at `paid`/`partially_failed`; the payouts query polls only while its tab
- * is open. A failed refetch keeps the last snapshot, marks it, and disables the actions.
+ * The run page (web LLD §6.3; PAY-301–304, PAY-400, PAY-413, PAY-500–502). The run query polls
+ * every 2 s while `processing` and stops at `paid`/`partially_failed`; the payouts query polls
+ * only while its tab is open. A failed refetch keeps the last snapshot, marks it, and disables
+ * the actions (calculate, delete, hours, approve, retry, resolve).
  */
 export function RunDetail({ runId, me }: { runId: string; me: { id: string; roles: Role[] } }) {
   const qc = useQueryClient();
+  const router = useRouter();
   const run = useQuery({
     queryKey: queryKeys.payRun(runId),
     queryFn: () => apiFetch<PayRun>(`/api/pay-runs/${runId}`),
@@ -58,6 +61,10 @@ export function RunDetail({ runId, me }: { runId: string; me: { id: string; role
   });
   const status = run.data?.status;
   const [tab, setTab] = useState<Tab | null>(null);
+  const [payoutFilter, setPayoutFilter] = useState<PayoutFilter>("");
+  const [payslipOpen, setPayslipOpen] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [notice, setNotice] = useState("");
   const activeTab = tab ?? (run.data?.approved_at ? "payouts" : "payslips");
 
   // When polling stops at a final status, refetch the payouts once so the rows are complete.
@@ -78,6 +85,15 @@ export function RunDetail({ runId, me }: { runId: string; me: { id: string; role
     },
   });
 
+  const remove = useMutation({
+    mutationFn: () => apiFetch<void>(`/api/pay-runs/${runId}`, { method: "DELETE" }),
+    retry: 0,
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["pay-runs"] });
+      router.push("/pay-runs");
+    },
+  });
+
   if (run.isPending) return <p>Loading…</p>;
   if (!run.data) return <ErrorBanner error={run.error} onRetry={() => void run.refetch()} />;
 
@@ -85,7 +101,9 @@ export function RunDetail({ runId, me }: { runId: string; me: { id: string; role
   const stale = run.isError;
   const canPrepare = me.roles.includes("payroll_admin");
   const canApprove = me.roles.includes("approver");
+  const editable = r.status === "draft" || r.status === "calculated";
   const c = r.counts;
+  const missing = errorEmployeeIds(calculate.error);
 
   return (
     <>
@@ -128,20 +146,29 @@ export function RunDetail({ runId, me }: { runId: string; me: { id: string; role
         {r.calculated_by ? (
           <>
             <dt className="text-muted">Calculated by</dt>
-            <dd>{who(r.calculated_by, r.calculated_by_name, me.id)}</dd>
+            <dd>
+              {who(r.calculated_by, r.calculated_by_name, me.id)}
+              {r.calculated_at ? `, ${new Date(r.calculated_at).toLocaleString()}` : ""}
+            </dd>
           </>
         ) : null}
         {r.approved_by ? (
           <>
             <dt className="text-muted">Approved by</dt>
-            <dd>{who(r.approved_by, r.approved_by_name, me.id)}</dd>
+            <dd>
+              {who(r.approved_by, r.approved_by_name, me.id)}
+              {r.approved_at ? `, ${new Date(r.approved_at).toLocaleString()}` : ""}
+            </dd>
           </>
         ) : null}
       </dl>
 
       {stale ? (
         <p role="status" className="mt-3 text-warn">
-          Last updated {new Date(run.dataUpdatedAt).toLocaleTimeString()}. Updates paused.
+          Last updated {new Date(run.dataUpdatedAt).toLocaleTimeString()}.{" "}
+          {run.error instanceof ApiError && run.error.status === 429
+            ? "Live updates paused."
+            : "Updates paused."}
         </p>
       ) : null}
 
@@ -154,7 +181,14 @@ export function RunDetail({ runId, me }: { runId: string; me: { id: string; role
           {c.blocked > 0 ? (
             <p>
               {c.blocked} blocked: an operator must resolve these.{" "}
-              <button type="button" className="underline" onClick={() => setTab("payouts")}>
+              <button
+                type="button"
+                className="underline"
+                onClick={() => {
+                  setPayoutFilter("requested");
+                  setTab("payouts");
+                }}
+              >
                 Show payouts
               </button>
             </p>
@@ -162,108 +196,112 @@ export function RunDetail({ runId, me }: { runId: string; me: { id: string; role
         </div>
       ) : null}
 
+      {notice ? (
+        <p role="status" className="mt-3">
+          {notice}
+        </p>
+      ) : null}
+
       <section aria-label="Actions" className="mt-4 flex flex-col gap-3">
-        {canPrepare && (r.status === "draft" || r.status === "calculated") ? (
-          <div>
+        {canPrepare && editable ? (
+          <div className="flex flex-wrap gap-2">
             <button
               type="button"
               className="rounded border border-brand px-4 py-2 text-brand disabled:opacity-50"
               disabled={stale || calculate.isPending}
+              aria-describedby={calculate.error ? "calculate-error" : undefined}
               onClick={() => calculate.mutate()}
             >
               {calculate.isPending ? "Calculating…" : "Calculate"}
             </button>
-            {calculate.error ? (
-              <p role="alert" className="text-danger">
-                {calculate.error instanceof ApiError
-                  ? calculate.error.message
-                  : "The service is temporarily unavailable. Please try again."}
-              </p>
-            ) : null}
+            <button
+              type="button"
+              className="rounded border border-danger px-4 py-2 text-danger disabled:opacity-50"
+              disabled={stale || remove.isPending}
+              onClick={() => setConfirmDelete(true)}
+            >
+              Delete run
+            </button>
           </div>
+        ) : null}
+        {calculate.error ? (
+          <p id="calculate-error" role="alert" className="text-danger">
+            {errorText(calculate.error)}
+            {calculate.error instanceof ApiError && calculate.error.requestId
+              ? ` Reference: ${calculate.error.requestId}.`
+              : ""}
+          </p>
+        ) : null}
+        {remove.error ? (
+          <p role="alert" className="text-danger">
+            {errorText(remove.error)}
+          </p>
         ) : null}
         {canApprove && r.status === "calculated" ? (
           <ApproveButton run={r} meId={me.id} disabled={stale} />
         ) : null}
       </section>
 
+      {canPrepare && editable ? <HoursEditor run={r} highlight={missing} disabled={stale} /> : null}
+
       <RunTabs active={activeTab} onSelect={setTab} />
-      {TABS.map((t) => (
-        <div
-          key={t}
-          role="tabpanel"
-          id={`panel-${t}`}
-          aria-labelledby={`tab-${t}`}
-          hidden={t !== activeTab}
-          tabIndex={0}
+      <TabPanel id="payslips" active={activeTab === "payslips"}>
+        <PayslipsTable run={r} onOpen={setPayslipOpen} />
+      </TabPanel>
+      <TabPanel id="payouts" active={activeTab === "payouts"}>
+        <PayoutsTab
+          key={payoutFilter}
+          runId={runId}
+          pollMs={r.status === "processing" ? POLL_MS : false}
+          canAct={canApprove}
+          disabled={stale}
+          initialFilter={payoutFilter}
+          onOpenPayslip={setPayslipOpen}
+          onNotice={setNotice}
+        />
+      </TabPanel>
+
+      {payslipOpen ? (
+        <PayslipDialog runId={runId} payslipId={payslipOpen} onClose={() => setPayslipOpen(null)} />
+      ) : null}
+      {confirmDelete ? (
+        <ConfirmDialog
+          title="Delete this pay run?"
+          confirmLabel="Delete run"
+          pending={remove.isPending}
+          onClose={() => setConfirmDelete(false)}
+          onConfirm={() => {
+            setConfirmDelete(false);
+            remove.mutate();
+          }}
         >
-          {t !== activeTab ? null : t === "payslips" ? (
-            <PayslipsTable run={r} />
-          ) : (
-            <PayoutsTable runId={runId} polling={r.status === "processing"} />
-          )}
-        </div>
-      ))}
+          <p>
+            The run for {r.period_start} – {r.period_end} and its payslips are removed. The period
+            becomes free for a new run.
+          </p>
+        </ConfirmDialog>
+      ) : null}
     </>
   );
 }
 
-const TABS = ["payslips", "payouts"] as const;
-type Tab = (typeof TABS)[number];
+type Tab = "payslips" | "payouts";
+const TAB_LIST = [
+  { id: "payslips", label: "Payslips" },
+  { id: "payouts", label: "Payouts" },
+] as const satisfies readonly { id: Tab; label: string }[];
 
-/**
- * The WAI-ARIA tabs pattern (web LLD §6.3, PAY-NFR-14): a roving tabIndex (only the selected
- * tab is in the tab order) and automatic activation with ArrowLeft/ArrowRight/Home/End.
- */
+/** The run's tabs: the WAI-ARIA tabs pattern from `components/tabs.tsx` (PAY-NFR-14). */
 export function RunTabs({ active, onSelect }: { active: Tab; onSelect: (t: Tab) => void }) {
-  function onKeyDown(e: KeyboardEvent<HTMLButtonElement>) {
-    const i = TABS.indexOf(active);
-    const next =
-      e.key === "ArrowRight"
-        ? TABS[(i + 1) % TABS.length]
-        : e.key === "ArrowLeft"
-          ? TABS[(i - 1 + TABS.length) % TABS.length]
-          : e.key === "Home"
-            ? TABS[0]
-            : e.key === "End"
-              ? TABS[TABS.length - 1]
-              : undefined;
-    if (!next) return;
-    e.preventDefault();
-    onSelect(next);
-    document.getElementById(`tab-${next}`)?.focus();
-  }
-  return (
-    <div role="tablist" aria-label="Run details" className="mt-6 flex gap-2 border-b">
-      {TABS.map((t) => (
-        <button
-          key={t}
-          type="button"
-          role="tab"
-          id={`tab-${t}`}
-          aria-selected={active === t}
-          aria-controls={`panel-${t}`}
-          tabIndex={active === t ? 0 : -1}
-          className={`px-3 py-2 ${active === t ? "border-b-2 border-brand font-semibold" : ""}`}
-          onClick={() => onSelect(t)}
-          onKeyDown={onKeyDown}
-        >
-          {t === "payslips" ? "Payslips" : "Payouts"}
-        </button>
-      ))}
-    </div>
-  );
+  return <TabList tabs={TAB_LIST} active={active} onSelect={onSelect} label="Run details" />;
 }
 
-function PayslipsTable({ run }: { run: PayRun }) {
+function PayslipsTable({ run, onOpen }: { run: PayRun; onOpen: (id: string) => void }) {
   const pager = useCursorStack();
   const q = useQuery({
     queryKey: queryKeys.payslips(run.id, pager.cursor),
-    queryFn: () => {
-      const qs = new URLSearchParams({ limit: "50" });
-      if (pager.cursor) qs.set("cursor", pager.cursor);
-      return apiFetch<PageOf<Payslip>>(`/api/pay-runs/${run.id}/payslips?${qs.toString()}`);
-    },
+    queryFn: () =>
+      apiFetch<PageOf<Payslip>>(`/api/pay-runs/${run.id}/payslips?${listQuery(50, pager.cursor)}`),
   });
   if (q.isError) return <ErrorBanner error={q.error} onRetry={() => void q.refetch()} />;
   if (!q.data) return <p>Loading…</p>;
@@ -275,6 +313,7 @@ function PayslipsTable({ run }: { run: PayRun }) {
           <tr>
             <th scope="col">Employee</th>
             <th scope="col">Pay type</th>
+            <th scope="col">Hours</th>
             <th scope="col">Gross</th>
             <th scope="col">Tax</th>
             <th scope="col">Retirement</th>
@@ -284,8 +323,13 @@ function PayslipsTable({ run }: { run: PayRun }) {
         <tbody>
           {q.data.items.map((p) => (
             <tr key={p.id} className="border-t">
-              <td>{p.employee_name}</td>
+              <td>
+                <button type="button" className="text-brand underline" onClick={() => onOpen(p.id)}>
+                  {p.employee_name}
+                </button>
+              </td>
               <td>{p.pay_type}</td>
+              <td>{p.pay_type === "hourly" ? formatHours(p.hours_hundredths) : ""}</td>
               <td>{formatCents(p.gross_cents)}</td>
               <td>{formatCents(p.tax_cents)}</td>
               <td>{formatCents(p.retirement_cents)}</td>
@@ -295,7 +339,7 @@ function PayslipsTable({ run }: { run: PayRun }) {
         </tbody>
         <tfoot>
           <tr className="border-t font-semibold">
-            <th scope="row" colSpan={2}>
+            <th scope="row" colSpan={3}>
               Run totals
             </th>
             <td>{formatCents(run.totals?.gross_cents)}</td>
@@ -304,66 +348,6 @@ function PayslipsTable({ run }: { run: PayRun }) {
             <td>{formatCents(run.totals?.net_cents)}</td>
           </tr>
         </tfoot>
-      </table>
-      <CursorPager
-        nextCursor={q.data.next_cursor}
-        hasPrevious={pager.hasPrevious}
-        onNext={pager.next}
-        onPrevious={pager.previous}
-      />
-    </>
-  );
-}
-
-function PayoutsTable({ runId, polling }: { runId: string; polling: boolean }) {
-  const pager = useCursorStack();
-  const q = useQuery({
-    queryKey: queryKeys.payouts(runId, pager.cursor),
-    queryFn: () => {
-      const qs = new URLSearchParams({ limit: "50" });
-      if (pager.cursor) qs.set("cursor", pager.cursor);
-      return apiFetch<PageOf<Payout>>(`/api/pay-runs/${runId}/payouts?${qs.toString()}`);
-    },
-    refetchInterval: polling ? POLL_MS : false,
-    refetchIntervalInBackground: false,
-  });
-  if (q.isError && !q.data) return <ErrorBanner error={q.error} onRetry={() => void q.refetch()} />;
-  if (!q.data) return <p>Loading…</p>;
-  return (
-    <>
-      <table className="mt-3 w-full text-left">
-        <caption className="sr-only">Payouts</caption>
-        <thead>
-          <tr>
-            <th scope="col">Employee</th>
-            <th scope="col">Amount</th>
-            <th scope="col">Bank</th>
-            <th scope="col">Status</th>
-            <th scope="col">Attempt</th>
-          </tr>
-        </thead>
-        <tbody>
-          {q.data.items.map((p) => {
-            const badge = payoutBadge(p);
-            const current = p.attempts.find((a) => a.attempt === p.current_attempt);
-            return (
-              <tr key={p.id} className="border-t">
-                <td>{p.employee_name}</td>
-                <td>{formatCents(p.amount_cents)}</td>
-                <td>{current ? `••••${current.account_last4}` : "—"}</td>
-                <td>
-                  <PayoutStatusBadge
-                    kind={badge.kind}
-                    label={badge.label}
-                    tooltip={badge.tooltip}
-                  />
-                  {badge.reason ? <span className="ml-2">{badge.reason}</span> : null}
-                </td>
-                <td>{p.current_attempt || "—"}</td>
-              </tr>
-            );
-          })}
-        </tbody>
       </table>
       <CursorPager
         nextCursor={q.data.next_cursor}

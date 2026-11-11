@@ -10,9 +10,10 @@ from uuid import UUID
 
 from pycommon.db import new_id
 from sqlalchemy import func, insert, select, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from identity.db.models import AuditLog, Credential, EmailOutbox, Invite, User
+from identity.db.models import AuditLog, Credential, EmailOutbox, Invite, PasswordReset, User
 
 __all__ = [
     "AuditRepo",
@@ -23,7 +24,8 @@ __all__ = [
     "IssuedFor",
     "LoginRow",
     "OutboxRepo",
-    "ResetTokenRepo",
+    "ResetForConfirm",
+    "ResetRepo",
     "UserRepo",
 ]
 
@@ -91,6 +93,64 @@ class UserRepo:
         stmt = insert(User).values(**values).returning(User)
         return (await self._s.execute(stmt)).scalar_one()
 
+    async def lock(self, cid: UUID, user_id: UUID) -> User | None:
+        """The row, locked ``FOR UPDATE`` (lock order: users before invites and resets, §6.5)."""
+        stmt = select(User).where(User.company_id == cid, User.id == user_id).with_for_update()
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
+    async def lock_active_admin_ids(self, cid: UUID) -> list[UUID]:
+        """Every active admin of the company, locked in ``id`` order (§6.5 step 3)."""
+        stmt = (
+            select(User.id)
+            .where(
+                User.company_id == cid,
+                User.status == "active",
+                User.roles.contains(["admin"]),
+            )
+            .order_by(User.id)
+            .with_for_update()
+        )
+        return list((await self._s.execute(stmt)).scalars())
+
+    async def list_page(self, cid: UUID, *, after: UUID | None, limit: int) -> list[User]:
+        """Creation order (``id`` ascending); ``limit + 1`` rows tell whether a page follows."""
+        stmt = select(User).where(User.company_id == cid)
+        if after is not None:
+            stmt = stmt.where(User.id > after)
+        stmt = stmt.order_by(User.id).limit(limit + 1)
+        return list((await self._s.execute(stmt)).scalars())
+
+    async def apply_change(
+        self, cid: UUID, user_id: UUID, *, roles: Sequence[str] | None, deactivate: bool
+    ) -> User:
+        """Write a planned PATCH and bump ``roles_version`` by exactly 1 (§6.5)."""
+        values: dict[str, Any] = {
+            "roles_version": User.roles_version + 1,
+            "updated_at": func.now(),
+        }
+        if roles is not None:
+            values["roles"] = list(roles)
+        if deactivate:
+            values["status"] = "inactive"
+            values["deactivated_at"] = func.now()
+        stmt = (
+            update(User)
+            .where(User.company_id == cid, User.id == user_id)
+            .values(**values)
+            .returning(User)
+        )
+        return (await self._s.execute(stmt)).scalar_one()
+
+    async def bump_roles_version_if_active(self, cid: UUID, user_id: UUID) -> int | None:
+        """After a password reset (§6.5): the new ``roles_version``; ``None`` unless active."""
+        stmt = (
+            update(User)
+            .where(User.company_id == cid, User.id == user_id, User.status == "active")
+            .values(roles_version=User.roles_version + 1, updated_at=func.now())
+            .returning(User.roles_version)
+        )
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
     async def activate_pending(self, cid: UUID, user_id: UUID) -> User | None:
         stmt = (
             update(User)
@@ -109,6 +169,21 @@ class CredentialRepo:
         await self._s.execute(
             insert(Credential).values(user_id=user_id, company_id=cid, password_hash=password_hash)
         )
+
+    async def set_password(self, *, user_id: UUID, cid: UUID, password_hash: str) -> None:
+        """Insert or replace the credential; ``password_changed_at = now()`` (reset, §6.6)."""
+        stmt = pg_insert(Credential).values(
+            user_id=user_id, company_id=cid, password_hash=password_hash
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[Credential.user_id],
+            set_={
+                "password_hash": stmt.excluded.password_hash,
+                "password_changed_at": func.now(),
+                "updated_at": func.now(),
+            },
+        )
+        await self._s.execute(stmt)
 
     async def rehash(self, *, user_id: UUID, cid: UUID, password_hash: str) -> None:
         """Store a hash recomputed with new parameters (``password_changed_at`` is unchanged)."""
@@ -148,6 +223,31 @@ class InviteRepo:
             )
         )
         return invite_id
+
+    async def get(self, cid: UUID, invite_id: UUID) -> Invite | None:
+        stmt = select(Invite).where(Invite.company_id == cid, Invite.id == invite_id)
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
+    async def revoke_pending_for_user(self, cid: UUID, user_id: UUID) -> UUID | None:
+        """Revoke the user's pending invite (at most one, ``uq_invites_user_pending``)."""
+        stmt = (
+            update(Invite)
+            .where(Invite.company_id == cid, Invite.user_id == user_id, Invite.status == "pending")
+            .values(status="revoked", revoked_at=func.now(), updated_at=func.now())
+            .returning(Invite.id)
+        )
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
+    async def pending_ids_for(self, cid: UUID, user_ids: Sequence[UUID]) -> dict[UUID, UUID]:
+        """``{user_id: pending invite id}`` for the given users (one query per list page)."""
+        if not user_ids:
+            return {}
+        stmt = select(Invite.user_id, Invite.id).where(
+            Invite.company_id == cid,
+            Invite.user_id.in_(list(user_ids)),
+            Invite.status == "pending",
+        )
+        return {row[0]: row[1] for row in await self._s.execute(stmt)}
 
     async def pending_id_for(self, cid: UUID, user_id: UUID) -> UUID | None:
         stmt = select(Invite.id).where(
@@ -208,11 +308,73 @@ class InviteRepo:
         return None if row is None else IssuedFor(expires_at=row[0], name=row[1])
 
 
-class ResetTokenRepo:
-    """The relay's half of password resets (the request and confirm flows arrive with F1)."""
+@dataclass(frozen=True)
+class ResetForConfirm:
+    reset_id: UUID
+    user_id: UUID
+    reset_status: str
+    unexpired: bool
+    user_status: str
+
+
+class ResetRepo:
+    """Password resets: request and confirm (§6.6), and the relay's token issue (§6.7)."""
 
     def __init__(self, session: AsyncSession) -> None:
         self._s = session
+
+    async def insert(self, *, cid: UUID, user_id: UUID) -> UUID:
+        reset_id = new_id()
+        await self._s.execute(
+            insert(PasswordReset).values(id=reset_id, company_id=cid, user_id=user_id)
+        )
+        return reset_id
+
+    async def revoke_pending_for_user(self, cid: UUID, user_id: UUID) -> UUID | None:
+        """Revoke the user's pending reset (at most one, ``uq_password_resets_user_pending``)."""
+        stmt = (
+            update(PasswordReset)
+            .where(
+                PasswordReset.company_id == cid,
+                PasswordReset.user_id == user_id,
+                PasswordReset.status == "pending",
+            )
+            .values(status="revoked", revoked_at=func.now(), updated_at=func.now())
+            .returning(PasswordReset.id)
+        )
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
+    async def find_for_confirm(self, cid: UUID, digest: bytes) -> ResetForConfirm | None:
+        stmt = (
+            select(
+                PasswordReset.id,
+                PasswordReset.user_id,
+                PasswordReset.status,
+                func.coalesce(PasswordReset.expires_at > func.now(), False),
+                User.status,
+            )
+            .join(User, User.id == PasswordReset.user_id)
+            .where(PasswordReset.company_id == cid, PasswordReset.token_hash == digest)
+        )
+        row = (await self._s.execute(stmt)).first()
+        if row is None:
+            return None
+        return ResetForConfirm(row[0], row[1], row[2], bool(row[3]), row[4])
+
+    async def mark_used(self, cid: UUID, reset_id: UUID) -> UUID | None:
+        """Single use: only a pending, unexpired reset moves to ``used`` (§6.6)."""
+        stmt = (
+            update(PasswordReset)
+            .where(
+                PasswordReset.company_id == cid,
+                PasswordReset.id == reset_id,
+                PasswordReset.status == "pending",
+                PasswordReset.expires_at > func.now(),
+            )
+            .values(status="used", used_at=func.now(), updated_at=func.now())
+            .returning(PasswordReset.user_id)
+        )
+        return (await self._s.execute(stmt)).scalar_one_or_none()
 
     async def issue_token(self, reset_id: UUID, digest: bytes, ttl_h: int) -> IssuedFor | None:
         stmt = text(
@@ -262,6 +424,14 @@ class AuditRepo:
         )
         return audit_id
 
+    async def list_page(self, cid: UUID, *, before: UUID | None, limit: int) -> list[AuditLog]:
+        """Newest first (``id DESC``; UUIDv7, so time order); ``limit + 1`` rows."""
+        stmt = select(AuditLog).where(AuditLog.company_id == cid)
+        if before is not None:
+            stmt = stmt.where(AuditLog.id < before)
+        stmt = stmt.order_by(AuditLog.id.desc()).limit(limit + 1)
+        return list((await self._s.execute(stmt)).scalars())
+
 
 @dataclass(frozen=True)
 class ClaimedEmail:
@@ -303,6 +473,24 @@ class OutboxRepo:
         )
         return email_id
 
+    async def cancel_pending(
+        self, *, invite_id: UUID | None = None, password_reset_id: UUID | None = None
+    ) -> int:
+        """Cancel the pending rows of a revoked invite or reset (§6.5, §6.6)."""
+        if invite_id is not None:
+            ref = EmailOutbox.invite_id == invite_id
+        elif password_reset_id is not None:
+            ref = EmailOutbox.password_reset_id == password_reset_id
+        else:
+            return 0
+        result = await self._s.execute(
+            update(EmailOutbox)
+            .where(ref, EmailOutbox.status == "pending")
+            .values(status="cancelled", finished_at=func.now(), updated_at=func.now())
+            .returning(EmailOutbox.id)
+        )
+        return len(result.all())
+
     async def claim(self, *, batch: int, lease_s: int) -> list[ClaimedEmail]:
         """Claim due rows with ``SKIP LOCKED``; the lease is ``next_attempt_at`` (§6.9)."""
         stmt = text(
@@ -328,22 +516,29 @@ class OutboxRepo:
         claimed = [ClaimedEmail(*row) for row in rows]
         return sorted(claimed, key=lambda c: c.id)
 
-    async def finish(self, email_id: UUID, status: str, *, last_error: str | None = None) -> None:
-        await self._s.execute(
+    async def finish(self, email_id: UUID, status: str, *, last_error: str | None = None) -> bool:
+        """Record the outcome of a claimed row; False if it is no longer ``pending``.
+
+        A resend, deactivation or repeat reset request may cancel the row while the relay is
+        sending it (§6.9); the cancellation stands and the outcome is dropped.
+        """
+        result = await self._s.execute(
             update(EmailOutbox)
-            .where(EmailOutbox.id == email_id)
+            .where(EmailOutbox.id == email_id, EmailOutbox.status == "pending")
             .values(
                 status=status,
                 finished_at=func.now(),
                 last_error=last_error,
                 updated_at=func.now(),
             )
+            .returning(EmailOutbox.id)
         )
+        return len(result.all()) == 1
 
     async def retry_in(self, email_id: UUID, delay_s: float, *, last_error: str) -> None:
         await self._s.execute(
             update(EmailOutbox)
-            .where(EmailOutbox.id == email_id)
+            .where(EmailOutbox.id == email_id, EmailOutbox.status == "pending")
             .values(
                 next_attempt_at=func.now()
                 + text("make_interval(secs => :d)").bindparams(d=float(delay_s)),
@@ -356,7 +551,7 @@ class OutboxRepo:
         """The breaker was open: undo the claim's attempt and come back after ``delay_s``."""
         await self._s.execute(
             update(EmailOutbox)
-            .where(EmailOutbox.id == email_id)
+            .where(EmailOutbox.id == email_id, EmailOutbox.status == "pending")
             .values(
                 attempts=EmailOutbox.attempts - 1,
                 next_attempt_at=func.now()

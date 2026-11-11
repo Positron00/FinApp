@@ -1,4 +1,4 @@
-"""``/v1/employees`` for S5: create, list and read (design §4.3; PAY-201, PAY-202)."""
+"""``/v1/employees``: create, list, read and update (design §4.3; PAY-201 to PAY-203)."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pycommon.auth import Principal
 
 from payroll.api.deps import ANY_ROLE, PAYROLL_ADMIN, get_runtime, require_roles, require_web_user
 from payroll.api.responses import errors
-from payroll.api.schemas import EmployeeCreate, EmployeeOut, Limit, Page
+from payroll.api.schemas import EmployeeCreate, EmployeeOut, EmployeeUpdate, Limit, Page
 from payroll.services import employees as svc
 from payroll.services.runtime import Runtime
 
@@ -46,3 +46,13 @@ async def create_employee(
 @router.get("/{employee_id}", response_model=EmployeeOut, responses=errors(404))
 async def get_employee(employee_id: UUID, rt: RT, principal: AnyRole) -> EmployeeOut:
     return await svc.get_employee(rt, principal.cid, employee_id)
+
+
+@router.patch("/{employee_id}", response_model=EmployeeOut, responses=errors(400, 404, 409))
+async def update_employee(
+    employee_id: UUID,
+    body: EmployeeUpdate,
+    rt: RT,
+    principal: Annotated[Principal, Depends(require_roles(PAYROLL_ADMIN))],
+) -> EmployeeOut:
+    return await svc.update_employee(rt, principal, employee_id, body)

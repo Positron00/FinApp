@@ -21,7 +21,7 @@ from pycommon.logging import get_logger, log_event
 from pycommon.otel import context_from_traceparent, tracer
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from identity.db.repositories import ClaimedEmail, InviteRepo, IssuedFor, OutboxRepo, ResetTokenRepo
+from identity.db.repositories import ClaimedEmail, InviteRepo, IssuedFor, OutboxRepo, ResetRepo
 from identity.domain.email_schedule import is_exhausted, retry_delay_s
 from identity.domain.tokens import new_token
 from identity.email.smtp import EmailSender, error_label
@@ -99,14 +99,15 @@ class EmailRelay:
                     row.invite_id, digest, self._s.invite_ttl_h
                 )
             if row.template == "password_reset" and row.password_reset_id is not None:
-                return await ResetTokenRepo(session).issue_token(
+                return await ResetRepo(session).issue_token(
                     row.password_reset_id, digest, self._s.reset_ttl_h
                 )
         return None  # pragma: no cover  (ck_email_outbox_ref makes this unreachable)
 
-    async def _finish(self, row: ClaimedEmail, status: str, last_error: str | None = None) -> None:
+    async def _finish(self, row: ClaimedEmail, status: str, last_error: str | None = None) -> bool:
+        """False when the row was cancelled meanwhile (resend, deactivation, new reset)."""
         async with transaction(self._sf) as session:
-            await OutboxRepo(session).finish(row.id, status, last_error=last_error)
+            return await OutboxRepo(session).finish(row.id, status, last_error=last_error)
 
     async def _release_uncounted(self, row: ClaimedEmail) -> None:
         async with transaction(self._sf) as session:
@@ -179,7 +180,8 @@ class EmailRelay:
     async def _failed_attempt(self, row: ClaimedEmail, exc: BaseException) -> None:
         label = error_label(exc)
         if is_exhausted(row.attempts, self._s.email_max_attempts):
-            await self._finish(row, "failed", last_error=label)
+            if not await self._finish(row, "failed", last_error=label):
+                return  # cancelled while sending: not a delivery failure
             self._metrics.emails_failed.add(1)
             log_event(
                 _log,

@@ -1,12 +1,9 @@
-"""Request and response models (identity LLD §3.3).
-
-The F1 models (reset, resend, patch, lists, audit) are added with their endpoints.
-"""
+"""Request and response models (identity LLD §3.3)."""
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal, Self
 from uuid import UUID
 
 from pydantic import (
@@ -17,12 +14,15 @@ from pydantic import (
     Field,
     StringConstraints,
     field_validator,
+    model_validator,
 )
 from pydantic_core import PydanticCustomError
 
 from identity.domain.roles import Role
 
 __all__ = [
+    "AuditEntryOut",
+    "AuditListOut",
     "Email",
     "InviteAcceptIn",
     "InviteUserIn",
@@ -30,9 +30,15 @@ __all__ = [
     "MeOut",
     "Name",
     "Password",
+    "PatchUserIn",
+    "PendingInviteOut",
+    "ResetConfirmIn",
+    "ResetConfirmOut",
+    "ResetRequestIn",
     "RoleList",
     "SessionUser",
     "Token",
+    "UserListOut",
     "UserOut",
     "reject_nul",
 ]
@@ -72,17 +78,42 @@ class InviteAcceptIn(_In):
     password: Password
 
 
+def _no_duplicate_roles(v: list[Role] | None) -> list[Role] | None:
+    if v is not None and len(set(v)) != len(v):
+        raise ValueError("duplicate roles")
+    return v
+
+
 class InviteUserIn(_In):
     email: Email
     name: Name
     roles: RoleList
 
-    @field_validator("roles")
-    @classmethod
-    def _no_duplicates(cls, v: list[Role]) -> list[Role]:
-        if len(set(v)) != len(v):
-            raise ValueError("duplicate roles")
-        return v
+    _no_duplicates = field_validator("roles")(_no_duplicate_roles)
+
+
+class ResetRequestIn(_In):
+    email: Email
+
+
+class ResetConfirmIn(_In):
+    token: Token
+    password: Password
+
+
+class PatchUserIn(_In):
+    """``roles`` and/or ``status``; only ``"inactive"`` (no reactivation in 0.1.0: R37, C25)."""
+
+    roles: RoleList | None = None
+    status: Literal["inactive"] | None = None
+
+    _no_duplicates = field_validator("roles")(_no_duplicate_roles)
+
+    @model_validator(mode="after")
+    def _at_least_one(self) -> Self:
+        if self.roles is None and self.status is None:
+            raise ValueError("set roles or status")
+        return self
 
 
 class SessionUser(BaseModel):
@@ -116,3 +147,39 @@ class MeOut(UserOut):
     """``GET /v1/users/me`` (R19): adds ``company_id`` for the BFF's re-check."""
 
     company_id: UUID
+
+
+class UserListOut(BaseModel):
+    items: list[UserOut]
+    next_cursor: str | None
+
+
+class PendingInviteOut(BaseModel):
+    """Returned by resend: the new invite."""
+
+    id: UUID
+    expires_at: datetime | None  # None until the relay has sent it (C31)
+    # The invite's latest outbox row; None once purged.
+    email_status: Literal["pending", "sent", "failed", "cancelled"] | None
+
+
+class ResetConfirmOut(BaseModel):
+    """The BFF deletes every session in ``web:user-sess:<user_id>`` (R19)."""
+
+    user_id: UUID
+    roles_version: int
+
+
+class AuditEntryOut(BaseModel):
+    id: UUID
+    at: datetime
+    actor_user_id: UUID | None
+    event: str
+    target_user_id: UUID | None
+    ip_hash: str | None
+    details: dict[str, Any]
+
+
+class AuditListOut(BaseModel):
+    items: list[AuditEntryOut]
+    next_cursor: str | None

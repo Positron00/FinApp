@@ -10,7 +10,7 @@ import { http, HttpResponse } from "msw";
 
 import { GET as listRuns } from "@/app/api/pay-runs/route";
 import { logger, otelSink } from "@/lib/logger";
-import { REQUEST_DURATION_BUCKETS } from "@/lib/metrics";
+import { metricsApi, REQUEST_DURATION_BUCKETS } from "@/lib/metrics";
 import { originRegex } from "@/lib/otel-util";
 import { redact, REDACTED } from "@/lib/redact";
 import { requestContext } from "@/lib/request-context";
@@ -180,6 +180,30 @@ describe("metrics (§7.2)", () => {
       expect(points[0]!.value.buckets.boundaries).toEqual(REQUEST_DURATION_BUCKETS);
       const errors = all.find((m) => m.descriptor.name === "rate_limiter_errors")!;
       expect(errors.dataPoints[0]!.attributes).toEqual({ component: "web" });
+    } finally {
+      await provider.shutdown();
+      metrics.disable();
+    }
+  });
+});
+
+describe("metrics pre-initialisation (C72)", () => {
+  // PAY-603: RateLimiterErrors reads rate(rate_limiter_errors_total{component="web"}); the series
+  // exists at 0 from server start (startNode calls metricsApi.init()), so the first limiter error
+  // is an increase rather than a new series that rate() can't see.
+  it("exports rate_limiter_errors{component=web} at 0 before any error", async () => {
+    const exporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+    const reader = new PeriodicExportingMetricReader({ exporter, exportIntervalMillis: 60_000 });
+    const provider = new MeterProvider({ readers: [reader] });
+    metrics.setGlobalMeterProvider(provider);
+    try {
+      metricsApi.init();
+      await reader.forceFlush();
+      const all = exporter.getMetrics().flatMap((m) => m.scopeMetrics.flatMap((s) => s.metrics));
+      const errors = all.find((m) => m.descriptor.name === "rate_limiter_errors")!;
+      expect(errors.dataPoints.map((p) => [p.attributes, p.value])).toEqual([
+        [{ component: "web" }, 0],
+      ]);
     } finally {
       await provider.shutdown();
       metrics.disable();

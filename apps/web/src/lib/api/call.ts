@@ -33,3 +33,21 @@ export async function callService<T>(
   }
   return parseUpstream(schema, data, target, routeName);
 }
+
+/** As `callService`, for a 2xx with no body (payroll DELETE 204, identity reset request 202). */
+export async function callServiceNoContent(
+  target: Target,
+  routeName: string,
+  call: Promise<FetchResult>,
+  vars: MessageVars = {},
+): Promise<void> {
+  const { error, response } = await call;
+  if (!response.ok) {
+    throw mapUpstreamError(
+      target,
+      { status: response.status, body: error, headers: response.headers },
+      routeName,
+      vars,
+    );
+  }
+}

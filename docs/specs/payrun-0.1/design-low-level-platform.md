@@ -26,8 +26,10 @@ FinApp/
   .editorconfig  .gitignore  .dockerignore  .pre-commit-config.yaml  .gitleaks.toml
   .python-version            # 3.14 (see §10.3)
   .nvmrc                     # 24
-  .trivyignore               # empty at 0.1.0; entries need reason, owner, exp:YYYY-MM-DD
-  .env.example               # every key from §3.15 and §4, with a comment each; no values for secrets
+  .trivyignore               # 11 accepted base-image CVEs (C66, C78); each needs reason, owner, exp:YYYY-MM-DD
+  .env.example               # documents the keys scripts/dev-env.sh writes, one comment each; no values for
+                             # secrets. Other keys (§4) take their code defaults
+  CLAUDE.md                  # agent and contributor notes
   pyproject.toml  uv.lock    # uv workspace root (§1.2)
   package.json  pnpm-workspace.yaml  pnpm-lock.yaml
   CHANGELOG.md  README.md  SECURITY_DEPENDENCIES.md
@@ -63,7 +65,7 @@ FinApp/
       collector.yaml  collector.prod.yaml
       prometheus/prometheus.yml
       prometheus/rules/recording.yml  prometheus/rules/alerts.yml
-      prometheus/tests/slo_test.yml   prometheus/tests/alerts_test.yml
+      prometheus/tests/slo_test.yml   prometheus/tests/alerts_test.yml   prometheus/tests/panels_test.yml
       alertmanager.yml
       alert-sink/alert_sink.py
       tempo.yaml  loki.yaml
@@ -72,6 +74,7 @@ FinApp/
       grafana/dashboards/{service-overview,journeys,queues,bank,platform}.json
     k8s/
       base/  components/  overlays/{dev,uat,prod}/  schemas/   # §9; synced copies marked in §9.1
+      observability/alerts-kubernetes.yml  observability/alerts-kubernetes_test.yml   # PodRestarts (R28)
   load/                      # k6 (smoke.js, full.js, soak.js, settlement.js)
   tests/
     resilience/              # Toxiproxy fault tests
@@ -79,10 +82,11 @@ FinApp/
   scripts/
     dev-env.sh  stack.sh  export_openapi.py  seed.py  mint_token.py  sync-k8s-assets.sh
     ci/{lib.sh, python.sh, web.sh, contract.sh, e2e.sh, images.sh, manifests.sh, security.sh,
-        check_metrics.sh, schemathesis_auth.py, nightly-load.sh, nightly-resilience.sh,
-        nightly-e2e.sh, nightly-schemathesis.sh, nightly-audit.sh, report_failure.sh}
-  docs/{plan,specs,adr,runbooks}/  docs/{ARCHITECTURE,RUNBOOK,TESTING}.md
-    runbooks/<AlertName>.md  # one per alert in §8.3 (17 files)
+        check_metrics.sh, k6.sh, schemathesis.sh, schemathesis.toml, schemathesis_auth.py,
+        soak_resources.py, alert_drills.sh, nightly-load.sh, nightly-resilience.sh, nightly-e2e.sh,
+        nightly-schemathesis.sh, nightly-audit.sh, report_failure.sh}
+  docs/{plan,specs,adr,runbooks}/  docs/{ARCHITECTURE,RUNBOOK,TESTING,API}.md
+    runbooks/<AlertName>.md  # one per alert in §8.3 plus PodRestarts (18 files)
   .github/workflows/ci.yml  .github/workflows/nightly.yml  .github/dependabot.yml
 ```
 
@@ -744,7 +748,7 @@ def context_from_traceparent(tp: str | None) -> Context        # empty Context w
 ```
 
 Behaviour:
-- **Exporters:** OTLP gRPC to `OTEL_EXPORTER_OTLP_ENDPOINT` (`http://otel-collector:4317`); metric export every `OTEL_METRIC_EXPORT_INTERVAL` = 15000 ms, cumulative temporality.
+- **Exporters:** OTLP gRPC to `OTEL_EXPORTER_OTLP_ENDPOINT` (`http://otel-collector:4317`); metric export every `OTEL_METRIC_EXPORT_INTERVAL` = 15000 ms, cumulative temporality. `OTEL_EXPORTER_OTLP_TIMEOUT` = 3 (**seconds**: the Python gRPC exporter reads seconds, default 10) bounds each export, so the shutdown flush to an unreachable Collector (traces, metrics and logs in turn) stays within the ≤ 10 s close-and-flush budget of a 75 s grace (C67; measured about 5 s by payout-worker `test_shutdown.py`).
 - **Sampling (R27, C23):** `OTEL_TRACES_SAMPLER=parentbased_always_on` in every service and every environment, so the apps send 100% of spans; there is no `OTEL_TRACES_SAMPLER_ARG`. `setup` uses `ParentBased(ALWAYS_ON)` when the variable is unset, and logs `otel.sampler.overridden` {sampler} at warning when it is set to anything else. Prod keeps errors, slow traces and a 10% baseline with the Collector's `tail_sampling` (§8.1), not in the SDK.
 - **Instrumentation:** FastAPI (`excluded_urls="livez,readyz"`, no header capture, a `server_request_hook` that drops `url.query`), httpx (a request hook that drops `url.query` and never records headers), SQLAlchemy (`engine.sync_engine`; `enable_commenter=False`; `skip_dep_check=True`, because instrumentation 0.66b1 declares sqlalchemy < 2.1 and otherwise instruments nothing, while its engine hooks work on 2.1.6, verified by `test_db_spans.py`; C61), Redis (a `request_hook` that records only the command name, never arguments: arguments can carry session IDs), system metrics (process CPU and memory only).
 - **Metric naming rule:** instruments are created with the **final Prometheus name minus `_total`** for counters (the Collector appends `_total`), and with the full name, `_seconds` included, for histograms and gauges with unit `s` (the Collector doesn't duplicate a suffix already present). **Gauges never use unit `"1"` (C63):** the Collector's Prometheus exporter appends `_ratio` to a gauge with that unit, so `circuit_breaker_state` would arrive as `circuit_breaker_state_ratio`. Gauges use a curly-brace annotation (`"{state}"`, `"{entry}"`, `"{run}"`), which adds no suffix, or `"s"` for ages; `observable_gauge` raises `ValueError` for `"1"`. Counters may keep `"1"` (they only get `_total`). `scripts/ci/check_metrics.sh` confirms the names in Prometheus in the e2e job.
@@ -1365,12 +1369,12 @@ APIs; no SQL. Progress goes to stderr; stdout carries only the JSON summary.
 1. Refuses to run unless `ENV == "dev"` (exit 2, PAY-609). `--skeleton` with `--employees` is an argument error (exit 2).
 2. Waits (polling, 60 s cap, else exit 3) for the web's `GET /api/readyz` (C4) and Mailpit's `/api/v1/info` (`MAILPIT_PORT`).
 3. **Owner:** the `bootstrap-owner` one-shot has already created an **active** owner with `SEED_OWNER_PASSWORD` (`--if-empty --password-env`, R16, C27). The seed signs in as `SEED_OWNER_EMAIL` through `POST /api/auth/login` and keeps the session cookie. It never accepts an owner invite.
-4. **Users:** invites (`POST /api/users/invite`) `approver@payrun.example.com` with roles `[approver]` and `LOAD_USER_EMAIL` with roles `[payroll_admin]` only (R22, C27), finds each invite in Mailpit (`/api/v1/search?query=to:…`, newest first), extracts the token from the `/accept#token=…` link and accepts it through `POST /api/auth/accept` with `SEED_APPROVER_PASSWORD` / `LOAD_USER_PASSWORD`. Users that already exist are skipped (looked up by email in `GET /api/users`, paging until `next_cursor` is null); a pending one gets `POST /api/invites/{pending_invite_id}/resend` and is then accepted. Both modes create these users: k6 smoke signs in as `LOAD_USER_EMAIL`, and the skeleton journey approves as the approver.
+4. **Users:** invites (`POST /api/users/invite`) `approver@payrun.example.com` with roles `[approver]` and `LOAD_USER_EMAIL` with roles `[payroll_admin]` only (R22, C27), finds each invite in Mailpit (`/api/v1/search?query=to:…`, newest first), extracts the token from the `/accept#token=…` link and accepts it through `POST /api/auth/accept` with `SEED_APPROVER_PASSWORD` / `LOAD_USER_PASSWORD`. For each user the seed first tries to sign in with its password; when that works the user exists and is kept. Otherwise it invites; an invite answered 409 (a pending user left by an earlier run that stopped before accepting) makes it look the user up by email in `GET /api/users`, paging until `next_cursor` is null; the pending one gets `POST /api/invites/{pending_invite_id}/resend` and is then accepted. Both modes create these users: k6 smoke signs in as `LOAD_USER_EMAIL`, and the skeleton journey approves as the approver.
 5. **Settings (full mode only):** `PUT /api/settings` with tax 2000 bps, retirement 500 bps and dual approval on (R22). `--skeleton` makes no settings PUT and runs on the migration's 0/0 seed (C33).
-6. **Employees:** counts existing employees first, then creates the missing ones, with polyfactory and a fixed seed so names and numbers are reproducible:
+6. **Employees:** counts existing employees first, then creates the missing ones. Employee *i* is generated with `random.Random(SEED * 1000 + i)` (no factory library), so names and numbers are reproducible and a re-run creates nothing:
    - `--skeleton`: 5 salaried monthly employees (C33);
-   - default: 10, salaried and hourly on both schedules, one with an account ending `0000`;
-   - `--employees 500`: 500 on one monthly schedule, for k6.
+   - default: 10, salaried and hourly on both schedules (employees 6–10 include 4 biweekly and 3 hourly), one with an account ending `0000` (employee 9, closed account, for J4/J5);
+   - `--employees 500`: the same first 10, then monthly employees up to 500 with every 10th hourly, for k6 (`FULL_SHAPES` and `_shape` in `seed.py`).
 7. **Runs** (both modes, C33): ensures one monthly run for the current month (period start = the 1st, UTC) and one draft monthly run for the next month. The current-month run is created if missing, given 160 hours for each hourly payslip, and calculated as the owner when it is still `draft`; a run already past `calculated` is left as it is. Its ID is reported, so k6 smoke can read it.
 8. **JSON summary** (stdout, and `--out PATH` when given; e2e writes `ci-logs/seed.json`):
 
@@ -1425,17 +1429,17 @@ All start with `source scripts/ci/lib.sh` (`set -euo pipefail`, `log()`, `group(
 | Script | Does |
 |---|---|
 | `python.sh <member>` | `uv sync --locked --all-packages`; `ruff check <paths>`; `ruff format --check <paths>`; `mypy --strict <src> <tests>`; `pytest <member>/tests/unit --disable-socket --allow-unix-socket --cov=<pkg> --cov-branch`; `pytest <member>/tests/integration --cov=<pkg> --cov-branch --cov-append --cov-fail-under=<85 or 90> --cov-report=xml`. Member `platform` runs `tests/platform` (no coverage gate) |
-| `web.sh` | `corepack enable`; `pnpm install --frozen-lockfile`; `pnpm --filter web lint`; `pnpm exec prettier --check .`; `pnpm --filter web typecheck`; `pnpm --filter web test --coverage` (thresholds 80% in the Vitest config); `pnpm --filter web build` |
+| `web.sh` | `corepack enable` (when `pnpm` is missing); `pnpm install --frozen-lockfile`; `pnpm --filter web lint`; `pnpm exec prettier --check .`; `pnpm --filter web typecheck`; `pnpm --filter @payrun/api-client typecheck`; `pnpm --filter web test --coverage` (thresholds 80% in the Vitest config); `pnpm --filter web int` (the real-Redis integration tests through Testcontainers, so Docker is needed; web LLD §9.1); `pnpm --filter web build` with no secrets in the environment |
 | `contract.sh` | `export_openapi.py --all`; `pnpm --filter @payrun/api-client generate`; `git diff --exit-code -- services/*/openapi.json packages/api-client`; per service, `oasdiff breaking <(git show origin/main:services/<svc>/openapi.json) services/<svc>/openapi.json --fail-on ERR` (skipped when `main` has no spec); `check-jsonschema --check-metaschema contracts/events/*.json`; `check-jsonschema --schemafile contracts/events/payout.requested.v1.json contracts/events/examples/payout.requested.v1.*.json`, and the same for `payout.requested.dlq.v1.json` and its examples (C21); every example's `data.company_id` equals the dev `COMPANY_ID` (C28) |
-| `e2e.sh` | Takes `E2E_SUITE=skeleton\|full` (default `full`; `ci.yml` sets `skeleton` until task F3 lands; C51). Both suites: `dev-env.sh`; `stack.sh up --check-startup` (core, obs, test; PAY-NFR-15). **skeleton:** `seed.py --skeleton --out ci-logs/seed.json`, then `pnpm --filter web exec playwright test --grep @skeleton` (only `skeleton.spec.ts`). **full:** `seed.py --out ci-logs/seed.json` (the full seed, C33), then `seed.py --employees 500 --out ci-logs/seed.json`, then Playwright `--grep @journeys` plus the trace (`trace.spec.ts`) and a11y (axe) specs. Playwright runs with `.env` and `SEED_JSON=ci-logs/seed.json` in its environment (`.env` already holds the test-only `PAYOUT_WORKER_JWT_PRIVATE_KEY` and `PAYROLL_PORT` for the blocked case, C44). Then, in **both** suites: `pytest tests/platform/test_seed.py -m stack` (PAY-609); Schemathesis per service (below); `k6 run -e SEED_JSON=ci-logs/seed.json load/smoke.js`; `pytest tests/resilience -m smoke` (the PR fault smoke tests: slow DB, identity down; C38); `check_metrics.sh`. On failure `stack.sh logs > ci-logs/compose.log`; always `stack.sh down -v` |
-| `check_metrics.sh` | Queries Prometheus (`PROMETHEUS_PORT`) `/api/v1/series` for each required name (`http_server_request_duration_seconds_count`, `bff_request_duration_seconds_count`, `queue_messages_total`, `queue_consumer_lag`, `outbox_oldest_age_seconds`, `circuit_breaker_state`, `external_requests_total`, `payroll_payouts_stuck`, `payroll_runs_processing_oldest_age_seconds`, `payroll_attempts_needs_operator`, `payroll_payout_settlement_seconds_count`, `identity_emails_pending`, `rate_limiter_errors_total`, `redis_stream_length`, `pg_up`, `otelcol_exporter_send_failed_spans_total`); fails listing the missing ones. Guards the metric-naming rule of §3.3 |
+| `e2e.sh` | Takes `E2E_SUITE=skeleton\|full` (default `full`; `ci.yml` and `nightly.yml` set `full` since F6; C51, C70). Both suites: `dev-env.sh`; `stack.sh up --check-startup` (core, obs, test; PAY-NFR-15). **skeleton:** `seed.py --skeleton --out ci-logs/seed.json`, then `pnpm --filter web exec playwright test --grep @skeleton` (only `skeleton.spec.ts`). **full:** `seed.py --out ci-logs/seed.json` (the full seed, C33), then `seed.py --employees 500 --out ci-logs/seed.json`, then Playwright `--grep "@journeys\|@trace\|@a11y"` (J1–J5, role changes, errors, the trace test and axe). Playwright runs with `.env` and `SEED_JSON=ci-logs/seed.json` in its environment (`.env` already holds the test-only `PAYOUT_WORKER_JWT_PRIVATE_KEY` and `PAYROLL_PORT` for the blocked case, C44). Then, in **both** suites and **in this order** (C70): `pytest tests/platform/test_seed.py -m stack` (PAY-609); `k6.sh load/smoke.js` with `SEED_JSON=ci-logs/seed.json`; Schemathesis per service (below) — **after** the seed tests and k6, because its stateful phase deletes the still-calculated `runs.current` and changes seeded users and settings; `pytest tests/resilience -m smoke` (the PR fault smoke tests: slow DB, identity down; C38); `check_metrics.sh`. The seed tests and the fault smoke skip themselves when the stack or summary is missing, so the script fails unless their JUnit XML shows at least one test and no skips. On failure `stack.sh logs > ci-logs/compose.log`; always `stack.sh down -v` |
+| `check_metrics.sh` | Queries Prometheus (`PROMETHEUS_PORT`) `/api/v1/series` (last hour, waiting up to `CHECK_METRICS_WAIT_S`, default 90 s) for each of the 27 required entries. An entry is a metric name (`match[]={__name__="<name>"}`) or, when it contains `{`, a full selector used as the `match[]` as is, so a pre-initialised label set an alert reads is proved, not just the name: `http_server_request_duration_seconds_count`, `bff_request_duration_seconds_count`, `queue_messages_total`, `queue_consumer_lag`, `circuit_breaker_state`, `external_requests_total`, `payroll_payout_settlement_seconds_count`, `identity_emails_pending`, `rate_limiter_errors_total`, `rate_limiter_errors_total{service_name="web",component="web"}`, `redis_stream_length`, `pg_up`, `otelcol_exporter_sent_spans`, `outbox_unsent`, `outbox_oldest_age_seconds`, `payroll_payouts_stuck`, `payroll_runs_processing_oldest_age_seconds`, `payroll_attempts_needs_operator`, `payroll_late_settlements_total`, `identity_emails_failed_total`, `identity_email_oldest_pending_age_seconds`, `redis_memory_used_bytes`, `redis_memory_max_bytes`, `queue_dlq_messages`, `process_memory_usage_bytes`, `auth_signins_total{service_name="identity",outcome="failure"}`, `external_request_duration_seconds_count` (every series an alert, a gate or a drill reads; the two selectors are pre-initialised at process start (C72, C77), so they exist before any sign-in; the settlement histogram and the external-call series appear once a run has been paid, which the e2e journeys do before this check); fails listing the missing ones. Guards the metric-naming rule of §3.3 |
 | `schemathesis_auth.py` | A Schemathesis auth provider (`@schemathesis.auth()`, R30, C35) that imports `scripts/mint_token.py`'s `mint` and mints a **fresh token per request** (tokens live 60 s). `aud` is the service under test (`PAYRUN_SERVICE`, set by `e2e.sh` per run). Identity's four public-flow routes get `sub="service:web"`, `roles: []` and `X-Client-IP: 127.0.0.1`; `/v1/internal/*` gets `issuer="payout-worker"`, `sub="service:payout-worker"`; every other route gets the owner (`users.owner` from `SEED_JSON`) with `[admin, approver, payroll_admin]` and `name="Owner"`. For bank-stub it sets `X-Api-Key: $BANK_STUB_API_KEY` instead |
 | `images.sh` | **Trivy ignore policy first (C38):** every non-comment line of `.trivyignore` is a CVE ID followed by a comment `# reason: <text>; owner: <github handle>; exp:YYYY-MM-DD`; the script fails if a field is missing, if `exp` is in the past, or if the CVE is not also listed in `SECURITY_DEPENDENCIES.md`. Then `docker buildx bake -f deploy/docker/bake.hcl --set *.platform=linux/amd64 --load` (cache `type=gha`, one scope per image); `trivy image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed=false --ignorefile .trivyignore payrun/<img>:ci` for the 5 images |
 | `manifests.sh` | `scripts/sync-k8s-assets.sh`, then `git diff --exit-code` and an empty `git status --porcelain` on the copy paths (R32, C36); `kustomize build deploy/k8s/overlays/<env> \| kubeconform …` for dev, uat, prod (§9.6; no load-restrictor flag); `pytest tests/platform/test_k8s_policy.py`; `promtool check config`, `promtool check rules`, `promtool test rules` (in the pinned `prom/prometheus` image); `amtool check-config` (pinned `prom/alertmanager` image); `otelcol-contrib validate --config` for both Collector files; `docker compose -f … config -q` for both Compose files |
 | `security.sh` | `uv export --frozen --all-packages --no-dev --no-hashes \| pip-audit -r /dev/stdin --strict` (accepted advisories via `--ignore-vuln` from `SECURITY_DEPENDENCIES.md`); `pnpm audit --audit-level high`; `gitleaks git --log-opts="<base>..HEAD" --redact --exit-code 1` |
-| `nightly-load.sh` | stack up, `seed.py --employees 500 --out ci-logs/seed.json`, `k6 run load/full.js` (30 req/s, 10 min), `load/soak.js` (5 req/s, 30 min), `load/settlement.js` (approves as `approver@payrun.example.com`, R22); uploads k6 summaries |
-| `nightly-resilience.sh` | stack up, seed, `pytest tests/resilience` (all faults) |
-| `nightly-e2e.sh` | `E2E_SUITE=full e2e.sh` three times in a row (`--repeat-each 1` per run, fresh stack each time; `skeleton` until F3) |
+| `nightly-load.sh` | stack up, `seed.py --employees 500 --out ci-logs/seed.json`, then each of `LOAD_SCENARIOS` (default `full soak settlement`) through `k6.sh`, every one running even when an earlier one fails: `load/full.js` (ramp to 30 journey iterations/s (~44 req/s), held `FULL_HOLD`, default 10 min); `load/soak.js` (5 journey iterations/s for `SOAK_DURATION`, default 30m), followed by the **drift check** (p95 of the `window:last` simple requests within 20% of `window:first`, from the summary export) and the **resource check** `scripts/ci/soak_resources.py` over the soak window (PAY-NFR-05: RSS slope < 5% over the soak for identity, payroll, payout-worker and bank-stub, from `process_memory_usage_bytes` = `deriv × window / avg_over_time`; no `queue_consumer_lag` series both > 0 and rising, the `ConsumerLagGrowing` condition; a missing series fails); `load/settlement.js` (approves as `approver@payrun.example.com`, R22), cross-checked against Prometheus `histogram_quantile(0.95, payroll_payout_settlement_seconds)` ≤ 60 s over the step. Summaries go to `load/results/<scenario>.json` (uploaded); the job fails listing every failed scenario or check. The web exports no process-memory series, so its RSS is not in the resource check |
+| `nightly-resilience.sh` | stack up, seed, `pytest tests/resilience` (all faults; fails on any skip). Each test checks its HLD §4 row's log event (in `docker compose logs`) and metric (an instant query on the stack's Prometheus, `Stack.prom`, polled for up to 90 s because of the 15 s export and scrape intervals); slow DB checks payroll's `http.request` lines with `route` `/v1/pay-runs` and `status` 503, logged after the toxic was added. One row is split across two tests: "Bank timeout after settling" names `payout.indeterminate` / `payroll_payouts_republished_total`, the branch where the timeouts outlast the delivery budget, which the bank-down test drives and checks; the bank-timeout test covers the other branch (a retry with the same key) and checks `external_requests_total{outcome="timeout"}` and `bank_stub.transfer.replayed`. `tests/resilience/_stack.py` reads the payout timing (`PAYOUT_CLAIM_MIN_IDLE_MS`, `PAYOUT_MAX_DELIVERIES`, `BANK_TOTAL_DEADLINE_S`, `PAYOUT_REPUBLISH_AFTER_S`, `MAINTENANCE_INTERVAL_S`) from `docker compose config --format json`, so the waits follow `x-payout-timing`; a config that was read but lacks a key fails the run, and the defaults in `_stack.py` apply only when Compose itself is unavailable (pytest's header names the source). The web's `BREAKER_FAILURES` (identity-down test) comes from Compose's `web` environment when it sets one, else from the default in `apps/web/src/lib/config.ts` |
+| `nightly-e2e.sh` | `E2E_SUITE=full e2e.sh` `E2E_REPEAT` (default 3) times in a row, a fresh stack each time; another `E2E_SUITE` in the environment is overridden with a warning; each run's log and Playwright report are kept (`ci-logs/e2e-run-<n>.log`, `ci-logs/playwright-run-<n>`) |
 | `nightly-schemathesis.sh` | Schemathesis with `--max-examples 500` per service |
 | `nightly-audit.sh` | `security.sh` with fresh advisory DBs, plus `trivy image` of the freshly built images |
 | `report_failure.sh <job>` | Opens or updates the nightly issue (§11.2) |
@@ -1482,6 +1486,7 @@ names (`REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME=web`, `REDIS_PASSWORD`; C12).
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | URL | `http://otel-collector:4317` (Python), `:4318` (web) | NFR-09, 10 |
 | `OTEL_TRACES_SAMPLER` | str | `parentbased_always_on` everywhere (R27, C23); no `OTEL_TRACES_SAMPLER_ARG`; prod sampling is the Collector's `tail_sampling` | plan §11 |
 | `OTEL_METRIC_EXPORT_INTERVAL` | ms | 15000 | NFR-10 |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | s (Python gRPC exporter only; the web's JS exporter is not configured by it) | 3 in Compose `x-py-env` and the four Python Deployments (identity, payroll, payout-worker, bank-stub); unset (SDK default 10) in the migration and bootstrap Jobs, which flush once on exit and have no grace budget (C67) | PAY-408, NFR-02 |
 | `OTEL_SEMCONV_STABILITY_OPT_IN` | str | `http` (Dockerfile, Compose, K8s, and `otel.py` fallback) | NFR-10 |
 | `PYCOMMON_APP` / `PORT` | str / int | `<pkg>.main:app` / 8000 (Python Dockerfile); the web container uses `PORT=3000` (C4) | — |
 | `APP_PORT_BASE` | int | 4100 / n/a / n/a | PAY-NFR-13 |
@@ -1559,7 +1564,7 @@ generated at runtime (`secrets.token_urlsafe`), never committed as literals (tes
 | `tests/unit/test_serve.py` | `pycommon.serve` builds the uvicorn config from env (access log off, server header off) |
 | `tests/integration/test_db_pg.py` | Statement timeout → 503 `db_timeout` via a `pg_sleep(3)` route; pool exhaustion → `db_timeout` after 2 s; DB stopped → `db_unavailable` fast, and recovery without stuck connections once restarted; `migrations_check` detects a head mismatch; `run_alembic_env` puts the version table in the schema and revokes runtime writes on it |
 | `tests/integration/test_streams.py` | With real Redis and the ACL users: the `payroll` user publishes with `MAXLEN ~` and the entry has exactly the three fields; `XREADGROUP` as `payout-worker` reads the envelope back and `context_from_traceparent` continues the producer's trace (same trace id); a client from `create_redis(socket_timeout_ms=5500)` survives `BLOCK 5000` while the default client times out at 500 ms |
-| `tests/integration/test_relay_loop.py` | Against a throwaway outbox table the **test** creates (pycommon ships none): two loops on one table never send a row twice (SKIP LOCKED); Redis stopped → rows stay unsent with `relay_attempts` rising, then the loop catches up after recovery; batch of 100 then an immediate loop |
+| `tests/integration/test_relay_loop.py` | Against a throwaway outbox table the **test** creates (pycommon ships none): two loops on one table never send a row twice (SKIP LOCKED); Redis stopped → rows stay unsent with `relay_attempts` rising, then the loop catches up after recovery; batch of 100 then an immediate loop; **relay crash mid-batch** (HLD §4 "Outbox relay crash"): one loop claims a batch and dies before publishing, a second loop skips the locked rows until the dead connection is terminated, then sends each row exactly once (one `relay_attempts` each), `outbox.relay.error` is logged and the oldest-unsent age returns to 0 |
 | `tests/integration/test_ratelimit.py` | PAY-603: two limiter instances share counts; 429 with `Retry-After` past the limit; Redis stopped → `open` allows and counts `rate_limiter_errors_total`, `closed` raises 503 `service_unavailable` |
 | `tests/integration/test_maintenance.py` | Two runners on one database: only one runs per tick (advisory lock); the lock is released after the tick and after a killed connection; a test task's affected count is logged in `maintenance.task.completed` (PAY-608; each service's own integration suite proves its purge windows) |
 | `tests/integration/test_secret_not_logged.py` | A full request through `create_app` with every secret set to a recognisable random value: none of them appears in captured stdout logs or exported spans (NFR-07) |
@@ -1575,11 +1580,13 @@ generated at runtime (`secrets.token_urlsafe`), never committed as literals (tes
 | `test_toxiproxy_config.py` | `toxiproxy.json` has exactly the four proxies and listen ports used by `compose.test.yaml` |
 | `test_alert_sink.py` | POST /page and /ticket store payloads; GET returns them; DELETE clears; bounded at 500 per route |
 | `test_rules_meta.py` | Every BFF SLI expression in `recording.yml` carries `route!~"/api/livez\|/api/readyz\|/api/telemetry"` (C4); no rule uses `outcome="failed"` for `auth_signins_total` (C19) or the gauge `identity_emails_failed` (C20); every alert in `alerts.yml` is one of the 17 in plan §11, has `severity` in {page, ticket, warning}, `summary`, and a `runbook_url` whose file exists under `docs/runbooks/`; every alert has at least one firing and one quiet `promtool` test case (NFR-10, 11) |
-| `test_dashboards.py` | The five dashboard JSONs parse, have stable `uid`s, use datasource uids `prometheus`/`tempo`/`loki`, and every metric name they query is in the §5 table or a service LLD's list |
-| `test_k8s_policy.py` | For each overlay's rendered output: every Deployment and Job has `runAsNonRoot`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, drops ALL, `seccompProfile: RuntimeDefault`, `automountServiceAccountToken: false`, resources and probes (Jobs: no probes); the web's probes are `/api/livez` (startup, liveness) and `/api/readyz` (readiness) on port 3000 (C4); no container env or ConfigMap holds `DATABASE_URL`, `MIGRATOR_DATABASE_URL` or `REDIS_URL` (C1); `OTEL_TRACES_SAMPLER` is `parentbased_always_on` in every overlay (C23); a default-deny policy exists; bank-stub is absent from prod; only payout-worker has an egress rule to the bank; **prod's payout-worker Deployment has `replicas: 0`** (R14, C32); uat and prod use ExternalSecrets and have no plaintext Secret values (R29; PAY-NFR-13, ADR 0011) |
+| `test_dashboards.py` | The five dashboard JSONs parse, have stable `uid`s, use datasource uids `prometheus`/`tempo`/`loki`, and every metric name they query is in the §5 table or a service LLD's list; the Queues counter panels (dead-lettered, late settlements, email failures) and the `alert_drills.sh` checks use exactly the expressions `panels_test.yml` proves (C75, C77) |
+| `test_k8s_policy.py` | For each overlay's rendered output: every Deployment and Job has `runAsNonRoot`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, drops ALL, `seccompProfile: RuntimeDefault`, `automountServiceAccountToken: false`, resources and probes (Jobs: no probes); the web's probes are `/api/livez` (startup, liveness) and `/api/readyz` (readiness) on port 3000 (C4); no container env or ConfigMap holds `DATABASE_URL`, `MIGRATOR_DATABASE_URL` or `REDIS_URL` (C1); `OTEL_TRACES_SAMPLER` is `parentbased_always_on` in every overlay (C23); every Python Deployment (and Compose's `x-py-env`) sets `OTEL_EXPORTER_OTLP_TIMEOUT` ≤ 3 (C67); a default-deny policy exists; bank-stub is absent from prod; only payout-worker has an egress rule to the bank; **prod's payout-worker Deployment has `replicas: 0`** (R14, C32); the Collector has 1 replica, the `Recreate` strategy and a PDB with `maxUnavailable: 1` in every overlay (§8.1; PAY-NFR-10, C77); uat and prod use ExternalSecrets and have no plaintext Secret values (R29; PAY-NFR-13, ADR 0011) |
 | `test_mint_token.py` | PAY-609, C35: `mint()` tokens verify with the `.env` keysets for each issuer; claims per PAY-600 (user: roles, `name`, `sid`; `service:web`: no `name`, no `sid`; worker: `roles: []`); a bad issuer/sub pair raises; the CLI prints only the token and exits 2 when `ENV` isn't dev |
+| `test_soak_resources.py` | PAY-NFR-05: `scripts/ci/soak_resources.py` against a fake Prometheus: every Python service under 5% RSS growth and no lag pass; 5% itself fails; a service with no `process_memory_usage_bytes` series fails; lag fails only when both > 0 and rising; no `queue_consumer_lag` series fails; exit codes 0 / 1 / 2 (window < 120 s, Prometheus unreachable). The PromQL itself runs in promtool (pinned `prom/prometheus` image) on synthetic series: a 7.7% RSS climb and a rising lag are flagged, flat series are not |
+| `test_resilience_helpers.py` | PAY-NFR-03: `tests/resilience/_stack.py`'s pure helpers. `compose_timing` reads every payout-timing key from a given Compose config, raises `LookupError` naming the missing `service.KEY` when a read config lacks one (or a whole service), and returns the defaults only for `None` (Compose unavailable); `web_breaker_failures` prefers Compose's `web` value, else the `apps/web/src/lib/config.ts` default; `counter_increase` counts a new series in full, an expired series as 0 and a drop on the same labels as 0 |
 | `test_sync_k8s_assets.py` | R32, C36: in a temp copy of the repo, `sync-k8s-assets.sh --check` passes after a sync and fails (exit 1, listing the file) after a source edit, a copy edit or a deleted source |
-| `test_seed.py` (marker `stack`; run by `e2e.sh`, skipped in the `platform` matrix member) | PAY-609: against the running stack, the JSON summary validates (keys and types of §3.15, `company_id` = `COMPANY_ID`); a second run prints the same IDs and counts; `ENV=uat` exits 2; `LOAD_USER_EMAIL` has exactly `[payroll_admin]` (C27); in skeleton mode there are 5 salaried monthly employees, `runs.current` is `calculated` and `runs.draft` is `draft` (C33) |
+| `test_seed.py` (marker `stack`; run by `e2e.sh`, skipped in the `platform` matrix member) | PAY-609: against the running stack, the JSON summary validates (keys and types of §3.15, `company_id` = `COMPANY_ID`); a second run prints the same IDs and counts; `ENV=uat` exits 2; `LOAD_USER_EMAIL` has exactly `[payroll_admin]` (C27); skeleton mode: 5 salaried monthly employees; full mode (10) and the 500 mode: the R22 settings (2000 / 500 bps, dual approval) and both schedules and pay types among the employees; in every mode `runs.current` is a calculated (or later) current-month monthly run and `runs.draft` a draft next-month one (C33, C54). `e2e.sh` fails the job if any of these is skipped |
 
 Prometheus rule tests (`promtool test rules`) are described with the rules in §8.3.
 
@@ -1649,6 +1656,7 @@ x-py-env: &py-env
   RETENTION_BANK_DETAILS_DAYS: "30"
   IDEMPOTENCY_TTL_H: "24"
   OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+  OTEL_EXPORTER_OTLP_TIMEOUT: "3"              # seconds (Python gRPC exporter); bounds the shutdown flush (C67)
   OTEL_EXPORTER_OTLP_PROTOCOL: grpc
   OTEL_TRACES_SAMPLER: parentbased_always_on   # C23: every service and environment; no _ARG
   OTEL_METRIC_EXPORT_INTERVAL: "15000"
@@ -1980,7 +1988,7 @@ exporters:
     enable_open_metrics: true                        # exemplars
     resource_constant_labels:
       included: ["service.name", "deployment.environment.name"]
-    metric_expiration: 10m
+    metric_expiration: 2m                            # C72: a restarted process's stale series drop fast
   otlp_http/loki: { endpoint: http://loki:3100/otlp }
 
 service:
@@ -2005,7 +2013,7 @@ processors:
   tail_sampling:
     decision_wait: 10s
     num_traces: 50000
-    expected_new_traces_per_sec: 200
+    expected_new_traces_per_sec: 100
     policies:
       - { name: errors,   type: status_code,   status_code: { status_codes: [ERROR] } }      # keep every error
       - { name: slow,     type: latency,       latency: { threshold_ms: 300 } }               # keep traces > 300 ms
@@ -2016,7 +2024,13 @@ service:
 ```
 
 A trace is kept when any policy matches. The Collector runs as a single-replica gateway Deployment so
-every span of a trace reaches the same tail sampler. `x-trace-id` is still returned for every request;
+every span of a trace reaches the same tail sampler: every overlay sets `otel-collector` to 1 replica,
+and `test_k8s_policy.py` asserts it. Its rollout strategy is `Recreate` (C77): a `RollingUpdate`
+surge would run a second gateway next to the old one during every rollout, splitting traces between
+two tail samplers and exporting every series twice. Recreate stops the old pod first; the SDKs retry
+their OTLP exports through the short gap. The PDB keeps `maxUnavailable: 1` (with one replica,
+`minAvailable: 1` would block every node drain; a PDB doesn't gate the Deployment's own rollouts).
+`test_k8s_policy.py` asserts the replica count, the strategy and the PDB. `x-trace-id` is still returned for every request;
 in prod a dropped trace's ID simply finds nothing in Tempo.
 
 ### 8.2 `prometheus/prometheus.yml`
@@ -2125,26 +2139,30 @@ gives NaN, which compares false, so the burn alerts stay quiet when idle.
 | `BffAvailabilityFastBurn` | `sli:bff_errors:ratio_rate1h > (14.4 * 0.005) and sli:bff_errors:ratio_rate5m > (14.4 * 0.005)` | 2m | page | `service_name: web`, `slo: bff-availability` |
 | `BffAvailabilitySlowBurn` | `sli:bff_errors:ratio_rate6h > (6 * 0.005) and sli:bff_errors:ratio_rate30m > (6 * 0.005)` | 15m † | ticket | `service_name: web`, `slo: bff-availability` |
 | `PayoutSettlementSlow` | `max(payroll_runs_processing_oldest_age_seconds) > 60` | 2m | page | `service_name: payroll` |
-| `PayoutDLQ` | `increase(queue_messages_total{outcome="dlq"}[15m]) > 0` | 0m | page | `service_name: payout-worker` |
+| `PayoutDLQ` | `increase(queue_messages_total{outcome="dlq"}[15m]) > 0 or (queue_messages_total{outcome="dlq"} > 0 unless max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m)) or (queue_messages_total{outcome="dlq"} - max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m) > 0)` (C75, C77) | 0m | page | `service_name: payout-worker` |
 | `PayoutNeedsOperator` | `max(payroll_attempts_needs_operator) > 0` | 1m † | page | `service_name: payroll` |
+| `PayoutLateSettlement` | `increase(payroll_late_settlements_total[15m]) > 0 or (payroll_late_settlements_total > 0 unless max_over_time(payroll_late_settlements_total[1h] offset 15m)) or (payroll_late_settlements_total - max_over_time(payroll_late_settlements_total[1h] offset 15m) > 0)` (C75, C77) | 0m | page | `service_name: payroll`; runbook `docs/runbooks/PayoutLateSettlement.md` (possible double payment) |
 | `PayoutsStuck` | `max(payroll_payouts_stuck) > 0` | 10m | page | `service_name: payroll` |
 | `PayoutStreamNearMaxlen` † | `max(redis_stream_length{stream="stream:payout.requested"}) > 0.8 * 100000` | 5m | warning | `service_name: redis` |
-| `EmailOutboxStuck` † | `max(identity_email_oldest_pending_age_seconds) > 900 or sum(increase(identity_emails_failed_total[1h])) > 0` (R25, C20) | 5m | warning | `service_name: identity` |
+| `EmailOutboxStuck` † | `max(identity_email_oldest_pending_age_seconds) > 900 or sum(increase(identity_emails_failed_total[1h])) > 0 or sum(identity_emails_failed_total > 0 unless max_over_time(identity_emails_failed_total[2h] offset 1h)) > 0 or sum(identity_emails_failed_total - max_over_time(identity_emails_failed_total[2h] offset 1h) > 0) > 0` (R25, C20, C75, C77) | 5m | warning | `service_name: identity` |
 | `RateLimiterErrors` † | `sum by (service_name, component) (rate(rate_limiter_errors_total[5m])) > 0` | 5m | warning | — |
 | `OutboxStuck` † | `max by (service_name) (outbox_oldest_age_seconds) > 60` | 1m | warning | — |
 | `ConsumerLagGrowing` † | `max by (stream, group) (queue_consumer_lag) > 0 and max by (stream, group) (deriv(queue_consumer_lag[10m])) > 0` | 10m | warning | `service_name: payout-worker` |
 | `BankBreakerOpen` † | `max(circuit_breaker_state{target="bank"}) == 2` | 5m | warning | `service_name: payout-worker` |
 | `BankErrorRateHigh` † | `provider:external_errors:ratio_rate5m{provider="bank"} > 0.05` | 10m | warning | `service_name: payout-worker` |
-| `SigninFailuresSpike` † | `sum(increase(auth_signins_total{outcome="failure"}[15m])) > 50` (C19) | 0m | warning | `service_name: identity` |
+| `SigninFailuresSpike` † | `sum((increase(auth_signins_total{outcome="failure"}[15m]) and max_over_time(auth_signins_total{outcome="failure"}[1h] offset 15m)) or (auth_signins_total{outcome="failure"} unless max_over_time(auth_signins_total{outcome="failure"}[1h] offset 15m))) > 50` (C19, C77) | 0m | warning | `service_name: identity` |
 | `RedisMemoryHigh` † | `max(redis_memory_used_bytes / (redis_memory_max_bytes > 0)) > 0.8` | 5m | warning | `service_name: redis` |
 | `PodRestarts` † | `increase(kube_pod_container_status_restarts_total{namespace=~"payrun-.*"}[15m]) > 2` | 0m | warning | — (Kubernetes only, R28) |
-| `CollectorDropping` † | `(sum(rate(otelcol_exporter_send_failed_spans_total[5m])) or vector(0)) + (sum(rate(otelcol_exporter_send_failed_metric_points_total[5m])) or vector(0)) + (sum(rate(otelcol_exporter_send_failed_log_records_total[5m])) or vector(0)) + (sum(rate(otelcol_receiver_refused_spans_total[5m])) or vector(0)) > 0` | 10m | warning | `service_name: otel-collector` |
+| `CollectorDropping` † | `(sum(rate({__name__=~"otelcol_exporter_send_failed_spans(_total)?"}[5m])) or vector(0)) + (sum(rate({__name__=~"otelcol_exporter_send_failed_metric_points(_total)?"}[5m])) or vector(0)) + (sum(rate({__name__=~"otelcol_exporter_send_failed_log_records(_total)?"}[5m])) or vector(0)) + (sum(rate({__name__=~"otelcol_receiver_refused_spans(_total)?"}[5m])) or vector(0)) > 0` (Collector 0.164 exports its own counters without `_total`; the regex takes either name) | 10m | warning | `service_name: otel-collector` |
 
 Notes:
 - **BankErrorRateHigh excludes business rejections by construction:** a bank `rejected` answer is HTTP 2xx, so the resilient client counts it as `outcome="ok"`; business outcomes are counted separately in `payouts_bank_transfers_total{outcome, reason}`.
-- **PayoutDLQ:** the worker pre-initialises `queue_messages_total{outcome="dlq"}` to 0 (C21; payout-worker LLD §3.3). Without that, a counter that first appears at 1 has `increase() = 0` and the alert never fires; a promtool case documents this.
+- **PayoutDLQ:** the worker pre-initialises `queue_messages_total{outcome="dlq"}` to 0 (C21; payout-worker LLD §3.3). That alone isn't enough: a DLQ inside a restarted worker's first export interval reaches Prometheus as a series that starts at 1, which `increase()` reads as 0. The live drill hit exactly this (C75). So the rule also fires on a series above 0 that had **no sample in the hour before the window** (`unless max_over_time(X[1h] offset 15m)`); PayoutLateSettlement uses the same arm, and EmailOutboxStuck `unless max_over_time(X[2h] offset 1h)` for its 1 h window. The first version compared with one instant (`unless X offset 15m`), which also fired for an **old** series above 0 whenever that instant fell more than the 5 m lookback into a data gap (a Prometheus restart, a Collector outage, or `metric_expiration` dropping a stalled exporter). Set operators match on every label except `__name__`, so `unless` matches `max_over_time`'s output without `ignoring`.
+- **The gap arm (C77):** an old series that **rose during** a data gap longer than the window (at 3, no samples for 20 m while the counter moved, back at 5) was a false negative: `increase()` sees only the post-gap samples (0), and the new-series arm is suppressed because the series has samples in the hour before the window. The third arm, `X - max_over_time(X[1h] offset 15m) > 0` (EmailOutboxStuck: `[2h] offset 1h`, inside `sum`), pages on it with the rise as `$value` (5 − 3 = 2), until the post-gap samples enter the lookback 15 m (1 h) later. Arithmetic one-to-one matching also ignores `__name__`, so the subtraction pairs each series with its own past (the promtool cases check the labels). A per-process series never resets (each process has its own `service.instance.id`), so a positive difference is always an increase. **Remaining limit:** a gap longer than the lookback (1 h; EmailOutboxStuck 2 h) makes an old series look new, and the new-series arm pages with its full value.
+- **promtool** cases cover, for all three alerts: a new series (fires; its window boundary is pinned to the 30 s evaluation, so `offset 15m` → `10m` or `15m30s` fails), an old series behind a gap with no increase (quiet), and an old series that rose during a gap (fires). The Queues panels and `alert_drills.sh` count the same cases (§8.8).
+- **SigninFailuresSpike** sums, per series, `increase()` for a series that had a sample in the hour before the window and the full value of one that didn't (a restarted identity whose first export already counts failures; C77). A restart, or a rollout across replicas, splits the failures between old and new series, and both count towards the one threshold of 50; `increase(…) > 50 or new > 50` would miss 30 + 30. A promtool case checks exactly that split.
 - The `max()` in the payroll gauge alerts collapses replicas, as the plan requires.
-- **EmailOutboxStuck** uses the counter, not a gauge of failed rows, so it clears one hour after the last failure once SMTP is fixed (R25).
+- **EmailOutboxStuck** uses the counter, not a gauge of failed rows, so it clears one hour after the last failure once SMTP is fixed (R25); a new failure series clears an hour after it first appeared, a gap-arm rise an hour after the series came back.
 - **PodRestarts** needs kube-state-metrics, a listed cluster dependency (R28). The rule ships in the Kubernetes observability install only, not in the Compose Prometheus; its promtool test still runs in CI.
 - Every alert has these annotations:
 
@@ -2153,14 +2171,14 @@ annotations:
   summary: "<one line, e.g. 'Payouts were dead-lettered in the last 15 minutes'>"
   description: "<what it means and the first check, with {{ $value }} where useful>"
   runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/<AlertName>.md"
-  dashboard_url: "http://127.0.0.1:4101/d/<dashboard uid>"     # dev; overlays rewrite the host
+  dashboard_url: "http://127.0.0.1:4101/d/<dashboard uid>"     # the dev Grafana (Compose)
 ```
 
 Example, verbatim in the file:
 
 ```yaml
 - alert: PayoutDLQ
-  expr: increase(queue_messages_total{outcome="dlq"}[15m]) > 0
+  expr: 'increase(queue_messages_total{outcome="dlq"}[15m]) > 0 or (queue_messages_total{outcome="dlq"} > 0 unless max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m)) or (queue_messages_total{outcome="dlq"} - max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m) > 0)'
   labels: { severity: page, service_name: payout-worker }
   annotations:
     summary: "Payout messages were dead-lettered in the last 15 minutes"
@@ -2169,29 +2187,32 @@ Example, verbatim in the file:
     dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
 ```
 
-**Alert → dashboard:** BFF burn alerts → `payrun-journeys`; Payout*, Outbox, ConsumerLag → `payrun-queues`; Bank* → `payrun-bank`; EmailOutboxStuck, RateLimiterErrors, SigninFailuresSpike → `payrun-service-overview`; Redis, Pod, Collector → `payrun-platform`.
+**Alert → dashboard:** BFF burn alerts → `payrun-journeys`; Payout*, Outbox, ConsumerLag, EmailOutboxStuck ("Identity emails" panel) → `payrun-queues`; Bank* → `payrun-bank`; RateLimiterErrors, SigninFailuresSpike → `payrun-service-overview`; Redis, Pod, Collector → `payrun-platform`.
 
-**promtool tests** (`prometheus/tests/slo_test.yml` loads `recording.yml`; `alerts_test.yml` loads both files; `evaluation_interval: 30s`). Every alert has at least one **fires** and one **stays quiet** case (`test_rules_meta.py` enforces this):
+**`dashboard_url` outside dev:** the URLs in `alerts.yml` and `alerts-kubernetes.yml` are hard-coded to the dev Grafana (`http://127.0.0.1:4101`); nothing rewrites them per environment. A uat or prod install must template the host itself, for example from an external label (`global.external_labels` with the Grafana base URL, used as `{{ $externalLabels.grafana_url }}/d/<uid>` in the annotation) or in the Alertmanager notification template. Until then the link in a uat or prod notification points at a dev address; the runbook link does not depend on it.
+
+**promtool tests** (`prometheus/tests/slo_test.yml` loads `recording.yml`; `alerts_test.yml` loads both files; `panels_test.yml` checks the Queues counter-panel expressions with `promql_expr_test`, §8.8; `evaluation_interval: 30s`). Every alert has at least one **fires** and one **stays quiet** case (`test_rules_meta.py` enforces this):
 
 | Alert | Fires when (input series) | Stays quiet when |
 |---|---|---|
 | `BffAvailabilityFastBurn` | 10% of `bff_request_duration_seconds_count` are `status="500"` for 70 m (1 h ratio 0.1 > 0.072); expected at 65m with labels and the full annotations | 5% errors (< 0.072), and a 4 m spike of 100% errors (5 m window high, 1 h low); only `/api/readyz` and `/api/livez` failing (C4) |
 | `BffAvailabilitySlowBurn` | 4% errors for 7 h (> 0.03) | 2% errors for 7 h; no traffic (NaN) |
 | `PayoutSettlementSlow` | gauge 0 then 90 for 5 m | 45 for 30 m; 90 for 1 m only |
-| `PayoutDLQ` | counter `0 0 0 1 1 1 …` (pre-initialised) | flat 0; **and the documented pitfall:** a series that first appears at 1 does not fire |
+| `PayoutDLQ` | counter `0 0 0 1 1 1 …` (pre-initialised); a series that first appears at 1 (`_ _ _ 1x30`, C75): firing at 5 m and 17 m 30 s, gone at 18 m (the 3 m sample enters `(t-75m, t-15m]` at 18 m); an old series that rose during a gap (`3x30 _x20 5x30`, C77): firing at 51 m (value 2) and 65 m 30 s, gone at 66 m | flat 0; retries only; an old series at 3 with a 10 m data gap, at 52 m and 55 m (C75) |
 | `PayoutNeedsOperator` | 1 for 3 m (one replica 0, another 1, so `max` matters) | 0 |
+| `PayoutLateSettlement` | counter `0 0 0 1 …` (pre-initialised); a series that first appears at 1 (`_ _ 1x30`, a restarted payroll; C75): firing at 4 m and 16 m 30 s, gone at 17 m; an old series that rose during a gap (`3x30 _x20 5x30`, C77): firing at 51 m, gone at 66 m | flat, then clear 15 m after the increment; an old series at 3 with a 10 m data gap, at 52 m and 55 m (C75) |
 | `PayoutsStuck` | 2 for 12 m | 2 for 8 m, then 0 |
 | `PayoutStreamNearMaxlen` | 85000 for 10 m | 79000 |
-| `EmailOutboxStuck` | oldest pending 1000 s for 6 m; separately `identity_emails_failed_total` going 0 → 1 (fires after 5 m) | pending 300 s and the counter flat; **clears** 1 h after the counter stops rising (R25) |
+| `EmailOutboxStuck` | oldest pending 1000 s for 6 m; separately `identity_emails_failed_total` going 0 → 1 (fires after 5 m); a failure series that first appears at 1 (`_ _ 1x80`: pending from 2 m, firing at 7 m and 61 m 30 s, gone at 62 m, when the 2 m sample enters `(t-3h, t-1h]`; C75); an old failure series that rose during a 70 m gap, longer than the 1 h window (`3x30 _x70 5x100`, C77): pending at 105 m, firing at 106 m (value 2), gone at 161 m | pending 300 s and the counter flat; **clears** 1 h after the counter stops rising (R25); an old failure series at 3 with a 20 m data gap, at 105 m and 110 m (C75; 20 m, so the old instant arm would have outlasted `for: 5m`) |
 | `RateLimiterErrors` | counter rising for 10 m | flat |
 | `OutboxStuck` | oldest age 120 for 3 m | 20 |
 | `ConsumerLagGrowing` | lag rising 0 → 500 linearly over 25 m | a 500-message burst draining within 2 m |
 | `BankBreakerOpen` | 2 for 6 m | 2 for 3 m then 0; 1 (half-open) |
 | `BankErrorRateHigh` | 10% `timeout` outcomes for 15 m | 4%; 100% `ok` (including business rejections) |
-| `SigninFailuresSpike` | 60 `outcome="failure"` in 15 m | 30 failures; 1000 `success`; 100 `rate_limited` (C19) |
+| `SigninFailuresSpike` | 60 `outcome="failure"` in 15 m; a replica's increase of 30 plus a restarted replica's new series first exported at 30, at 45 m (C77); a new series first exported at 60 | 30 failures; 1000 `success`; 100 `rate_limited` (C19); the split case before the new series appears (39 m); a new series at 40 |
 | `RedisMemoryHigh` | used 0.9 × max for 6 m | 0.5 × max; `max = 0` (no limit) |
 | `PodRestarts` | +3 restarts in 15 m | +1 |
-| `CollectorDropping` | failed spans rising for 12 m | all counters flat; series absent (`or vector(0)`) |
+| `CollectorDropping` | failed spans rising for 12 m | series absent (`or vector(0)`); every failure counter present and flat, once with the unsuffixed names and once with `_total` |
 
 SLO recording tests check `sli:bff_errors:ratio_rate5m` = 0.1 for a 10% input, the route exclusion (5xx on `/api/livez`, `/api/readyz` and `/api/telemetry` don't count), and `sli:payout_settlement_p95:1h` against hand-computed bucket input (p95 within 45–60 s for a run settling in about 50 s).
 
@@ -2376,11 +2397,21 @@ panels show exemplars; per-service metrics are filtered by `service_name`.
 | J4 Approve and pay | approve route success and p95; `payroll_pay_runs_total` by outcome; `payroll_payouts_total` by outcome; `payroll_runs_processing_oldest_age_seconds`; `payroll_payout_settlement_seconds` heatmap |
 | J5 Recover | retry route success; `payroll_payouts_total{outcome="failed"}` |
 
-**`queues.json`** (uid `payrun-queues`): `outbox_unsent` and `outbox_oldest_age_seconds` by service (60 s line); `queue_messages_total` rate by outcome; `queue_processing_seconds` p50 / p95; `queue_consumer_lag`; `queue_dlq_messages`; `redis_stream_length` for both streams (80000 line); `payroll_payouts_republished_total` rate; `payroll_payouts_stuck`; `payroll_attempts_needs_operator`; `payroll_runs_processing_oldest_age_seconds` (60 s line); `identity_emails_pending`, `increase(identity_emails_failed_total[1h])` (C20), `identity_email_oldest_pending_age_seconds`; a log panel for `queue.*`, `outbox.*` and `payout.*` events.
+**`queues.json`** (uid `payrun-queues`): `outbox_unsent` and `outbox_oldest_age_seconds` by service (60 s line); `queue_messages_total` rate by outcome; `queue_processing_seconds` p50 / p95; `queue_consumer_lag`; `queue_dlq_messages`; `redis_stream_length` for both streams (80000 line); `payroll_payouts_republished_total` rate; `payroll_payouts_stuck`; `payroll_attempts_needs_operator`; `payroll_runs_processing_oldest_age_seconds` (60 s line); `identity_emails_pending`, failed emails in the last hour (C20), `identity_email_oldest_pending_age_seconds`; "Dead-lettered messages" (dead-lettered in the last 15 m, with `queue_dlq_messages` by stream) and "Late settlements (possible double payment)" (late settlements in the last 15 m); a log panel for `queue.*`, `outbox.*` and `payout.*` events.
+
+The three counter panels (dead-lettered and late settlements over 15 m, email failures over 1 h) show what their alerts count, new series and data gaps included (C75, C77). Per series, they take the last value in the window minus the highest value in the lookback before it (`clamp_min(last_over_time(X[15m]) - max_over_time(X[1h] offset 15m), 0)`: an old series, across a gap too), or the full last value of a series with no sample in the lookback (`last_over_time(X[15m]) unless max_over_time(X[1h] offset 15m)`: a new series, such as a restarted process whose first export is already above 0); the `or` sits **inside** `sum()`, so new and old series add up, and `or vector(0)` shows 0 when no series exists. Email failures use `[1h]` and `[2h] offset 1h`. `last_over_time` keeps a stopped process's rise visible for the whole window. For example:
+
+```promql
+sum(clamp_min(last_over_time(queue_messages_total{outcome="dlq"}[15m]) - max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m), 0)
+    or (last_over_time(queue_messages_total{outcome="dlq"}[15m]) unless max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m)))
+  or vector(0)
+```
+
+`prometheus/tests/panels_test.yml` checks the three expressions with `promql_expr_test` (a pre-initialised series, a new series, an old series that rose during a gap, a stopped process, no series), `test_dashboards.py` checks that the panels and the `alert_drills.sh` checks use them verbatim, and `manifests.sh` runs it with the other promtool tests.
 
 **`bank.json`** (uid `payrun-bank`; the "Bank (stub) dependency" dashboard): `external_requests_total{provider="bank"}` by outcome; error ratio vs 5%; `external_request_duration_seconds{provider="bank"}` p50 / p95 / p99 (exemplars); `circuit_breaker_state{target="bank"}`; `payouts_bank_transfers_total` by outcome and reason; the same request, latency and breaker panels for `provider="payroll"` (worker → payroll); a log panel for `bank.transfer.*` events.
 
-**`platform.json`** (uid `payrun-platform`): Postgres `pg_up`, connections by role, transactions per second, deadlocks, database size; Redis `redis_up`, memory used vs max (80% line), connected clients, commands per second, AOF status, `redis_evicted_keys_total` (must stay 0); Collector accepted, refused and failed spans, metric points and log records; pod restarts and container CPU / memory (Kubernetes only; empty in Compose); scrape-target `up` table; firing alerts (`ALERTS{alertstate="firing"}`).
+**`platform.json`** (uid `payrun-platform`): Postgres `pg_up`, connections by role, transactions per second, deadlocks, database size; Redis `redis_up`, memory used vs max (80% line), connected clients, commands per second, AOF status, `redis_evicted_keys_total` (must stay 0); Collector accepted, refused and failed spans, metric points and log records; services' "Memory (RSS) by service" (`process_memory_usage_bytes` by service and instance; `process_resident_memory_bytes` by job for the Go processes of the observability stack and exporters, Collector excluded) and "Process starts in the last hour" (processes per service, counted by their `process_cpu_time_seconds_total` series; restarts by job from `process_start_time_seconds`); pod restarts and container CPU / memory (Kubernetes only; empty in Compose); scrape-target `up` table; firing alerts (`ALERTS{alertstate="firing"}`).
 
 ## 9. Kubernetes (`deploy/k8s/`; PAY-NFR-13, ADR 0008, 0011)
 
@@ -2456,6 +2487,7 @@ spec:
             - { name: OTEL_SEMCONV_STABILITY_OPT_IN, value: http }
             - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: http://otel-collector:4317 }
             - { name: OTEL_TRACES_SAMPLER, value: parentbased_always_on }   # C23, every overlay
+            - { name: OTEL_EXPORTER_OTLP_TIMEOUT, value: "3" }   # seconds; Python Deployments only (C67)
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -2642,7 +2674,7 @@ CMD ["python", "-m", "pycommon.serve"]
 
 ```dockerfile
 # syntax=docker/dockerfile:1
-ARG NODE_IMAGE=node:24-slim@sha256:<digest>
+ARG NODE_IMAGE=node:24-trixie-slim@sha256:<digest>   # Debian 13, like the Python images (C78)
 
 FROM ${NODE_IMAGE} AS deps
 ENV PNPM_HOME=/pnpm COREPACK_ENABLE_DOWNLOAD_PROMPT=0
@@ -2741,7 +2773,7 @@ jobs:
 | `python` (matrix: `pycommon`, `identity`, `payroll`, `payout_worker`, `bank_stub`, `platform`) | ubuntu-latest (Docker for Testcontainers) / 20 min | checkout, setup-uv, `uv python install`, script, upload coverage | `python.sh <member>` | uv cache keyed on `uv.lock` |
 | `web` | ubuntu-latest / 15 min | checkout, setup-node (`.nvmrc`), corepack, script, upload coverage | `web.sh` | pnpm store keyed on `pnpm-lock.yaml`; `apps/web/.next/cache` |
 | `contract` | ubuntu-latest / 15 min | checkout with `fetch-depth: 0` (needs `origin/main`), setup-uv, setup-node, script | `contract.sh` | uv, pnpm |
-| `e2e` (env `E2E_SUITE: skeleton` until F3, then `full`; C51) | ubuntu-latest / 40 min | checkout, setup-uv, setup-node, `docker/setup-buildx-action`, install k6 (pinned) and Playwright browsers (`pnpm exec playwright install --with-deps chromium`), script; `if: failure()` upload `playwright-report/`, `ci-logs/`; `if: always()` `stack.sh down -v` | `e2e.sh` | uv, pnpm, Playwright browsers keyed on the Playwright version, buildx `type=gha` per image |
+| `e2e` (env `E2E_SUITE: skeleton` until F3, then `full`; C51) | ubuntu-latest / 40 min | checkout, setup-uv, setup-node, `docker/setup-buildx-action`, install k6 (pinned) and Playwright browsers (`pnpm exec playwright install chromium`; no `--with-deps`, C77), script; `if: failure()` upload `playwright-report/`, `ci-logs/`; `if: always()` `stack.sh down -v` | `e2e.sh` | uv, pnpm, Playwright browsers keyed on the Playwright version, buildx `type=gha` per image |
 | `images` | ubuntu-latest / 30 min | checkout, setup-buildx, script (`.trivyignore` policy check, build `linux/amd64`, Trivy) | `images.sh` | buildx `type=gha`; Trivy DB cache |
 | `manifests` | ubuntu-latest / 10 min | checkout, setup-uv, script (k8s asset sync diff, kustomize, kubeconform, k8s policy test, promtool, amtool, collector validate, compose config) | `manifests.sh` | uv |
 | `security` | ubuntu-latest / 10 min | checkout with `fetch-depth: 0`, setup-uv, setup-node, script (pip-audit, pnpm audit, gitleaks over `base..head`) | `security.sh` | uv, pnpm |
@@ -2764,15 +2796,27 @@ concurrency: { group: nightly, cancel-in-progress: false }
 
 | Job | Timeout | Script | Proves |
 |---|---|---|---|
-| `load` | 75 min | `nightly-load.sh` | full 30 req/s × 10 min, soak 5 req/s × 30 min, settlement p95 ≤ 60 s for 500 employees (PAY-NFR-05, 06) |
-| `resilience` | 60 min | `nightly-resilience.sh` | every fault in plan §12.1 (PAY-NFR-02, 03) |
-| `e2e-repeat` | 75 min | `nightly-e2e.sh` | e2e three times in a row (flakiness) |
-| `schemathesis-deep` | 45 min | `nightly-schemathesis.sh` | 500 examples per operation |
-| `audit` | 20 min | `nightly-audit.sh` | pip-audit, pnpm audit and Trivy against fresh advisories |
+| `load` | 100 min (nominal ~55; measured 46 min in run 43040233170) | `nightly-load.sh` | full 30 journey iterations/s (~44 req/s) × 10 min, soak 5 journey iterations/s × 30 min with no latency drift, no memory growth and no consumer-lag growth (`soak_resources.py`), settlement p95 ≤ 60 s for 500 employees (PAY-NFR-05, 06) |
+| `resilience` | 60 min (measured 33 min in run 43040233170) | `nightly-resilience.sh` | every fault in plan §12.1, each with its HLD §4 log event and metric (PAY-NFR-02, 03) |
+| `e2e-repeat` | 120 min (3 × the PR `e2e` job's 40 min; measured 28 min in run 43074520518) | `nightly-e2e.sh` | the full e2e three times in a row (flakiness) |
+| `schemathesis-deep` | 45 min (measured 8.5 min in run 43040233170) | `nightly-schemathesis.sh` | 500 examples per operation |
+| `audit` | 20 min (measured 2.5 min in run 43040233170) | `nightly-audit.sh` | pip-audit, pnpm audit and Trivy against fresh advisories |
 
-**Failure issues:** each job tees its script output to `ci-logs/<job>.log`. A final step
-`if: failure()` runs `scripts/ci/report_failure.sh <job>` with job-level `permissions: {contents: read, issues: write}`
-and `GH_TOKEN: ${{ github.token }}`. The script:
+The measured durations are from the nightly runs on `release/0.1.0` (43040233170; `e2e-repeat` from
+43074520518, the first run where it could start, C77). The first full pass of all five jobs is
+43074520518 (2026-11-11: load 47 min, resilience 35 min, e2e-repeat 28 min). Every timeout keeps
+room for a slower runner, so none changed.
+
+**Failure issues:** each job tees its script output to `ci-logs/<job>.log` and uploads it as the
+artifact `log-<job>` (`if: always()`); only these jobs hold `contents: read`. A separate job,
+`report`, runs after all five (`needs: [load, resilience, e2e-repeat, schemathesis-deep, audit]`,
+`if: !cancelled() && contains(needs.*.result, 'failure')`). It is the only job with
+`permissions: {contents: read, issues: write}`. It downloads the `log-*` artifacts into
+`nightly-logs/` and, for each job whose result is `failure`, finds that job's log with
+`find nightly-logs/log-<job> -name <job>.log -print -quit` (an artifact is rooted at the common
+ancestor of its upload paths, so `load`, which also uploads `load/results/`, has its log at
+`log-load/ci-logs/load.log`), falling back to `nightly-logs/log-<job>/<job>.log`, and runs
+`scripts/ci/report_failure.sh <job> <log>` with `GH_TOKEN: ${{ github.token }}`. The script:
 1. looks for an open issue labelled `nightly-failure` titled `Nightly failure: <job>` (`gh issue list --label nightly-failure --state open --search "in:title \"Nightly failure: <job>\"" --json number`);
 2. builds a body with the run URL, the commit SHA, and the last 150 lines of the log, passed through `scripts/ci/lib.sh`'s `scrub` (masks anything matching the redactor's JWT/PEM/Bearer patterns, though CI uses throwaway keys);
 3. comments on the issue if it exists, otherwise creates it (`gh issue create --label nightly-failure`), creating the label on first use.
@@ -2790,19 +2834,20 @@ through the same scripts.
 | Python types | `mypy --strict <src> <tests>` | 0 errors | python |
 | Service coverage | `pytest … --cov=<pkg> --cov-branch --cov-append --cov-fail-under=85` (unit + integration); the same threshold is `fail_under = 85` in each service's `pyproject.toml`, so a local run from the member directory enforces it too (C63) | ≥ 85% lines, per service | python |
 | pycommon coverage | same, `--cov=pycommon --cov-fail-under=90`; `fail_under = 90` in `libs/pycommon/pyproject.toml` (C63) | ≥ 90% lines | python |
-| Web lint / format / types | `pnpm --filter web lint`, `prettier --check .`, `pnpm --filter web typecheck` (`tsc --noEmit`) | 0 errors | web |
+| Web lint / format / types | `pnpm --filter web lint`, `prettier --check .`, `pnpm --filter web typecheck` and `pnpm --filter @payrun/api-client typecheck` (`tsc --noEmit`) | 0 errors | web |
 | Web coverage | Vitest `coverage.thresholds.lines = 80` | ≥ 80% lines | web |
+| Web integration (real Redis) | `pnpm --filter web int` (`vitest.int.config.ts`, Testcontainers; Docker needed; web LLD §9.1) | all pass | web |
 | Web build | `pnpm --filter web build` | succeeds | web |
 | Contract drift | `export_openapi.py --all` + `pnpm --filter @payrun/api-client generate` + `git diff --exit-code` | no diff | contract |
 | Breaking changes | `oasdiff breaking <main spec> <PR spec> --fail-on ERR` (skipped when `main` has no spec) | none | contract |
 | Event schemas | `check-jsonschema --check-metaschema` + examples; producer and consumer tests validate envelopes | pass | contract, python |
 | API fuzz | `schemathesis run … --checks all` per service | no 5xx, no schema violations | e2e |
 | End to end | Playwright: `@skeleton` while `E2E_SUITE=skeleton`, then `@journeys` + trace test + axe (C51) | all pass; no serious/critical axe violations | e2e |
-| Fault smoke (C38) | `pytest tests/resilience -m smoke`: the 1–2 PR Toxiproxy tests (slow DB, identity down) | pass | e2e |
+| Fault smoke (C38) | `pytest tests/resilience -m smoke`: the PR Toxiproxy tests (slow DB, identity down), each also checking its HLD §4 metric in Prometheus | pass | e2e |
 | Seed (PAY-609) | `pytest tests/platform/test_seed.py -m stack` + `test_mint_token.py` | pass | e2e, python (platform) |
 | Start-up (PAY-NFR-15) | `stack.sh up --check-startup` | every service ready ≤ 20 s after its migrations | e2e |
 | Load smoke | `k6 run load/smoke.js` (5 VUs × 30 s) | p95 < 300 ms, errors < 1% | e2e |
-| Metric names | `check_metrics.sh` | every required series present | e2e |
+| Metric names | `check_metrics.sh` (27 entries, §3.15) | every required series present | e2e |
 | Images | `trivy image --severity HIGH,CRITICAL --exit-code 1 --ignorefile .trivyignore` | no HIGH or CRITICAL | images |
 | Trivy ignore policy (C38) | `images.sh` policy check | every `.trivyignore` entry has a reason, an owner and an unexpired `exp:YYYY-MM-DD`, and is in `SECURITY_DEPENDENCIES.md` | images |
 | Python deps | `pip-audit --strict` | none, except accepted in `SECURITY_DEPENDENCIES.md` | security |
@@ -2815,7 +2860,7 @@ through the same scripts.
 | Kubernetes | `kustomize build … \| kubeconform -strict -summary` for dev, uat, prod (with CRD schemas; no load-restrictor flag) + `test_k8s_policy.py` | pass | manifests |
 | K8s asset copies (R32, C36) | `sync-k8s-assets.sh` + `git diff --exit-code` on the copies | no diff | manifests |
 | Compose | `docker compose config -q` (base and test override) + `test_compose.py` | pass | manifests, python (platform) |
-| Nightly load | `load/full.js`, `load/soak.js`, `load/settlement.js` | p95 < 300 ms (heavy < 1.5 s), errors < 1%, no memory or lag growth in soak (C38); settlement p95 ≤ 60 s | nightly |
+| Nightly load | `load/full.js`, `load/soak.js`, `load/settlement.js` | p95 < 300 ms (heavy < 1.5 s), errors < 1%, no memory or lag growth in soak (C38): RSS slope < 5% per Python service and no `queue_consumer_lag` both > 0 and rising, checked in Prometheus by `soak_resources.py`; settlement p95 ≤ 60 s | nightly |
 | Nightly failure issue (C38) | `report_failure.sh <job>` (§11.2) | a failed nightly job opens or updates its `nightly-failure` issue with the log tail | nightly |
 
 `docs/TESTING.md` records the table and the latest measured values (PAY-NFR-12 check).
@@ -2849,8 +2894,8 @@ through the same scripts.
 | PAY-NFR-07 No secrets in telemetry | `logging.redact`, `RedactingFilter`, OTel hooks, Collector `transform/redact` | `test_logging.py`, `test_otel.py`, `test_secret_not_logged.py`, `test_jwt.py`; e2e Loki/Tempo token search |
 | PAY-NFR-08 Privacy | hashed subjects in limiter keys, no PII metric labels | `test_ratelimit_unit.py`, `test_dashboards.py` |
 | PAY-NFR-09 Tracing | `parentbased_always_on` everywhere (C23), `otel.inject_traceparent` / `new_traceparent` / `context_from_traceparent`, required `Envelope.traceparent` (C22), Collector (prod `tail_sampling`), Tempo, Loki | `test_streams.py` (same trace id), `test_otel.py`; e2e `trace.spec.ts` |
-| PAY-NFR-10 Observability assets | `otel.py` naming rule, Collector, Prometheus, rules, Alertmanager, alert-sink, Grafana, five dashboards, 17 runbooks | `test_rules_meta.py`, `test_dashboards.py`, `test_alert_sink.py`, `check_metrics.sh`, promtool, amtool; Step 6 drills |
-| PAY-NFR-11 Paging alerts | `PayoutDLQ`, `PayoutsStuck`, `PayoutNeedsOperator`, `PayoutSettlementSlow` rules; DLQ counter pre-initialisation | `alerts_test.yml` fire and quiet cases |
+| PAY-NFR-10 Observability assets | `otel.py` naming rule, Collector, Prometheus, rules, Alertmanager, alert-sink, Grafana, five dashboards, 18 runbooks | `test_rules_meta.py`, `test_dashboards.py`, `test_alert_sink.py`, `check_metrics.sh`, promtool, amtool; Step 6 drills |
+| PAY-NFR-11 Paging alerts | `PayoutDLQ`, `PayoutsStuck`, `PayoutNeedsOperator`, `PayoutSettlementSlow`, `PayoutLateSettlement` rules; counter pre-initialisation plus the C75/C77 new-series and gap arms, with promtool gap cases | `alerts_test.yml` fire and quiet cases; `panels_test.yml`; Step 6 drills |
 | PAY-NFR-12 Quality gates | `ci.yml`, `scripts/ci/*.sh` (promtool/amtool, fault smoke, Trivy ignore policy, nightly failure issue; C38), root `pyproject.toml` (ruff, mypy, coverage) | §12 |
 | PAY-NFR-13 Deployability | Compose profiles and override, Dockerfiles, Kustomize base, components, overlays (prod worker replicas 0; C32), Jobs, NetworkPolicies, `sync-k8s-assets.sh` | `test_compose.py`, `test_k8s_policy.py`, kubeconform, `stack.sh up --wait` in e2e |
 | PAY-NFR-15 Recovery and startup | Redis AOF (`redis.conf`), `stack.sh up --check-startup`, `start_period: 20s` health checks | `ci-logs/startup.json` in e2e; resilience `test_redis_restart.py` |
@@ -2860,5 +2905,8 @@ through the same scripts.
 
 - 2026-11-10: incorporated README R-table and C-table decisions (R1, R2, R12, R14, R16, R22, R25, R26, R27, R28, R29, R30, R31, R32; C1, C2, C3, C4, C10, C12, C17, C18, C19, C20, C21, C22, C23, C24, C27, C28, C29, C30, C32, C33, C35, C36, C38, C44, and the later lead decisions C46, C47, C49, C50, C51 and the `not_deployable` startup-check reason).
 - 2026-11-10 (Step 5): folded in C53–C63. C53 settles the worker timing in the test stack: `compose.test.yaml` keeps the shared `x-payout-timing` values, and only in-process integration fixtures lower them. C58 (§1.2 tool settings, pytest-socket), C59 (`check_secrets`, `export_openapi.py`), C60 (`55P03`), C61 (SQLAlchemy `skip_dep_check`, UUIDv7 `jti`, OTel test isolation) and C63 (gauge units, DB-only error mapping and 22021, `fail_under` per member, `alembic_version` re-revoke, `-scan -randomkey`, fatal JWT keyset check, runtime test secrets, `outbox.relay.published`, `RateLimiter.record_denied` / `record_error`, `--k8s-dev-file`). §1.2 now matches the committed workspace files.
+- 2026-11-11 (release review fixes): §3.15 `e2e.sh` row matches the script and C70 (`full` in ci.yml and nightly.yml since F6; seed tests and k6 smoke **before** Schemathesis; seed tests and fault smoke must run with no skips). `nightly-load.sh` row lists `LOAD_SCENARIOS`, `FULL_HOLD`, `SOAK_DURATION`, the drift check, the new soak resource check (`soak_resources.py`: RSS slope < 5% per Python service, no consumer-lag growth; PAY-NFR-05) and the settlement Prometheus cross-check; `nightly-e2e.sh` row updated. Seed section matches `seed.py` (`random.Random(SEED*1000+i)`, the 500-mode shapes, sign-in first and list users only on a 409) and the `test_seed.py` row covers the full and 500 modes. `OTEL_EXPORTER_OTLP_TIMEOUT` (seconds, Python only, 3; C67) added to §3.3 exporters, §4 and the Compose / Kubernetes excerpts; `test_k8s_policy.py` checks it. §11.2 timeouts: `load` 100 min, `e2e-repeat` 120 min (unmeasured on runners; H2).
+- 2026-11-11 (alignment review fixes): §1.1 tree lists `CLAUDE.md`, `docs/API.md`, `deploy/k8s/observability/` and `scripts/ci/{k6.sh,schemathesis.sh,schemathesis.toml,alert_drills.sh}`; `.trivyignore` holds 17 accepted base-image CVEs (C66); `.env.example` documents the keys `dev-env.sh` writes (other keys take code defaults). §3.15 `web.sh` row and §12 add `pnpm --filter @payrun/api-client typecheck` and `pnpm --filter web int` (Docker); `check_metrics.sh` row lists the script's 26 names (8 added: email failures and age, Redis memory, DLQ length, process RSS, sign-ins, external-call histogram). §8.1 `metric_expiration: 2m` (C72), prod `expected_new_traces_per_sec: 100` as in `collector.prod.yaml`, and the Collector is one replica in every overlay (uat and prod had 2; tail sampling needs whole traces), asserted by `test_k8s_policy.py`. §8.3: the C75 new-series arm is `unless max_over_time(X[1h] offset 15m)` (EmailOutboxStuck `[2h] offset 1h`), so an old series behind a data gap no longer pages; promtool gap cases for all three, a PayoutLateSettlement row in the promtool table, CollectorDropping copied from `alerts.yml` (the `(_total)?` regex) with flat-counter quiet cases; EmailOutboxStuck links to `payrun-queues`; `dashboard_url` is the dev host and other environments must template it (the "overlays rewrite the host" claim was wrong). §11.2 describes the separate `report` job and how it finds each log, and records the measured nightly durations (run 43040233170); timeouts unchanged. §6.1 adds the relay-crash integration test; §3.15 `nightly-resilience.sh` row: each fault test checks its HLD §4 log event and metric, and the payout timing comes from `docker compose config`.
+- 2026-11-11 (review fixes, platform): §8.3 adds the C77 gap arm `X - max_over_time(X[1h] offset 15m) > 0` to PayoutDLQ and PayoutLateSettlement (EmailOutboxStuck `[2h] offset 1h`, inside `sum`): an old series that rose during a data gap longer than the window no longer goes unpaged; the remaining limit is a gap longer than the lookback (1 h; 2 h), which makes an old series look new. SigninFailuresSpike sums `increase()` of old series and the full value of new ones per series (a restart splits failures between both). promtool: gap cases for all three alerts, the new-series window boundaries pinned at 17 m 30 s / 18 m (PayoutDLQ), 16 m 30 s / 17 m (PayoutLateSettlement) and 61 m 30 s / 62 m (EmailOutboxStuck), and two SigninFailuresSpike cases. §8.8 describes the Queues counter panels' final form and the Platform memory and process-start panels; `panels_test.yml` proves the panel expressions and `test_dashboards.py` keeps the panels and drill checks equal to them. §8.1: the Collector Deployment uses `Recreate` (no surge gateway), PDB unchanged (`maxUnavailable: 1`). §3.15: `check_metrics.sh` takes full selectors (27 entries: the web limiter's and identity's failure series by label); the `nightly-resilience.sh` row says which test checks which part of the bank-timeout row, how slow DB checks its log event, and that a Compose config lacking a timing key fails; `nightly-load.sh` rates are journey iterations/s. §6.2 adds `test_resilience_helpers.py`. Traceability PAY-NFR-11 lists PayoutLateSettlement and the C75/C77 arms.
 
 Nothing is open.

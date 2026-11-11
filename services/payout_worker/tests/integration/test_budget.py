@@ -30,15 +30,17 @@ async def test_bank_unreachable_becomes_indeterminate(stack: Stack) -> None:
         )
 
     await wait_for(indeterminate, within=30)
-    [payout] = await stack.payouts(run["id"])
-    assert payout["status"] == "requested"
-    row = await stack.db.fetchrow("SELECT status, outcome, deliveries FROM payouts.disbursements")
-    assert (row["status"], row["outcome"], row["deliveries"]) == ("done", "indeterminate", 3)
 
+    # The report (step 7) commits before ``finish`` (step 8.1) marks the row done, and the XACK
+    # follows ``finish``: wait for the ACK before reading the worker's row.
     async def acked() -> bool:
         return await stack.pending() == 0
 
     await wait_for(acked)
+    [payout] = await stack.payouts(run["id"])
+    assert payout["status"] == "requested"
+    row = await stack.db.fetchrow("SELECT status, outcome, deliveries FROM payouts.disbursements")
+    assert (row["status"], row["outcome"], row["deliveries"]) == ("done", "indeterminate", 3)
     assert await stack.redis.exists(DLQ) == 0
     assert await stack.transfers() == 0
 

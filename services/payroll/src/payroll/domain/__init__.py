@@ -24,6 +24,7 @@ __all__ = [
     "HoursMissing",
     "HoursOutOfBounds",
     "InvalidCursor",
+    "InvalidFields",
     "InvalidPeriodStart",
     "NoEmployees",
     "NotFound",
@@ -31,6 +32,10 @@ __all__ = [
     "PayRunExists",
     "PayRunLocked",
     "PayRunNotApprovable",
+    "PayoutNotBlocked",
+    "PayoutNotRetryable",
+    "ResolveTooEarly",
+    "RetryLimitReached",
 ]
 
 
@@ -161,6 +166,23 @@ class InvalidCursor(DomainError):
         return [{"field": "query.cursor", "issue": "invalid_cursor"}]
 
 
+class InvalidFields(DomainError):
+    """422 ``validation_error`` for a rule that needs the stored row, such as the merged pay basis
+    of a PATCH (design §4.3). ``issues`` are ``(field, issue)`` pairs; values are never echoed."""
+
+    status = 422
+    code = "validation_error"
+    message = "The request failed validation."
+
+    def __init__(self, issues: Iterable[tuple[str, str]]) -> None:
+        super().__init__()
+        self.issues = list(dict.fromkeys(issues))
+
+    @property
+    def details(self) -> Sequence[Mapping[str, Any]]:
+        return [{"field": f, "issue": i} for f, i in self.issues]
+
+
 class HoursMissing(_EmployeeIdsError):
     status = 422
     code = "hours_missing"
@@ -211,6 +233,73 @@ class AttemptNotCurrent(DomainError):
     @property
     def details(self) -> Mapping[str, Any]:
         return {"current_attempt": self.current_attempt}
+
+
+class PayoutNotRetryable(DomainError):
+    """PAY-500: only a ``failed`` payout whose current attempt is ``rejected`` can be retried."""
+
+    code = "payout_not_retryable"
+    message = "Only a failed payout can be retried."
+
+    def __init__(self, payout_status: str, attempt_status: str | None) -> None:
+        super().__init__()
+        self.payout_status = payout_status
+        self.attempt_status = attempt_status
+
+    @property
+    def details(self) -> Mapping[str, Any]:
+        return {"payout_status": self.payout_status, "attempt_status": self.attempt_status}
+
+
+class RetryLimitReached(DomainError):
+    """PAY-500: ``current_attempt`` has reached ``PAYOUT_MAX_ATTEMPTS``."""
+
+    code = "retry_limit_reached"
+    message = "The payout has reached the maximum number of attempts."
+
+    def __init__(self, current_attempt: int, max_attempts: int) -> None:
+        super().__init__()
+        self.current_attempt = current_attempt
+        self.max_attempts = max_attempts
+
+    @property
+    def details(self) -> Mapping[str, Any]:
+        return {"current_attempt": self.current_attempt, "max_attempts": self.max_attempts}
+
+
+class PayoutNotBlocked(DomainError):
+    """PAY-502: resolve applies only to a payout whose current attempt is ``needs_operator``."""
+
+    code = "payout_not_blocked"
+    message = "The payout is not waiting for an operator."
+
+    def __init__(self, attempt_status: str | None) -> None:
+        super().__init__()
+        self.attempt_status = attempt_status
+
+    @property
+    def details(self) -> Mapping[str, Any]:
+        return {"attempt_status": self.attempt_status}
+
+
+class ResolveTooEarly(DomainError):
+    """PAY-502, C48: ``mark_rejected`` before ``PAYOUT_MARK_REJECTED_MIN_WAIT_S`` has passed since
+    the attempt entered ``needs_operator``. The response carries ``Retry-After``."""
+
+    code = "resolve_too_early"
+    message = "The attempt can't be marked rejected yet."
+
+    def __init__(self, retry_after_s: int) -> None:
+        super().__init__()
+        self.retry_after_s = max(1, retry_after_s)
+
+    @property
+    def details(self) -> Mapping[str, Any]:
+        return {"retry_after_s": self.retry_after_s}
+
+    @property
+    def headers(self) -> Mapping[str, str]:
+        return {"Retry-After": str(self.retry_after_s)}
 
 
 class AnchorLocked(DomainError):

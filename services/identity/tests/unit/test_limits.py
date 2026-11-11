@@ -89,9 +89,9 @@ class FakeRedis:
             self.ttl_ms[key] = ex * 1000
         return True
 
-    async def delete(self, key: str) -> int:
+    async def delete(self, *keys: str) -> int:
         self._check("delete")
-        return 1 if self.data.pop(key, None) is not None else 0
+        return sum(self.data.pop(key, None) is not None for key in keys)
 
 
 def make_limits(r: FakeRedis) -> AuthLimits:
@@ -188,6 +188,38 @@ async def test_clear_level_error_is_swallowed(otel_memory: OtelMemory) -> None:
     await make_limits(r).clear_level(EK)
 
 
+async def test_clear_lockout_ends_the_lock_and_restarts_the_count() -> None:
+    """PAY-104, PAY-105, C74: after a lock, clear_lockout deletes the lock, the level and the
+    level-0 failure count, so the next attempt is allowed and five more failures are needed."""
+    r = FakeRedis()
+    limits = make_limits(r)
+    await exhaust(limits)
+    assert (await limits.check_login("ip", EK)).lock_started is not None
+    await limits.clear_lockout(EK)
+    assert AuthLimits.lock_key(EK) not in r.data
+    assert AuthLimits.level_key(EK) not in r.data
+    await exhaust(limits)  # five allowed failures at level 0 again
+    gate = await limits.check_login("ip", EK)
+    assert gate.lock_started is not None
+    assert (gate.lock_started.level, gate.retry_after_s) == (1, 60)  # back to the first level
+
+
+async def test_clear_lockout_error_is_swallowed(
+    otel_memory: OtelMemory, caplog_json: JsonLogCapture
+) -> None:
+    """PAY-105, C74: a failed DEL after a reset or accept is counted and logged, not raised."""
+    r = FakeRedis()
+    r.fail.add("delete")
+    await make_limits(r).clear_lockout(EK)
+    errors = [
+        v
+        for a, v in otel_memory.metric_points("rate_limiter_errors")
+        if a == {"component": "login"}
+    ]
+    assert errors == [1]
+    assert len(caplog_json.events("ratelimit.backend_error")) == 1
+
+
 async def test_lock_with_unexpected_pttl_still_blocks() -> None:
     """PAY-104: a lock key without a usable TTL still blocks, with Retry-After 1."""
     r = FakeRedis()
@@ -195,3 +227,36 @@ async def test_lock_with_unexpected_pttl_still_blocks() -> None:
     r.ttl_ms[AuthLimits.lock_key(EK)] = -1
     gate = await make_limits(r).check_login("ip", EK)
     assert (gate.scope, gate.retry_after_s) == ("login_locked", 1)
+
+
+async def test_reset_requests_are_limited_per_ip_and_per_account() -> None:
+    """PAY-105, PAY-603: reset requests are limited like login: reset_ip at
+    AUTH_LOGIN_LIMIT_IP and reset_account at AUTH_LOGIN_LIMIT_ACCOUNT, with Retry-After, and no
+    lock is ever started."""
+    r = FakeRedis()
+    settings = make_settings(auth_login_limit_ip=3, auth_login_limit_account=2)
+    limits = AuthLimits(r, settings, clock=FakeClock())  # type: ignore[arg-type]
+    assert await limits.check_reset("ip-1", EK) is None
+    assert await limits.check_reset("ip-2", EK) is None
+    retry = await limits.check_reset("ip-3", EK)  # the account's third request
+    assert retry is not None
+    assert 1 <= retry <= 900
+    other = "f" * 64
+    assert await limits.check_reset("ip-1", other) is None  # ip-1's second request
+    assert await limits.check_reset("ip-1", other + "x") is None  # its third
+    assert await limits.check_reset("ip-1", other + "y") is not None  # its fourth: reset_ip
+    assert not any(":lock:" in k for k in r.data)
+
+
+async def test_accept_and_reset_checks_are_traced(otel_memory: OtelMemory) -> None:
+    """PAY-105, PAY-103, R18: check_accept and check_reset each open an
+    identity.ratelimit.check span with their identity.component and the verdict (LLD §5.3)."""
+    limits = make_limits(FakeRedis())
+    assert await limits.check_accept("ip") is None
+    assert await limits.check_reset("ip", EK) is None
+    spans = [s for s in otel_memory.spans() if s.name == "identity.ratelimit.check"]
+    assert [
+        (s.attributes["identity.component"], s.attributes["identity.allowed"])
+        for s in spans
+        if s.attributes is not None
+    ] == [("accept", True), ("reset", True)]

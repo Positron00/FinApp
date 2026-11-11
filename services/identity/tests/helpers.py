@@ -17,6 +17,13 @@ COMPANY_ID: Final = UUID("0193a000-0000-7000-8000-000000000001")
 AUDIT_KEY: Final = "k" + secrets.token_urlsafe(32)
 BASE_URL: Final = "http://127.0.0.1:4100"
 STRONG_SECRET: Final = "k" + secrets.token_urlsafe(24)
+
+
+def passphrase() -> str:
+    """A fresh password that passes the policy, built at runtime (no credential literals)."""
+    return "p-" + secrets.token_urlsafe(16)
+
+
 # Cheap argon2 for most tests; the timing and lockout tests use the production parameters.
 FAST_ARGON2: Final[dict[str, int]] = {
     "identity_argon2_time_cost": 1,

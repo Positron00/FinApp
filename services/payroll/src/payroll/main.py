@@ -2,7 +2,10 @@
 
 ``build_app(settings)`` assembles pycommon's app (OTel, request logging, body limit, error
 handlers, JWT auth and caller rate limit on every router, ``/livez`` and ``/readyz`` with the DB,
-Redis and Alembic-head checks), mounts the routers and runs the outbox relay in the background.
+Redis and Alembic-head checks), mounts the routers, registers the collection-time gauges (§7.2)
+and runs the outbox relay and the maintenance runner (§5.3, §5.4) in the background. The runner
+is always built (``Runtime.maintenance``, so tests can ``tick()``); ``maintenance=False`` only
+stops its background loop.
 ``app`` is built lazily from the environment, for ``PYCOMMON_APP=payroll.main:app``.
 """
 
@@ -22,7 +25,8 @@ from payroll.api.errors import install_domain_handler
 from payroll.crypto import FieldKeyring
 from payroll.events.outbox import OutboxWriter
 from payroll.events.relay import build_relay
-from payroll.metrics import Metrics
+from payroll.maintenance import build_maintenance
+from payroll.metrics import Metrics, PayrollGaugeSource, register_collection_gauges
 from payroll.services.runtime import Runtime
 from payroll.settings import STARTUP_CHECKS, Settings
 
@@ -38,15 +42,20 @@ def migrations_dir() -> str:
 
 
 def build_app(
-    settings: BaseServiceSettings, *, instrument: bool = True, relay: bool = True
+    settings: BaseServiceSettings,
+    *,
+    instrument: bool = True,
+    relay: bool = True,
+    maintenance: bool = True,
 ) -> FastAPI:
     if not isinstance(settings, Settings):
         raise TypeError("build_app needs payroll Settings")
     s = settings
     holder: dict[str, FastAPI] = {}
+    gauges = PayrollGaugeSource(s)
 
     async def on_startup(ctx: AppContext) -> None:
-        if ctx.sessions is None or ctx.redis is None:  # pragma: no cover  (use_db/use_redis on)
+        if ctx.sessions is None or ctx.redis is None or ctx.engine is None:  # pragma: no cover
             raise RuntimeError("payroll needs Postgres and Redis")
         relay_loop = (
             build_relay(
@@ -60,7 +69,7 @@ def build_app(
             if relay
             else None
         )
-        holder["app"].state.payroll = Runtime(
+        rt = Runtime(
             settings=s,
             sessions=ctx.sessions,
             keyring=FieldKeyring.from_settings(s.payroll_field_keys, s.payroll_field_active_kid),
@@ -71,18 +80,36 @@ def build_app(
             ),
             relay=relay_loop,
         )
+        rt.maintenance = build_maintenance(rt, ctx.engine)
+        holder["app"].state.payroll = rt
+        register_collection_gauges(gauges)
 
     async def outbox_relay(_ctx: AppContext, stop: asyncio.Event) -> None:
         rt: Runtime = holder["app"].state.payroll
         if rt.relay is not None:
             await rt.relay.run(stop)
 
+    async def maintenance_loop(_ctx: AppContext, stop: asyncio.Event) -> None:
+        """PAY-407, PAY-608: re-publish and purges, one replica at a time (advisory lock)."""
+        rt: Runtime = holder["app"].state.payroll
+        if rt.maintenance is not None:
+            await rt.maintenance.run(stop)
+
+    async def close_gauges(_ctx: AppContext, stop: asyncio.Event) -> None:
+        """Dispose the gauge source's engine and thread on shutdown."""
+        await stop.wait()
+        await asyncio.to_thread(gauges.close)
+
     app = create_app(
         s,
         routers=all_routers(),
         migrations_script_location=migrations_dir(),
         startup_checks=STARTUP_CHECKS,
-        background=(outbox_relay,) if relay else (),
+        background=(
+            *((outbox_relay,) if relay else ()),
+            *((maintenance_loop,) if maintenance else ()),
+            close_gauges,
+        ),
         on_startup=on_startup,
         instrument=instrument,
     )

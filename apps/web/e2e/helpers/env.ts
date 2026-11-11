@@ -10,9 +10,16 @@ export function need(key: string): string {
 }
 
 export const baseUrl = (): string => need("BASE_URL");
+export const repoRoot = (): string => need("E2E_REPO_ROOT");
 export const tempoUrl = (): string => `http://127.0.0.1:${need("TEMPO_PORT")}`;
 export const lokiUrl = (): string => `http://127.0.0.1:${need("LOKI_PORT")}`;
 export const authDir = (): string => need("E2E_AUTH_DIR");
+export const mailpitUrl = (): string => `http://127.0.0.1:${need("MAILPIT_PORT")}`;
+export const toxiproxyUrl = (): string => `http://127.0.0.1:${need("TOXIPROXY_PORT")}`;
+/** identity's test-profile port: a direct call that bypasses the BFF (role-change spec, C45). */
+export const identityDirectUrl = (): string => `http://127.0.0.1:${need("IDENTITY_PORT")}`;
+/** payroll's test-profile port: the worker's internal result endpoint (blocked case, C44). */
+export const payrollDirectUrl = (): string => `http://127.0.0.1:${need("PAYROLL_PORT")}`;
 
 export const APPROVER_EMAIL = "approver@payrun.example.com";
 

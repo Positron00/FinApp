@@ -8,6 +8,7 @@ company and parent scope (an unknown ``after`` is 422 ``invalid_cursor``), then 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
 
@@ -24,24 +25,36 @@ from payroll.db.models import (
     Payout,
     PayoutAttempt,
     PayRun,
+    PayRunHours,
     Payslip,
 )
 from payroll.domain import InvalidCursor, NotFound
+from payroll.domain.dual_approval import BankEdit, HoursEdit
 
 __all__ = [
     "AttemptRepo",
     "AuditRepo",
+    "DualApprovalRepo",
     "EmployeeRepo",
     "PayRunRepo",
     "PayoutRepo",
     "PayslipRepo",
     "SettingsRepo",
+    "clock_timestamp",
     "rowcount",
 ]
 
 
 def rowcount(result: Any) -> int:
     return int(cast(CursorResult[Any], result).rowcount)
+
+
+async def clock_timestamp(session: AsyncSession) -> datetime:
+    """The database's ``clock_timestamp()``: the wall clock at this statement, not ``now()`` (the
+    transaction start). Approve and retry read it after their employee locks to date a bank
+    snapshot (``payout_attempts.requested_at``, C73, design §3.4)."""
+    value: datetime = (await session.execute(select(func.clock_timestamp()))).scalar_one()
+    return value
 
 
 async def _anchor(session: AsyncSession, stmt: Executable) -> tuple[Any, ...]:
@@ -87,6 +100,20 @@ class EmployeeRepo:
     @staticmethod
     async def get(session: AsyncSession, company_id: UUID, employee_id: UUID) -> Employee:
         stmt = select(Employee).where(Employee.id == employee_id, Employee.company_id == company_id)
+        row = (await session.scalars(stmt)).first()
+        if row is None:
+            raise NotFound("employee_not_found")
+        return row
+
+    @staticmethod
+    async def lock(session: AsyncSession, company_id: UUID, employee_id: UUID) -> Employee:
+        """``FOR UPDATE`` (lock order 6, §4.10): the PATCH never locks ``pay_runs``."""
+        stmt = (
+            select(Employee)
+            .where(Employee.id == employee_id, Employee.company_id == company_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         row = (await session.scalars(stmt)).first()
         if row is None:
             raise NotFound("employee_not_found")
@@ -143,6 +170,66 @@ class EmployeeRepo:
             .execution_options(populate_existing=True)
         )
         return {e.id: e for e in (await session.scalars(stmt)).all()}
+
+
+class DualApprovalRepo:
+    """The facts dual approval needs beyond the run row (design §3.4; PAY-401, PAY-500, C73)."""
+
+    @staticmethod
+    async def bank_edits(
+        session: AsyncSession, company_id: UUID, employee_ids: Sequence[UUID], actor_id: str
+    ) -> list[BankEdit]:
+        """One query: the employees among ``employee_ids`` whose last bank editor is
+        ``actor_id``, each with ``vetted_at``, the latest ``requested_at`` of an attempt of
+        theirs in a dual-approval run requested by someone other than that editor (the last
+        time a second person released a snapshot of these bank details). Call it with the
+        employee rows already locked, so the edit can't change underneath.
+
+        Pass only employees that get a transfer (approve: payslip ``net_cents > 0``; retry: the
+        payout's employee). A no-transfer employee gets no payout attempt, so their edit is
+        neither released nor ever vetted by this run, and must not block its editor (C73)."""
+        vetted = (
+            select(func.max(PayoutAttempt.requested_at))
+            .select_from(Payout)
+            .join(PayoutAttempt, PayoutAttempt.payout_id == Payout.id)
+            .join(PayRun, PayRun.id == Payout.pay_run_id)
+            .where(
+                Payout.company_id == Employee.company_id,
+                Payout.employee_id == Employee.id,
+                PayRun.require_dual_approval.is_(True),
+                PayoutAttempt.requested_by != Employee.bank_updated_by,
+            )
+            .correlate(Employee)
+            .scalar_subquery()
+        )
+        stmt = (
+            select(
+                Employee.id,
+                Employee.bank_updated_by,
+                Employee.bank_updated_at,
+                vetted.label("vetted_at"),
+            )
+            .where(
+                Employee.company_id == company_id,
+                Employee.id.in_(list(employee_ids)),
+                Employee.bank_updated_by == actor_id,
+            )
+            .order_by(Employee.id)
+        )
+        return [
+            BankEdit(r.id, r.bank_updated_by, r.bank_updated_at, r.vetted_at)
+            for r in (await session.execute(stmt)).all()
+        ]
+
+    @staticmethod
+    async def hours_edits(session: AsyncSession, company_id: UUID, run_id: UUID) -> list[HoursEdit]:
+        """Who last entered each hours row of the run (``pay_run_hours.entered_by``)."""
+        stmt = (
+            select(PayRunHours.employee_id, PayRunHours.entered_by)
+            .where(PayRunHours.company_id == company_id, PayRunHours.pay_run_id == run_id)
+            .order_by(PayRunHours.employee_id)
+        )
+        return [HoursEdit(r.employee_id, r.entered_by) for r in (await session.execute(stmt)).all()]
 
 
 class PayRunRepo:
@@ -314,6 +401,42 @@ class PayoutRepo:
         return row
 
     @staticmethod
+    async def lock_in_run(
+        session: AsyncSession, company_id: UUID, run_id: UUID, payout_id: UUID
+    ) -> Payout:
+        """``FOR UPDATE`` (lock order 4); a payout of another run or company is 404."""
+        stmt = (
+            select(Payout)
+            .where(
+                Payout.id == payout_id,
+                Payout.pay_run_id == run_id,
+                Payout.company_id == company_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        row = (await session.scalars(stmt)).first()
+        if row is None:
+            raise NotFound("payout_not_found")
+        return row
+
+    @staticmethod
+    async def with_name(
+        session: AsyncSession, company_id: UUID, payout_id: UUID
+    ) -> tuple[Payout, str]:
+        """The payout (fresh values) and its payslip's ``employee_name``."""
+        stmt = (
+            select(Payout, Payslip.employee_name)
+            .join(Payslip, Payslip.id == Payout.payslip_id)
+            .where(Payout.id == payout_id, Payout.company_id == company_id)
+            .execution_options(populate_existing=True)
+        )
+        row = (await session.execute(stmt)).first()
+        if row is None:  # pragma: no cover  (callers hold the payout)
+            raise NotFound("payout_not_found")
+        return row[0], row[1]
+
+    @staticmethod
     async def statuses(session: AsyncSession, company_id: UUID, run_id: UUID) -> list[str]:
         stmt = select(Payout.status).where(
             Payout.pay_run_id == run_id, Payout.company_id == company_id
@@ -382,6 +505,7 @@ class AttemptRepo:
                 PayoutAttempt.company_id == company_id,
             )
             .order_by(PayoutAttempt.payout_id, PayoutAttempt.attempt)
+            .execution_options(populate_existing=True)
         )
         for a in (await session.scalars(stmt)).all():
             out[a.payout_id].append(a)
@@ -415,3 +539,33 @@ class AuditRepo:
                 trace_id=f"{ctx.trace_id:032x}" if ctx.is_valid else None,
             )
         )
+
+    @staticmethod
+    async def page(
+        session: AsyncSession,
+        company_id: UUID,
+        *,
+        entity_type: str | None,
+        entity_id: UUID | None,
+        event: str | None,
+        after: UUID | None,
+        limit: int,
+    ) -> list[AuditEvent]:
+        """Newest first (``id DESC``; UUIDv7 is time-ordered), ``limit + 1`` rows (§4.5, §4.9)."""
+        stmt = select(AuditEvent).where(AuditEvent.company_id == company_id)
+        if entity_type is not None:
+            stmt = stmt.where(AuditEvent.entity_type == entity_type)
+        if entity_id is not None:
+            stmt = stmt.where(AuditEvent.entity_id == entity_id)
+        if event is not None:
+            stmt = stmt.where(AuditEvent.event == event)
+        if after is not None:
+            key = await _anchor(
+                session,
+                select(AuditEvent.id).where(
+                    AuditEvent.id == after, AuditEvent.company_id == company_id
+                ),
+            )
+            stmt = stmt.where(_after((AuditEvent.id,), key, descending=True))
+        stmt = stmt.order_by(AuditEvent.id.desc()).limit(limit + 1)
+        return list((await session.scalars(stmt)).all())

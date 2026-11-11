@@ -1,6 +1,6 @@
 # Low-level design: bank-stub
 
-Status: draft 2026-11-10, aligned with the README Spec resolutions (R) and Contract decisions (C) tables · Sources: [spec README](README.md) (R- and C-tables), [architecture plan](../../plan/architecture-plan.md) v1.2 (§2.2, §4, §6, §7, §8, §9, §12.1, §13), [ADR 0001](../../adr/0001-service-map.md), [ADR 0003](../../adr/0003-payout-flow.md) (a, e), [ADR 0011](../../adr/0011-egress.md), [requirements](requirements.md) (PAY-412, PAY-605, PAY-606, PAY-NFR-02, PAY-NFR-07, PAY-NFR-09), [high-level design](design-high-level.md), [payout-worker low-level design](design-low-level-payout-worker.md) (the only caller), [platform low-level design](design-low-level-platform.md) (pycommon, env).
+Status: draft 2026-11-10, last changed 2026-11-11, aligned with the README Spec resolutions (R) and Contract decisions (C) tables · Sources: [spec README](README.md) (R- and C-tables), [architecture plan](../../plan/architecture-plan.md) v1.4 (§2.2, §4, §6, §7, §8, §9, §12.1, §13), [ADR 0001](../../adr/0001-service-map.md), [ADR 0003](../../adr/0003-payout-flow.md) (a, e), [ADR 0011](../../adr/0011-egress.md), [requirements](requirements.md) (PAY-412, PAY-605, PAY-606, PAY-NFR-02, PAY-NFR-07, PAY-NFR-09), [high-level design](design-high-level.md), [payout-worker low-level design](design-low-level-payout-worker.md) (the only caller), [platform low-level design](design-low-level-platform.md) (pycommon, env).
 
 bank-stub simulates a payment processor. It has an idempotent, persistent ledger: one row per
 `Idempotency-Key` in `bank_stub.transfers`, written with `INSERT … ON CONFLICT DO NOTHING
@@ -305,8 +305,8 @@ the C1 keys, and truncates `bank_stub.transfers` after each test. The app is dri
 |---|---|---|
 | `tests/unit/test_outcome.py` | Account ending `0000` → `account_closed` (even at rate 0); the same key always gives the same outcome; rate 0 never rejects, rate 1 always does; boundary: a key with bucket 499 is rejected at 0.05 and a key with bucket 500 isn't; no rounding (bucket 2 rejected at 0.00025, bucket 1 at 0.00015; C63); over 10,000 random keys at 0.05 the rejected share is 5% ± 1%; reference format `^BSR-[0-9A-F]{16}$` (≤ 64) | PAY-412 |
 | `tests/unit/test_schemas.py` | `TransferRequest` bounds and patterns, `extra="forbid"`; `repr` masks routing and account; key pattern accepts `<uuid>:<n>`; `TransferResponse` serialises exactly `{transfer_id, status, reason, bank_reference}` (R6) | PAY-412, NFR-07 |
-| `tests/unit/test_routes.py` (API key) | Missing → 401; wrong → 401; correct → passes; uses `compare_digest` (patched as the module-local name `bank_stub.api.auth.compare_digest`, never the stdlib function) | PAY-412 |
-| `tests/unit/test_latency.py` | The handler awaits `sleep(BANK_STUB_LATENCY_MS / 1000)` (patched sleep) on POST and GET | PAY-412 |
+| `tests/unit/test_routes.py::test_api_key_required`, `::test_api_key_uses_compare_digest` | Missing → 401; wrong → 401; correct → passes; uses `compare_digest` (patched as the module-local name `bank_stub.api.auth.compare_digest`, never the stdlib function) | PAY-412 |
+| `tests/unit/test_routes.py::test_latency_sleep_on_post_and_get`, `::test_no_sleep_before_auth_or_key_checks` | The handler awaits `sleep(BANK_STUB_LATENCY_MS / 1000)` (recording sleep) on POST and GET, and never before the API-key and key checks | PAY-412 |
 | `tests/unit/test_settings.py` | Settings load from the C1 keys (`DB_HOST` … `DB_SCHEMA`); `DATABASE_URL` is ignored; `LOG_LEVEL=info` is accepted as `INFO` (C24); rate and latency out of bounds → `settings.invalid` and exit 2 | PAY-605 |
 | `tests/unit/test_startup_checks.py` | `ENV=prod` → `startup.check_failed` (`setting=ENV`) and exit 2; with `ENV=uat`, a missing or dev-default `BANK_STUB_API_KEY` or `DB_PASSWORD`, and debug or docs on, each exit 2; the log names the setting, never the value; with `ENV=dev` failures only warn (C29) | PAY-605 |
 | `tests/integration/test_migrations.py` | Upgrade to head, downgrade one, upgrade again; constraints (unique key, outcome shape, `USD` only) | PAY-606 |
@@ -316,36 +316,37 @@ the C1 keys, and truncates `bank_stub.transfers` after each test. The app is dri
 | `tests/integration/test_restart_persistence.py` | POST a key, shut down the app and dispose its engine, build a new app → GET returns the same row, and a repeated POST returns 200 with the same `transfer_id` | PAY-412, NFR-02 |
 | `tests/integration/test_readyz.py` | 503 when the DB is down or migrations aren't at head; no Redis needed | PAY-605 |
 | `tests/integration/test_spans.py` | In-memory exporter: a POST with an incoming `traceparent` yields a server span whose parent and trace ID are the caller's; a `bank_stub.transfer` child with the attributes of §5.3 for created, replayed and GET-not-found; DB spans under it; no span carries the API key, routing, account, last 4 or amount | PAY-NFR-09, NFR-07 |
-| `tests/integration/test_no_secrets_in_logs.py` | Captured logs and spans for POST/GET/401/422 contain none of: the API key, routing, full account, amount | PAY-NFR-07 |
-| `tests/integration/test_metrics.py` | In-memory reader: `bank_stub_transfers_total{outcome}` values after created, rejected and replayed calls | PAY-412 |
+| `tests/integration/test_spans.py::test_no_secrets_in_spans_or_logs` | Captured logs and spans for POST/GET/401/422 contain none of: the API key (right or wrong), routing, full account, last 4, amount | PAY-NFR-07 |
+| `tests/integration/test_concurrent_same_key.py::test_metric_outcomes` | In-memory reader: `bank_stub_transfers_total{outcome}` is 1 each for `settled`, `rejected` and `replayed` after a created, a rejected and a replayed call; a GET isn't counted | PAY-412 |
 | `tests/contract/test_openapi.py` | `openapi.json` matches the app (drift); Schemathesis against the app finds no 5xx and no schema violations | PAY-NFR-12 |
 
 The Compose-level restart scenario (bank-stub restarted mid-run, ≤ 1 settled transfer per payout)
-is owned by the worker's resilience suite: `tests/resilience/test_bank_restart.py`.
+is owned by the resilience suite: `tests/resilience/test_bank_faults.py::test_bank_stub_restart_mid_run_keeps_its_ledger`.
 
 ## 7. Traceability
 
 | Requirement | Design section | Tests |
 |---|---|---|
-| PAY-412: POST with `Idempotency-Key` and `X-Api-Key`, ON CONFLICT, 201 new / 200 replay, lookup before body validation | §3.1, §3.3 | `test_transfers_api.py`, `test_api_key.py` |
+| PAY-412: POST with `Idempotency-Key` and `X-Api-Key`, ON CONFLICT, 201 new / 200 replay, lookup before body validation | §3.1, §3.3 | `test_transfers_api.py`, `test_routes.py` |
 | PAY-412: response `{transfer_id, status, reason, bank_reference}` | §2.3 | `test_schemas.py`, `test_transfers_api.py` |
 | PAY-412: missing `Idempotency-Key` → 400, malformed → 422 (C34) | §3.1 step 2 | `test_transfers_api.py` |
 | PAY-412: outcome rules | §3.4 | `test_outcome.py` |
-| PAY-412: latency | §3.6 | `test_latency.py` |
+| PAY-412: latency | §3.6 | `test_routes.py::test_latency_sleep_on_post_and_get` |
 | PAY-412: GET 200/404 | §3.2 | `test_transfers_api.py` |
-| PAY-412: missing API key → 401 | §3.3 | `test_api_key.py`, `test_transfers_api.py` |
+| PAY-412: missing API key → 401 | §3.3 | `test_routes.py::test_api_key_required`, `test_transfers_api.py` |
 | PAY-412: concurrent POSTs → one row | §3.1 step 7 | `test_concurrent_same_key.py` |
-| PAY-412: ledger survives restart | §2.1, §3.1 | `test_restart_persistence.py`, `tests/resilience/test_bank_restart.py` |
-| PAY-412: `bank_stub_transfers_total{outcome}` (R6) | §5.2 | `test_metrics.py`, `test_concurrent_same_key.py` |
+| PAY-412: ledger survives restart | §2.1, §3.1 | `test_restart_persistence.py`, `tests/resilience/test_bank_faults.py::test_bank_stub_restart_mid_run_keeps_its_ledger` |
+| PAY-412: `bank_stub_transfers_total{outcome}` (R6) | §5.2 | `test_concurrent_same_key.py::test_metric_outcomes` |
 | PAY-605 | §3.5, §4 | `test_settings.py`, `test_startup_checks.py`, `test_readyz.py` |
 | PAY-606 | §2.1, §2.2, §4 | `test_migrations.py`, `test_grants.py` |
 | PAY-NFR-02 (bank side) | §3.1, §3.4 | `test_concurrent_same_key.py`, `test_restart_persistence.py` |
-| PAY-NFR-07 | §2.3, §5 | `test_schemas.py`, `test_spans.py`, `test_no_secrets_in_logs.py` |
+| PAY-NFR-07 | §2.3, §5 | `test_schemas.py`, `test_spans.py::test_no_secrets_in_spans_or_logs` |
 | PAY-NFR-09 | §5.3 | `test_spans.py`, e2e `trace.spec.ts` |
 
 ## Change log
 
 - 2026-11-10: incorporated README R-table and C-table decisions (R3, R6, R13, R27; C1, C2, C14, C23, C24, C28, C29, C34, C44).
 - 2026-11-10 (Step 5, C63): exact PAY-412 failure threshold (no `round`); keys checked with `fullmatch`; GET key error field `path.key` (C56); module-local `compare_digest`; unit route tests on a stub lifespan; the C61 unit flake traced to value-echo assertions matching `request_id`/`ts` and fixed.
+- 2026-11-11 (second alignment review, docs only): §6 and §7 name the test files and functions that exist. Latency and API-key cases are in `unit/test_routes.py`, the metric case is `integration/test_concurrent_same_key.py::test_metric_outcomes`, the no-secrets case is `integration/test_spans.py::test_no_secrets_in_spans_or_logs`, and the Compose restart is `tests/resilience/test_bank_faults.py::test_bank_stub_restart_mid_run_keeps_its_ledger`. Before, they named `test_latency.py`, `test_api_key.py`, `test_metrics.py`, `test_no_secrets_in_logs.py` and `test_bank_restart.py`, which were never written.
 
 Resolved after the change log entry: C46 (`PAYOUT_PAYROLL_*` keys), C47 (`COMPANY_ID` for every service, `PAYOUT_CONSUMER_GC_IDLE_S`, startup reason `not_deployable`). Nothing is open.
