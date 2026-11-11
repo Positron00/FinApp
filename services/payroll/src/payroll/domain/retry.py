@@ -62,15 +62,23 @@ def republish_decision(
     after_s: int,
     max_backoff_s: int,
     max_republish: int,
+    envelope_invalid: bool = False,
 ) -> RepublishAction:
     """PAY-407: re-publish a live current attempt once its backoff has passed and no unsent
-    outbox row exists for it; after ``max_republish`` re-publishes it goes to the operator."""
+    outbox row exists for it; after ``max_republish`` re-publishes it goes to the operator.
+
+    ``has_unsent_outbox`` counts only rows the relay can still send. ``envelope_invalid`` means
+    the attempt's only unsent rows were refused by the relay's envelope check (§5.2): those are
+    never sent and a re-publish would build the same envelope, so once the backoff has passed
+    the attempt goes to the operator (PAY-NFR-03; the caller records reason
+    ``envelope_invalid``)."""
     if status not in LIVE_ATTEMPT or not is_current or has_unsent_outbox:
         return RepublishAction.SKIP
     elapsed = (now - last_published_at).total_seconds()
     backoff = republish_backoff_s(publish_count, after_s=after_s, max_backoff_s=max_backoff_s)
     if elapsed <= backoff:
         return RepublishAction.SKIP
-    if publish_count - 1 >= max_republish:  # max_republish re-publishes already made
+    # max_republish re-publishes already made, or nothing the relay could send
+    if envelope_invalid or publish_count - 1 >= max_republish:
         return RepublishAction.NEEDS_OPERATOR
     return RepublishAction.REPUBLISH

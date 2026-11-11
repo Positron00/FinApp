@@ -125,6 +125,7 @@ flowchart LR
 | `EMAIL_MAX_ATTEMPTS` | 10 | 10 | The identity relay then marks the email `failed` (alert `EmailOutboxStuck`) |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_STARTTLS` / `SMTP_USERNAME` / `SMTP_PASSWORD` | mailpit / 1025 / false / unset / unset | provider | Unprefixed infrastructure keys, like `DB_*` (spec C49) |
 | `OTEL_TRACES_SAMPLER` | parentbased_always_on | same | Apps send every span; prod keeps errors, slow traces and 10% of the rest at the Collector (`tail_sampling`) |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | 3 | 3 | Seconds; Python services only (the web's JS exporter ignores it). Bounds each OTLP export, so the shutdown flush to an unreachable Collector stays inside the 75 s grace after a 60 s drain (spec C67) |
 | `company_settings.require_dual_approval` | true | true | Per company, audited ([ADR 0005](../adr/0005-four-eyes-approval.md)) |
 
 ### 2.3 Cost and migration
@@ -511,6 +512,7 @@ Loki → Grafana, plus Alertmanager. The BFF records the journey SLI with an exp
   | `PayoutSettlementSlow` (`max(payroll_runs_processing_oldest_age_seconds) > 60` for 2 m) | page | paging receiver |
   | `PayoutDLQ` (`increase(queue_messages_total{outcome="dlq"}[15m]) > 0`) | page (money stuck) | paging receiver |
   | `PayoutNeedsOperator` (`max(payroll_attempts_needs_operator) > 0`) | page | paging receiver |
+  | `PayoutLateSettlement` (`increase(payroll_late_settlements_total[15m]) > 0`; a late `settled` for a rejected or superseded attempt, possible double payment) | page | paging receiver |
   | `PayoutsStuck` (`max(payroll_payouts_stuck) > 0` for 10 m) | page | paging receiver |
   | `PayoutStreamNearMaxlen` (length > 80% of MAXLEN) | warning | ticket receiver |
   | `EmailOutboxStuck` (oldest pending > 15 m, or `increase(identity_emails_failed_total[1h]) > 0`) | warning | ticket receiver |

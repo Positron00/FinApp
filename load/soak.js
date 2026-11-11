@@ -5,6 +5,9 @@
 // of the last 5 minutes must be within 20% of the first 5 minutes'. Every request is tagged
 // `window:first|middle|last`; the two sub-metrics land in the summary export, and
 // scripts/ci/nightly-load.sh compares them (a k6 handleSummary can't fail the run).
+// PAY-NFR-05's resource side (RSS slope < 5% over the soak, no consumer-lag growth) is not
+// visible to k6: nightly-load.sh checks it in Prometheus after this run, over the same
+// SOAK_DURATION window (scripts/ci/soak_resources.py), and fails the job on a violation.
 import exec from "k6/execution";
 
 import { journey, setupMix } from "./lib/mix.js";

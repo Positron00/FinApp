@@ -95,8 +95,8 @@ exactly one requirement; others refer to it by ID.
   - Audit `user.roles_changed` and `user.deactivated`.
 - Check: integration, e2e.
 
-**PAY-109 Auth audit log (must).** `GET /v1/audit-log` (admin; cursor) lists identity audit events, newest first: `{id, at, actor_user_id, event, target_user_id, ip_hash}`.
-- Acceptance: it never contains passwords, tokens or raw IPs.
+**PAY-109 Auth audit log (must).** `GET /v1/audit-log` (admin; cursor) lists identity audit events, newest first: `{id, at, actor_user_id, event, target_user_id, ip_hash, details}`, where `details` is non-personal context only (for example roles, an invite ID or a sign-in failure reason; identity LLD §2.6).
+- Acceptance: it never contains passwords, tokens, emails or raw IPs, in `details` included.
 - Check: integration.
 
 **PAY-110 Email delivery (must).**
@@ -474,7 +474,7 @@ No `float` in `payroll.domain`; a lint test bans it.
 **PAY-NFR-05 Latency SLO (must).** BFF p95 < 300 ms for reads and simple writes, and p95 < 1.5 s for calculate and approve on 500 employees.
 - PR k6 smoke: 5 VUs × 30 s, p95 < 300 ms, errors < 1%.
 - Nightly: 30 req/s for 10 min, plus a soak at 5 req/s for 30 min, with no memory growth (RSS slope < 5% over the soak) and no consumer-lag growth.
-- Check: `load/smoke.js`, `load/full.js`.
+- Check: `load/smoke.js`, `load/full.js`, `load/soak.js` (with `scripts/ci/nightly-load.sh`'s latency-drift check and `scripts/ci/soak_resources.py`, which reads the Python services' `process_memory_usage_bytes` and `queue_consumer_lag` from Prometheus over the soak).
 
 **PAY-NFR-06 Settlement SLO (must).** A 500-employee run on the healthy-bank path has all payouts final within 60 s of approval at p95.
 - Check: `load/settlement.js` (nightly), observed in `payroll_payout_settlement_seconds`.
@@ -505,7 +505,7 @@ A deny-list redactor in pycommon and the BFF masks keys named `password`, `token
 - **Routing:** Alertmanager by severity to the webhook sinks.
 - Check: `promtool check` and `promtool test rules`, `amtool check-config`, an in-memory metric test per business metric, the Step 6 drills.
 
-**PAY-NFR-11 Paging alerts for stuck money (must).** `PayoutDLQ`, `PayoutsStuck`, `PayoutNeedsOperator` and `PayoutSettlementSlow` fire on their plan §11 expressions and stay quiet otherwise.
+**PAY-NFR-11 Paging alerts for stuck or double-paid money (must).** `PayoutDLQ`, `PayoutsStuck`, `PayoutNeedsOperator`, `PayoutLateSettlement` and `PayoutSettlementSlow` fire on their plan §11 expressions and stay quiet otherwise.
 - Check: `promtool test rules` fixtures.
 
 **PAY-NFR-12 Quality gates (must).**

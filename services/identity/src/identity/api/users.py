@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Request, status
 from pycommon.errors import Forbidden
 
-from identity.api.deps import AdminActor, ClientIp, Runtime, UserCaller
+from identity.api.deps import AdminActor, ClientIp, Runtime, UserCaller, route_label
 from identity.api.pagination import Cursor, Limit
 from identity.api.responses import errors
 from identity.api.schemas import InviteUserIn, MeOut, PatchUserIn, UserListOut, UserOut
@@ -78,6 +78,8 @@ async def users_list(
 async def users_update(
     id: UUID,
     body: PatchUserIn,
+    *,
+    request: Request,
     actor: AdminActor,
     rt: Runtime,
     ip: ClientIp,
@@ -88,6 +90,7 @@ async def users_update(
         user_id=id,
         roles=None if body.roles is None else [str(r) for r in body.roles],
         deactivate=body.status == "inactive",
+        route=route_label(request),
         client_ip=ip,
     )
     return await update_user(rt, cmd)

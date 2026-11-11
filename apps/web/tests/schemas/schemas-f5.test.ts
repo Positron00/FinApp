@@ -155,7 +155,7 @@ describe("F5 request schemas (§2.3)", () => {
     expect(UserPatchBody.safeParse({ roles: ["approver", "approver"] }).success).toBe(false);
   });
 
-  // PAY-200: ranges, an IANA zone, a Monday anchor.
+  // PAY-200: ranges, a zone of 1-64 characters, a Monday anchor.
   it("SettingsBody", () => {
     const ok = {
       name: "Acme",
@@ -168,7 +168,10 @@ describe("F5 request schemas (§2.3)", () => {
     expect(SettingsBody.safeParse(ok).success).toBe(true);
     expect(SettingsBody.safeParse({ ...ok, tax_rate_bps: 5001 }).success).toBe(false);
     expect(SettingsBody.safeParse({ ...ok, retirement_bps: 2001 }).success).toBe(false);
-    expect(SettingsBody.safeParse({ ...ok, timezone: "Nowhere/City" }).success).toBe(false);
+    // Format and length only; payroll's zoneinfo check is authoritative.
+    expect(SettingsBody.safeParse({ ...ok, timezone: "Etc/UTC" }).success).toBe(true);
+    expect(SettingsBody.safeParse({ ...ok, timezone: "" }).success).toBe(false);
+    expect(SettingsBody.safeParse({ ...ok, timezone: "x".repeat(65) }).success).toBe(false);
     expect(SettingsBody.safeParse({ ...ok, biweekly_anchor: "2026-11-10" }).success).toBe(false);
     expect(SettingsBody.safeParse({ ...ok, require_dual_approval: "yes" }).success).toBe(false);
     expect(isMonday("2026-11-09")).toBe(true);

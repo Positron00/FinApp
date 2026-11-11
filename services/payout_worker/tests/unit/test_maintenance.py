@@ -5,10 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, cast
 
+import pytest
 from payout_worker.maintenance import build_runner, prune_consumers, prune_task
 from pycommon.testing import JsonLogCapture
 from redis.asyncio import Redis
-from redis.exceptions import ResponseError
+from redis.exceptions import NoPermissionError, ResponseError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from tests.helpers import make_settings
@@ -64,10 +65,34 @@ async def test_only_idle_consumers_without_pending_are_deleted(
     ]
 
 
-async def test_missing_group_prunes_nothing() -> None:
+@pytest.mark.parametrize(
+    "error",
+    [
+        ResponseError("NOGROUP No such consumer group 'payout-worker' for key name 'stream'"),
+        ResponseError("no such key"),  # ERR no such key, as redis-py raises it
+    ],
+)
+async def test_missing_group_prunes_nothing(error: ResponseError) -> None:
     """PAY-608: NOGROUP or no stream (lost keyspace) → nothing to prune, no error."""
-    redis = ConsumersRedis(xinfo_error=ResponseError("NOGROUP No such key"))
+    redis = ConsumersRedis(xinfo_error=error)
     assert await prune_consumers(cast(Redis, redis), make_settings()) == 0
+    assert redis.deleted == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        NoPermissionError("this user has no permissions to run the 'xinfo|consumers' command"),
+        ResponseError("WRONGTYPE Operation against a key holding the wrong kind of value"),
+    ],
+)
+async def test_other_errors_propagate(error: ResponseError) -> None:
+    """PAY-608, R12: a missing +xinfo grant (NoPermissionError is a ResponseError) or any other
+    Redis error is raised, so the runner logs maintenance.task.failed instead of pruning
+    nothing forever."""
+    redis = ConsumersRedis(xinfo_error=error)
+    with pytest.raises(type(error)):
+        await prune_consumers(cast(Redis, redis), make_settings())
     assert redis.deleted == []
 
 

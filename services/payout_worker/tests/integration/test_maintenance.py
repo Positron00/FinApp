@@ -7,7 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 import redis.asyncio as aioredis
-from payout_worker.maintenance import build_runner
+from payout_worker.maintenance import build_runner, prune_consumers
 from pycommon.db import create_engine, session_factory
 from pycommon.redis_client import create_redis
 from pycommon.testing import JsonLogCapture, PgBootstrapped, RedisAcl
@@ -98,3 +98,21 @@ async def test_prune_consumers_on_real_redis(
     assert done == {"purge_processed_events": 0, "prune_consumers": 1}
     [pruned] = caplog_json.events("queue.consumer.pruned")
     assert (pruned["consumer"], pruned["dropped_pending"]) == ("old-empty", 0)
+
+
+async def test_prune_lost_stream_or_group_on_real_redis(
+    migrated: PgBootstrapped, redis_acl: RedisAcl, redis_admin: aioredis.Redis
+) -> None:
+    """PAY-608: the real Redis 7 errors for a missing stream (ERR no such key) and a missing
+    group (NOGROUP), as the payout-worker ACL user, both mean nothing to prune."""
+    s = worker_settings(migrated, redis_acl)
+    redis = create_redis(s)
+    try:
+        await redis_admin.delete(STREAM)
+        assert await prune_consumers(redis, s) == 0  # no stream
+        await redis_admin.xadd(
+            STREAM, {"event_id": "e", "type": "payout.requested", "envelope": "{}"}
+        )
+        assert await prune_consumers(redis, s) == 0  # stream without the group
+    finally:
+        await redis.aclose()

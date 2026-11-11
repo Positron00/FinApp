@@ -104,9 +104,10 @@ class EmailRelay:
                 )
         return None  # pragma: no cover  (ck_email_outbox_ref makes this unreachable)
 
-    async def _finish(self, row: ClaimedEmail, status: str, last_error: str | None = None) -> None:
+    async def _finish(self, row: ClaimedEmail, status: str, last_error: str | None = None) -> bool:
+        """False when the row was cancelled meanwhile (resend, deactivation, new reset)."""
         async with transaction(self._sf) as session:
-            await OutboxRepo(session).finish(row.id, status, last_error=last_error)
+            return await OutboxRepo(session).finish(row.id, status, last_error=last_error)
 
     async def _release_uncounted(self, row: ClaimedEmail) -> None:
         async with transaction(self._sf) as session:
@@ -179,7 +180,8 @@ class EmailRelay:
     async def _failed_attempt(self, row: ClaimedEmail, exc: BaseException) -> None:
         label = error_label(exc)
         if is_exhausted(row.attempts, self._s.email_max_attempts):
-            await self._finish(row, "failed", last_error=label)
+            if not await self._finish(row, "failed", last_error=label):
+                return  # cancelled while sending: not a delivery failure
             self._metrics.emails_failed.add(1)
             log_event(
                 _log,

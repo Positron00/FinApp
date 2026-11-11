@@ -45,7 +45,7 @@ class UserEmailTaken(Conflict):
 
 class InviteNotPending(Conflict):
     code = "invite_not_pending"
-    default_message = "This user has already accepted an invite."
+    default_message = "This user is no longer waiting for an invite."
 
 
 class CannotModifySelf(Conflict):

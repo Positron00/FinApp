@@ -33,6 +33,35 @@ tests:
       - alertname: PayoutDLQ
         eval_time: 5m
         exp_alerts: []
+  - name: PayoutLateSettlement pages on the first late settlement (pre-initialised counter, PAY-NFR-02)
+    interval: 1m
+    input_series:
+      - series: 'payroll_late_settlements_total{service_name="payroll"}'
+        values: "0 0 0 1 1 1 1 1"
+    alert_rule_test:
+      - alertname: PayoutLateSettlement
+        eval_time: 5m
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              service_name: payroll
+            exp_annotations:
+              summary: "The bank settled a payout attempt that payroll had already rejected or replaced"
+              description: "1 late settled answer(s) in the last 15 minutes: an employee may have been paid twice. Find the payout.late_settlement audit row, check the bank for every attempt's key, then recall or record."
+              runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutLateSettlement.md"
+              dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
+  - name: PayoutLateSettlement stays quiet while the counter is flat, and clears after 15 minutes
+    interval: 1m
+    input_series:
+      - series: 'payroll_late_settlements_total{service_name="payroll"}'
+        values: "0x10 1x30"
+    alert_rule_test:
+      - alertname: PayoutLateSettlement
+        eval_time: 9m
+        exp_alerts: []
+      - alertname: PayoutLateSettlement
+        eval_time: 30m
+        exp_alerts: []
   - name: BffAvailabilityFastBurn fires at 10% errors for 70 minutes
     interval: 1m
     input_series:

@@ -1,7 +1,7 @@
 # Tasks: PayRun 0.1.0
 
-Status (2026-11-11): skeleton done (CI green on main). Step 4 on `release/0.1.0`: F1–F4b done; F5 and F6 next.
-hardening and release tasks (F*, H*, R1) run on `release/0.1.0`.
+Status (2026-11-11): skeleton done (CI green on main). Step 4 on `release/0.1.0`: F1–F6 done; H1 next.
+Feature, hardening and release tasks (F*, H*, R1) run on `release/0.1.0`.
 
 **Rules for every task:**
 - **Tests in the same change.**
@@ -67,8 +67,8 @@ The skeleton journey: sign in as the seeded owner → create a monthly run for s
 
 | ID | Task | Covers | Depends | Parallel with | Done when | Est. | Status |
 |---|---|---|---|---|---|---|---|
-| H1 | Gates at thresholds; every failure-table row (HLD §4) implemented with its test, log event and metric; resilience suite (worker kill, bank down and timeout, bank-stub restart, payroll down, Redis down and FLUSHALL, Postgres down, identity down, SMTP down) | PAY-NFR-02, PAY-NFR-03, PAY-NFR-12, PAY-NFR-15 | F6 | — | `tests/resilience` passes; all PR gates green locally; the C61 bank-stub unit flake is reproduced and fixed or closed with its cause recorded (no retries); the C61 isolation gap is closed: the payout-worker unit, integration and contract suites pass in **one** pytest process (`pycommon.testing` keeps one provider set, C63) | 8 h | |
-| H2 | Full and soak load against the SLOs, with the capacity recorded in the plan; all five dashboards; every alert rule with a promtool test and a runbook; alert drills through Alertmanager to the sink | PAY-NFR-04, PAY-NFR-05, PAY-NFR-06, PAY-NFR-10, PAY-NFR-11 | H1 | — | SLOs met; each paging alert drilled; runbooks exist | 6 h | |
+| H1 | Gates at thresholds; every failure-table row (HLD §4) implemented with its test, log event and metric; resilience suite (worker kill, bank down and timeout, bank-stub restart, payroll down, Redis down and FLUSHALL, Postgres down, identity down, SMTP down) | PAY-NFR-02, PAY-NFR-03, PAY-NFR-12, PAY-NFR-15 | F6 | — | `tests/resilience` passes; web real-Redis int tests land (`apps/web/tests/lib/rate-limit.int.test.ts`: two limiters share counts at production values, PAY-603, C69; `session.int.test.ts`: PAY-106 TTLs and the PAY-607 `web` ACL NOPERM), via Testcontainers or the stack Redis; the relay stops re-claiming refused envelope rows every poll (C71); all PR gates green locally; the C61 bank-stub unit flake is reproduced and fixed or closed with its cause recorded (no retries); `tests/resilience/test_redis_restart.py` exists (the PAY-NFR-15 check; no test cites PAY-NFR-15 before it); the C61 isolation gap is closed: the payout-worker unit, integration and contract suites pass in **one** pytest process (`pycommon.testing` keeps one provider set, C63) | 8 h | |
+| H2 | Full and soak load against the SLOs (the soak's latency-drift, RSS-slope and consumer-lag checks are in `nightly-load.sh` since the F6 review), with the capacity recorded in the plan; the measured durations of the nightly `load` and `e2e-repeat` jobs recorded (C70) and their timeouts (100 and 120 min) adjusted; all five dashboards; every alert rule with a promtool test and a runbook; alert drills through Alertmanager to the sink | PAY-NFR-04, PAY-NFR-05, PAY-NFR-06, PAY-NFR-10, PAY-NFR-11 | H1 | — | SLOs met; each paging alert drilled; runbooks exist | 6 h | |
 | H3 | Security review (authz in every handler, JWT audiences and issuers, CSRF and Origin, rate limits, headers and CSP, no secrets in logs, non-root images, NetworkPolicies, audits); privacy checks; nightly workflow run on the release branch | PAY-601, PAY-604, PAY-NFR-07, PAY-NFR-08, PAY-NFR-12 | H2 | — | Review findings fixed; nightly passes once | 4 h | |
 
 ## Release (Step 7)

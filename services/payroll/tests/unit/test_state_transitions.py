@@ -1,4 +1,5 @@
-"""``decide_result``, ``instruction_allowed`` and the run guards (design §3.3)."""
+"""``decide_result``, ``is_late_settlement``, ``instruction_allowed`` and the run guards
+(design §3.3)."""
 
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from payroll.domain.state import (
     assert_run_mutable,
     decide_result,
     instruction_allowed,
+    is_late_settlement,
 )
 
 A, OC, K = AttemptStatus, ResultOutcome, ResultKind
@@ -76,3 +78,31 @@ def test_run_guards(status: RunStatus) -> None:
     else:
         with pytest.raises(PayRunNotApprovable):
             assert_run_approvable(status)
+
+
+LATE = [
+    # (current_attempt, attempt, stored status, outcome) -> late settlement?
+    (1, 1, A.REJECTED, OC.SETTLED, True),  # operator_rejected (or bank) then settled
+    (2, 1, A.REJECTED, OC.SETTLED, True),  # superseded by a retry
+    (2, 1, A.SETTLED, OC.SETTLED, False),
+    (1, 1, A.SETTLED, OC.SETTLED, False),  # a duplicate answer
+    *[(1, 1, s, OC.SETTLED, False) for s in (A.REQUESTED, A.INDETERMINATE, A.NEEDS_OPERATOR)],
+    *[(2, 1, A.REJECTED, o, False) for o in OC if o is not OC.SETTLED],
+    (1, 1, A.REJECTED, OC.REJECTED, False),
+    (1, 2, None, OC.SETTLED, False),  # an unknown attempt number
+    (1, 3, A.REJECTED, OC.SETTLED, False),  # not an earlier attempt
+]
+
+
+@pytest.mark.parametrize(("current", "attempt", "status", "outcome", "late"), LATE)
+def test_is_late_settlement(
+    current: int, attempt: int, status: AttemptStatus | None, outcome: ResultOutcome, late: bool
+) -> None:
+    """PAY-NFR-02 (design §4.7 "Late settlement"): settled for a rejected current attempt or a
+    non-settled earlier one is a possible double payment; nothing else is."""
+    assert (
+        is_late_settlement(
+            current_attempt=current, attempt=attempt, attempt_status=status, outcome=outcome
+        )
+        is late
+    )

@@ -154,7 +154,7 @@ def tasks(rt: Runtime) -> list[MaintenanceTask]:
 
     async def republish(session: AsyncSession) -> int:
         return await republish_due_attempts(
-            session, settings=s, outbox=rt.outbox, metrics=rt.metrics, now=rt.clock.now()
+            session, settings=s, outbox=rt.outbox, metrics=rt.metrics, clock=rt.clock
         )
 
     async def purge_outbox(session: AsyncSession) -> int:

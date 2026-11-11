@@ -5,9 +5,8 @@
 #
 # Runs the FULL suite (E2E_SUITE=full: J1–J5, role changes, errors, trace, axe; C51 since F6)
 # through scripts/ci/e2e.sh three times in a row, each on a fresh stack (e2e.sh always ends with
-# `stack.sh down -v`). An E2E_SUITE other than full in the environment (nightly.yml still sets
-# `skeleton` from before F3) is overridden with a warning: the nightly repeat exists to catch
-# flaky journeys. Logs of each run go to ci-logs/e2e-run-<n>.log; the first failure stops the
+# `stack.sh down -v`). An E2E_SUITE other than full in the environment is overridden with a
+# warning: the nightly repeat exists to catch flaky journeys. Logs of each run go to ci-logs/e2e-run-<n>.log; the first failure stops the
 # job with that run's artefacts in place.
 # shellcheck source=scripts/ci/lib.sh disable=SC1091  # followed with -x; single-file runs (pre-commit) cannot
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"

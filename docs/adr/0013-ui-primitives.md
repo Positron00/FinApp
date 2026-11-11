@@ -8,7 +8,7 @@ Context:
 Options:
 1. **shadcn/ui and Radix** (the default). Well-tested accessibility, more code to vendor, a larger dependency surface.
 2. **Small local components:**
-   - `components/ui/dialog.tsx`, `tabs.tsx` and `field.tsx`, built to the WAI-ARIA Authoring Practices: focus trap and return, roving tabIndex with arrow, Home and End keys, and `aria-describedby` and `aria-invalid` on fields.
+   - `apps/web/src/components/dialog.tsx`, `tabs.tsx` and `field.tsx` (in `components/`, not a `ui/` subfolder), built to the WAI-ARIA Authoring Practices: focus trap and return, roving tabIndex with arrow, Home and End keys, and `aria-describedby` and `aria-invalid` on fields.
    - Each one has a behaviour test.
    - Tailwind for styling.
 Recommendation: option 2 for 0.1.0. It meets PAY-NFR-14 with fewer dependencies. The axe check in e2e (F6) and the keyboard tests are the evidence.

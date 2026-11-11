@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 import { config } from "@/lib/config";
 import { logger } from "@/lib/logger";
+import { metricsApi } from "@/lib/metrics";
 import { methodNotAllowed, route } from "@/lib/route";
 import { cookieOptions, deleteSessionByKey, sessionKeyOf } from "@/lib/session";
 
@@ -22,6 +23,7 @@ export const POST = route({
       try {
         await deleteSessionByKey(sessionKeyOf(cookie));
       } catch (err) {
+        metricsApi.sessionBackendError();
         logger().error(
           { event: "session.backend_error", op: "logout", err: String(err) },
           "logout failed",

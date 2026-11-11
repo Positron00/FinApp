@@ -4,6 +4,7 @@ import { callService } from "@/lib/api/call";
 import { config } from "@/lib/config";
 import { BffError } from "@/lib/errors";
 import { logger } from "@/lib/logger";
+import { metricsApi } from "@/lib/metrics";
 import { methodNotAllowed, route } from "@/lib/route";
 import { ResetConfirmBody } from "@/lib/schemas/requests";
 import { ResetConfirmResult } from "@/lib/schemas/responses";
@@ -44,7 +45,9 @@ export const POST = route({
       try {
         await deleteSessionByKey(sessionKeyOf(cookie));
       } catch (err) {
-        logger().warn(
+        // §7.1 level and §7.2 counter, as session.ts's backendError (best effort: still 204).
+        metricsApi.sessionBackendError();
+        logger().error(
           { event: "session.backend_error", op: "reset_confirm", err: String(err) },
           "could not delete the current session",
         );

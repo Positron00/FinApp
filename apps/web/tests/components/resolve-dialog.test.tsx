@@ -67,6 +67,10 @@ describe("ResolveDialog", () => {
     expect(dialog.textContent).toContain("••••4242");
     expect(dialog.textContent).toContain("$3,750.00");
     expect(dialog.textContent).toContain("GET /v1/transfers/{key}");
+    // PAY-NFR-14: Shift+Tab from the (non-tabbable) warning stays in the dialog
+    await userEvent.tab({ shift: true });
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).not.toBe(screen.getAllByRole("button", { name: "Resolve" })[0]);
   });
 
   // PAY-502: no default choice; submit disabled until a choice and a 1–500 character note.

@@ -40,6 +40,7 @@ class UpdateCommand:
     user_id: UUID
     roles: list[str] | None
     deactivate: bool
+    route: str  # the matched route template, for auth.forbidden (same label as admin_actor)
     client_ip: str | None = field(default=None, repr=False)
 
 
@@ -105,7 +106,7 @@ async def update_user(rt: IdentityRuntime, cmd: UpdateCommand) -> UserOut:
                     _log,
                     logging.INFO,
                     "auth.forbidden",
-                    route="/v1/users/{id}",
+                    route=cmd.route,
                     reason="db_role",
                 )
                 raise Forbidden()

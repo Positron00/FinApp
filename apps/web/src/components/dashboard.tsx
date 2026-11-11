@@ -2,6 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
+import { useId } from "react";
 
 import { ErrorBanner } from "@/components/error-banner";
 import { RunStatusBadge } from "@/components/runs/run-status-badge";
@@ -31,9 +32,11 @@ function RunCard({
   runs: ReturnType<typeof useRuns>;
   note?: (r: PayRun) => string | null;
 }) {
+  // An ID without whitespace: aria-labelledby is a space-separated ID list (PAY-NFR-14).
+  const headingId = useId();
   return (
-    <section className="rounded border p-4" aria-labelledby={`card-${title}`}>
-      <h2 id={`card-${title}`} className="font-semibold">
+    <section className="rounded border p-4" aria-labelledby={headingId}>
+      <h2 id={headingId} className="font-semibold">
         {title}
       </h2>
       {runs.isError ? <ErrorBanner error={runs.error} onRetry={() => void runs.refetch()} /> : null}

@@ -1,7 +1,8 @@
 """Statuses, the run status rule and the result decision table (design §3.3).
 
-PAY-405 (``decide_result``), PAY-406 (``run_status_from_payouts``), PAY-411
-(``instruction_allowed``), PAY-301/304/400 (the run guards).
+PAY-405 (``decide_result``), PAY-NFR-02 (``is_late_settlement``), PAY-406
+(``run_status_from_payouts``), PAY-411 (``instruction_allowed``), PAY-301/304/400 (the run
+guards).
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ __all__ = [
     "assert_run_mutable",
     "decide_result",
     "instruction_allowed",
+    "is_late_settlement",
     "payout_status_for_attempt",
     "run_status_from_payouts",
 ]
@@ -150,3 +152,25 @@ def decide_result(
             return ResultDecision(ResultKind.APPLY, _APPLY_FROM_LIVE[outcome])
         return _STORED
     return ResultDecision(ResultKind.APPLY, _APPLY_FROM_LIVE[outcome])
+
+
+def is_late_settlement(
+    *,
+    current_attempt: int,
+    attempt: int,
+    attempt_status: AttemptStatus | None,
+    outcome: ResultOutcome,
+) -> bool:
+    """PAY-NFR-02: a ``settled`` answer for an attempt payroll no longer treats as payable.
+
+    True for the current attempt when it is already ``rejected`` (for example
+    ``operator_rejected`` after the C48 wait), and for any earlier attempt that is not
+    ``settled`` (a retry has opened a later attempt, which may pay again). The response contract
+    is unchanged (``decide_result``); the caller records the event (design §4.7 "Late
+    settlement"). An unknown attempt number is never a late settlement.
+    """
+    if outcome is not ResultOutcome.SETTLED or attempt_status is None:
+        return False
+    if attempt == current_attempt:
+        return attempt_status is AttemptStatus.REJECTED
+    return attempt < current_attempt and attempt_status is not AttemptStatus.SETTLED

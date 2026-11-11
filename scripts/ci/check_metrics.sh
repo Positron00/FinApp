@@ -30,6 +30,7 @@ REQUIRED=(
   payroll_payouts_stuck
   payroll_runs_processing_oldest_age_seconds
   payroll_attempts_needs_operator
+  payroll_late_settlements_total             # pre-initialised to 0 (PayoutLateSettlement, C71)
 )
 
 port="${PROMETHEUS_PORT:-$(env_val PROMETHEUS_PORT)}"

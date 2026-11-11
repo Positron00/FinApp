@@ -162,7 +162,7 @@ async def retry_payout(
 @router.post(
     "/{run_id}/payouts/{payout_id}/resolve",
     response_model=PayoutOut,
-    responses=errors(400, 404, 409),
+    responses=errors(400, 404, 409, retry_after=(409,)),
 )
 async def resolve_payout(
     run_id: UUID, payout_id: UUID, body: ResolveIn, rt: RT, principal: Approver

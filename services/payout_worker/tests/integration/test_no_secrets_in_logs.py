@@ -3,13 +3,15 @@
 One run exercises every worker log path that touches a payout: settled, rejected, a bank
 no-answer and its redelivery, poison with and without readable IDs (DLQ). Everything captured —
 every log line of the in-process stack, every span (names, attributes, events, status) and every
-metric label — must hold none of: the routing number, the account numbers, the amounts, the
-bank API key, or the JWTs the worker minted.
+metric label — must hold none of: the routing number, the account numbers, the amounts (matched
+as whole numbers, in cents or units, so a digit run inside a timestamp or ID can't fail the test
+by chance), the bank API key, or the JWTs the worker minted.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import httpx
@@ -57,6 +59,14 @@ def _span_dump(otel: OtelMemory) -> str:
     return json.dumps(out, default=str)
 
 
+def _amount_pattern(cents: int) -> re.Pattern[str]:
+    """The amount as a whole number (412345) or in units (4123.45), not as part of a longer token:
+    a short digit run inside a timestamp, port, ID or another number is not a leak."""
+    forms = (str(cents), f"{cents // 100}.{cents % 100:02d}")
+    alternatives = "|".join(re.escape(f) for f in forms)
+    return re.compile(rf"(?<![\w.])(?:{alternatives})(?!\w)")
+
+
 def _metric_labels(otel: OtelMemory) -> str:
     labels = [attrs for name in otel.metric_names() for attrs, _ in otel.metric_points(name)]
     return json.dumps(labels, default=str)
@@ -99,7 +109,7 @@ async def test_full_flow_leaks_nothing(
     assert payroll.auth  # the worker's JWTs were seen on the wire
 
     amounts = {
-        str(json.loads(fields[b"envelope"])["data"]["amount_cents"])
+        int(json.loads(fields[b"envelope"])["data"]["amount_cents"])
         for _, fields in await stack.entries()
         if b"envelope" in fields
     }
@@ -109,10 +119,15 @@ async def test_full_flow_leaks_nothing(
     spans = _span_dump(otel_memory)
     labels = _metric_labels(otel_memory)
     assert "payout.requested process" in spans
-    for secret in secrets | amounts:
-        assert secret not in logs, "secret or amount in a log line"
-        assert secret not in spans, "secret or amount in a span"
-        assert secret not in labels, "secret or amount in a metric label"
+    for secret in secrets:
+        assert secret not in logs, "secret in a log line"
+        assert secret not in spans, "secret in a span"
+        assert secret not in labels, "secret in a metric label"
+    for cents in amounts:
+        amount = _amount_pattern(cents)
+        assert not amount.search(logs), "amount in a log line"
+        assert not amount.search(spans), "amount in a span"
+        assert not amount.search(labels), "amount in a metric label"
     dlq = json.dumps(await stack.dlq())
     for secret in secrets:
         assert secret not in dlq, "secret in a DLQ entry"

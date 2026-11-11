@@ -7,9 +7,13 @@
 # Stack up, `seed.py --employees 500`, then the k6 scenarios, each through scripts/ci/k6.sh:
 #   load/full.js        ramping-arrival-rate to 30 journey operations/s, held 10 min; errors < 1%,
 #                       p95 < 300 ms (simple) and < 1.5 s (calculate) (PAY-NFR-05)
-#   load/soak.js        5 operations/s for 30 min; the same thresholds, plus no upward drift: the
-#                       p95 of the last 5 min within 20% of the first 5 min (checked here, from the
-#                       summary export's window:first / window:last sub-metrics)
+#   load/soak.js        5 operations/s for 30 min; the same thresholds, plus three checks here:
+#                       no latency drift (p95 of the last 5 min within 20% of the first 5 min, from
+#                       the summary export's window:first / window:last sub-metrics); no memory
+#                       growth (RSS slope < 5% over the soak for every Python service, from
+#                       Prometheus process_memory_usage_bytes); no consumer-lag growth
+#                       (queue_consumer_lag not both > 0 and rising). The last two are
+#                       scripts/ci/soak_resources.py over the soak window (PAY-NFR-05).
 #   load/settlement.js  five 500-employee runs approved as approver@payrun.example.com (R22);
 #                       settlement p95 <= 60 s (PAY-NFR-06), cross-checked here against payroll's
 #                       payroll_payout_settlement_seconds histogram in Prometheus
@@ -50,6 +54,20 @@ sys.exit(0 if verdict == "ok" else 1)
 PY
 }
 
+# PAY-NFR-05 resources over the soak scenario's own window (k6 setup excluded): the window ends
+# when k6 exits and is SOAK_DURATION long (soak.js's default 30m).
+soak_resources() {
+  local ended="$1" duration="${SOAK_DURATION:-30m}" seconds
+  case "$duration" in
+    *s) seconds="${duration%s}" ;;
+    *m) seconds="$((${duration%m} * 60))" ;;
+    *h) seconds="$((${duration%h} * 3600))" ;;
+    *) log "SOAK_DURATION must look like 30m: $duration"; return 1 ;;
+  esac
+  python3 scripts/ci/soak_resources.py --prometheus "http://127.0.0.1:$(env_val PROMETHEUS_PORT)" \
+    --start "$((ended - seconds))" --end "$ended"
+}
+
 # Cross-check: payroll's own settlement histogram over the settlement step (PAY-NFR-06).
 settlement_prometheus() {
   local since="$1" window p95
@@ -75,7 +93,11 @@ for scenario in "${scenarios[@]}"; do
   else
     failed+=("$scenario")
   fi
-  if [[ "$scenario" == soak ]] && ! soak_drift; then failed+=("soak-drift"); fi
+  if [[ "$scenario" == soak ]]; then
+    ended="$(date +%s)"
+    soak_drift || failed+=("soak-drift")
+    soak_resources "$ended" || failed+=("soak-resources")
+  fi
   if [[ "$scenario" == settlement ]] && ! settlement_prometheus "$started"; then
     failed+=("settlement-prometheus")
   fi

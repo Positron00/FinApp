@@ -214,3 +214,17 @@ async def test_reset_requests_are_limited_per_ip_and_per_account() -> None:
     assert await limits.check_reset("ip-1", other + "x") is None  # its third
     assert await limits.check_reset("ip-1", other + "y") is not None  # its fourth: reset_ip
     assert not any(":lock:" in k for k in r.data)
+
+
+async def test_accept_and_reset_checks_are_traced(otel_memory: OtelMemory) -> None:
+    """PAY-105, PAY-103, R18: check_accept and check_reset each open an
+    identity.ratelimit.check span with their identity.component and the verdict (LLD §5.3)."""
+    limits = make_limits(FakeRedis())
+    assert await limits.check_accept("ip") is None
+    assert await limits.check_reset("ip", EK) is None
+    spans = [s for s in otel_memory.spans() if s.name == "identity.ratelimit.check"]
+    assert [
+        (s.attributes["identity.component"], s.attributes["identity.allowed"])
+        for s in spans
+        if s.attributes is not None
+    ] == [("accept", True), ("reset", True)]

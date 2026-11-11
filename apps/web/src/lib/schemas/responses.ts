@@ -264,13 +264,3 @@ export const Payout = z.strictObject({
   attempts: z.array(Attempt),
 });
 export type Payout = z.infer<typeof Payout>;
-
-/** The PAY-602 error body. */
-export const ErrorBody = z.object({
-  error: z.object({
-    code: z.string(),
-    message: z.string(),
-    request_id: z.string(),
-    details: z.unknown().optional(),
-  }),
-});

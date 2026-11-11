@@ -7,7 +7,12 @@ worker becomes its child (PAY-NFR-09). ``mark_sent``/``mark_failed`` end the spa
 With ``validate`` on (``PAYROLL_VALIDATE_EVENTS``), the envelope is re-validated against the JSON
 Schema after the traceparent rewrite (C60, C63). An invalid row is never published: it is marked
 failed (``relay_attempts``, ``last_error``), logged as ``outbox.relay.error`` and left unsent, so
-``OutboxStuck`` fires, while the rest of the batch still goes out.
+``OutboxStuck`` fires, while the rest of the batch still goes out. Re-publish then moves the
+attempt to ``needs_operator`` (``envelope_invalid``), so the payout is never stuck for good
+(§5.3, PAY-NFR-03).
+
+``mark_sent`` locks the touched attempt rows in ``(payout_id, attempt)`` order before updating
+them, the order every other writer uses (§4.10), so the relay can't deadlock with re-publish.
 """
 
 from __future__ import annotations
@@ -39,6 +44,12 @@ _CLAIM: Final = text(
     "LIMIT :limit FOR UPDATE SKIP LOCKED"
 )
 _MARK_SENT: Final = text("UPDATE payroll.outbox SET sent_at = now() WHERE id = ANY(:ids)")
+_LOCK_TOUCHED: Final = text(
+    "SELECT a.id FROM payroll.payout_attempts a "
+    "JOIN unnest(CAST(:payout_ids AS uuid[]), CAST(:attempts AS smallint[])) AS s(pid, att) "
+    "ON a.payout_id = s.pid AND a.attempt = s.att "
+    "ORDER BY a.payout_id, a.attempt FOR UPDATE OF a"
+)
 _TOUCH_ATTEMPTS: Final = text(
     "UPDATE payroll.payout_attempts a SET last_published_at = now(), updated_at = now() "
     "FROM unnest(CAST(:payout_ids AS uuid[]), CAST(:attempts AS smallint[])) AS s(pid, att) "
@@ -111,13 +122,12 @@ class PayrollOutboxSource:
         await session.execute(_MARK_SENT, {"ids": [i.event_id for i in items]})
         refs = [i.ref for i in items if isinstance(i.ref, RelayRef) and i.ref.attempt]
         if refs:
-            await session.execute(
-                _TOUCH_ATTEMPTS,
-                {
-                    "payout_ids": [r.payout_id for r in refs],
-                    "attempts": [r.attempt for r in refs],
-                },
-            )
+            params = {
+                "payout_ids": [r.payout_id for r in refs],
+                "attempts": [r.attempt for r in refs],
+            }
+            await session.execute(_LOCK_TOUCHED, params)
+            await session.execute(_TOUCH_ATTEMPTS, params)
         for item in items:
             if isinstance(item.ref, RelayRef):
                 item.ref.span.set_status(Status(StatusCode.OK))

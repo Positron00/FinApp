@@ -26,6 +26,7 @@ __all__ = [
     "admin_actor",
     "client_ip",
     "public_caller",
+    "route_label",
     "user_caller",
 ]
 
@@ -48,6 +49,12 @@ class ActorUser:
     company_id: UUID
 
 
+def route_label(request: Request) -> str:
+    """The matched route template, as pycommon's ``auth.forbidden`` logs it (e.g. ``{id:uuid}``)."""
+    route = request.scope.get("route")
+    return str(getattr(route, "path", None) or "unmatched")
+
+
 async def admin_actor(request: Request, principal: UserCaller, rt: Runtime) -> ActorUser:
     """The actor row must be active and hold ``admin`` **in the DB** (JWT roles may be stale)."""
     uid = principal.user_id
@@ -57,13 +64,8 @@ async def admin_actor(request: Request, principal: UserCaller, rt: Runtime) -> A
         user = await UserRepo(session).get(principal.cid, uid)
     if user is None or user.status != "active" or "admin" not in user.roles:
         # Same event as pycommon's JWT role check, so DB-role denials show up alongside them.
-        route = request.scope.get("route")
         log_event(
-            _log,
-            logging.INFO,
-            "auth.forbidden",
-            route=str(getattr(route, "path", None) or "unmatched"),
-            reason="db_role",
+            _log, logging.INFO, "auth.forbidden", route=route_label(request), reason="db_role"
         )
         raise Forbidden()
     return ActorUser(user_id=uid, company_id=principal.cid)

@@ -2534,6 +2534,8 @@ export interface operations {
             /** @description Conflict */
             409: {
                 headers: {
+                    /** @description Whole seconds to wait before the request can succeed (sent with the codes that carry details.retry_after_s, e.g. resolve_too_early, C48). */
+                    "Retry-After"?: number;
                     [name: string]: unknown;
                 };
                 content: {

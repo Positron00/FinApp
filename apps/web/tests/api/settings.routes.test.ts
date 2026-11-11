@@ -103,7 +103,8 @@ describe("PUT /api/settings", () => {
   it.each([
     [{ biweekly_anchor: "2026-01-06" }, "body.biweekly_anchor"],
     [{ biweekly_anchor: "2026-02-30" }, "body.biweekly_anchor"],
-    [{ timezone: "Mars/Olympus" }, "body.timezone"],
+    [{ timezone: "" }, "body.timezone"],
+    [{ timezone: `Mars/${"Olympus".repeat(10)}` }, "body.timezone"],
     [{ tax_rate_bps: 5001 }, "body.tax_rate_bps"],
     [{ retirement_bps: -1 }, "body.retirement_bps"],
     [{ tax_rate_bps: 12.5 }, "body.tax_rate_bps"],
@@ -117,6 +118,21 @@ describe("PUT /api/settings", () => {
     expect((e.details as { field: string }[])[0]!.field).toBe(field);
     expect(JSON.stringify(e)).not.toContain("Mars");
     expect(seen).toHaveLength(0);
+  });
+
+  // PAY-200: the BFF checks the zone's format and length only; payroll's zoneinfo check is
+  // authoritative, so zones missing from the runtime's ICU list (Etc/UTC, Asia/Kolkata) save.
+  it.each(["Etc/UTC", "Asia/Kolkata", "Europe/Kyiv"])("forwards %s to payroll", async (zone) => {
+    const cookie = await signIn();
+    let sent: unknown;
+    server.use(
+      http.put(`${PAYROLL}/v1/company/settings`, async ({ request }) => {
+        sent = await request.json();
+        return HttpResponse.json(settings());
+      }),
+    );
+    expect((await put(cookie, { ...BODY, timezone: zone })).status).toBe(200);
+    expect(sent).toMatchObject({ timezone: zone });
   });
 
   // PAY-200: UTC is accepted even where the runtime lists it only as an alias.

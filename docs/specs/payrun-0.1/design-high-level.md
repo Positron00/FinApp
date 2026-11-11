@@ -123,6 +123,8 @@ log events, metrics and alerts, and adds test layers. Every alerted row has a ru
 | Redis down | Client errors | Session 503; limiter rules; outbox holds | `ratelimit.backend_error` / `rate_limiter_errors_total`, `outbox_unsent` | `OutboxStuck`, `RateLimiterErrors` | PAY-603, 402 |
 | Redis data loss / NOGROUP | NOGROUP error | Recreate the group; re-publish | `queue.group.recreated`, `payout.republished` | `PayoutsStuck` | PAY-407, 408 |
 | Outbox relay crash | Unsent age | Another replica or the restart sends | `outbox.relay.error` / `outbox_oldest_age_seconds` | `OutboxStuck` | PAY-402 |
+| Late `settled` answer for a rejected or superseded attempt (possible double payment) | Result check | Response unchanged; audit `payout.late_settlement` once per attempt; operator checks the bank and recalls | `payout.late_settlement` (error) / `payroll_late_settlements_total` | `PayoutLateSettlement` (page) | PAY-NFR-02 |
+| Relay refuses an envelope (`EnvelopeInvalidError`) | Unsent age | Re-publish moves the attempt to `needs_operator` / `envelope_invalid`; operator resolves | `outbox.relay.error`, `payout.needs_operator` / `outbox_oldest_age_seconds` | `OutboxStuck`, `PayoutNeedsOperator` | PAY-NFR-03 |
 | Slow DB (2 s) | Statement timeout (slow query); asyncpg `command_timeout` and the per-unit DB budget `DB_STATEMENT_TIMEOUT_MS/1000 + DB_POOL_TIMEOUT_S` (slow link) | 503 `db_timeout` within the 4 s budget | `http.request` / `http_server_request_duration_seconds` | `BffAvailabilityFastBurn` | PAY-605, NFR-04 |
 | Postgres down | `/readyz` | 503 `db_unavailable` fast; recovers | `db.unavailable` / `http_server_request_duration_seconds` | `BffAvailabilityFastBurn` | PAY-605 |
 | identity down | BFF client | 503 `service_unavailable`; breaker | `bff.upstream_error` / `circuit_breaker_state` | `BffAvailabilityFastBurn` | PAY-602 |
@@ -177,7 +179,7 @@ The details are in plan §8; the requirements are PAY-600–607 and NFR-07/08.
 | SLO: availability | 99.5% non-5xx at the BFF; recording rules `sli:bff_errors:ratio_rate{5m,30m,1h,6h}` | PAY-NFR-04 |
 | SLO: latency | p95 < 300 ms (`bff_request_duration_seconds`) | PAY-NFR-05 |
 | SLO: settlement | p95 ≤ 60 s (`payroll_payout_settlement_seconds`) | PAY-NFR-06 |
-| Alerts (page) | `BffAvailabilityFastBurn`, `PayoutSettlementSlow`, `PayoutDLQ`, `PayoutsStuck`, `PayoutNeedsOperator` → `alert-sink` `/page` | PAY-NFR-10, 11 |
+| Alerts (page) | `BffAvailabilityFastBurn`, `PayoutSettlementSlow`, `PayoutDLQ`, `PayoutsStuck`, `PayoutNeedsOperator`, `PayoutLateSettlement` → `alert-sink` `/page` | PAY-NFR-10, 11 |
 | Alerts (ticket/warning) | `BffAvailabilitySlowBurn`, `OutboxStuck`, `ConsumerLagGrowing`, `BankBreakerOpen`, `BankErrorRateHigh`, `SigninFailuresSpike`, `RedisMemoryHigh`, `PayoutStreamNearMaxlen`, `EmailOutboxStuck`, `RateLimiterErrors`, `PodRestarts`, `CollectorDropping` → `alert-sink` `/ticket` | PAY-NFR-10 |
 | Dashboards | `service-overview.json`, `journeys.json`, `queues.json`, `bank.json`, `platform.json` in `deploy/observability/grafana/dashboards/` | PAY-NFR-10 |
 | Trace | One trace per J4 journey across all hops | PAY-NFR-09 |

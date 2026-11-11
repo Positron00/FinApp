@@ -5,6 +5,7 @@ import { abaChecksumOk } from "../aba";
 import {
   Cursor,
   Email,
+  IdentityCursor,
   IsoDate,
   Limit,
   Password,
@@ -81,10 +82,9 @@ export const SettingsBody = z.strictObject({
   name: z.string().trim().min(1).max(200),
   tax_rate_bps: z.number().int().min(0).max(5000),
   retirement_bps: z.number().int().min(0).max(2000),
-  timezone: z
-    .string()
-    .max(64)
-    .refine((v) => timeZones().includes(v), "timezone"),
+  // Format and length only: payroll's zoneinfo check is authoritative, and the runtime's ICU
+  // list leaves out valid zones such as Etc/UTC or Asia/Kolkata (web LLD §2.3).
+  timezone: z.string().min(1).max(64),
   biweekly_anchor: IsoDate.refine(isMonday, "not_monday"),
   require_dual_approval: z.boolean(),
 });
@@ -167,6 +167,9 @@ export type ResolveBody = z.infer<typeof ResolveBody>;
 
 /** C8: cursor and limit pass through to the service unchanged. */
 export const ListQuery = z.strictObject({ cursor: Cursor, limit: Limit });
+
+/** Identity's list endpoints (/v1/users, /v1/audit-log) cap the cursor at 64 characters. */
+export const IdentityListQuery = z.strictObject({ cursor: IdentityCursor, limit: Limit });
 
 /** PAY-202. */
 export const EmployeeListQuery = z.strictObject({

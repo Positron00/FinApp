@@ -2,6 +2,7 @@
 import { randomBytes } from "node:crypto";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { StrictMode } from "react";
 
 import { AcceptForm } from "@/components/forms/accept-form";
 import { ResetFlow } from "@/components/forms/reset-forms";
@@ -133,6 +134,47 @@ describe("AcceptForm", () => {
     await waitFor(() =>
       expect(screen.getByRole("alert").textContent).toMatch(/temporarily unavailable/),
     );
+  });
+});
+
+describe("useFragmentToken under StrictMode", () => {
+  // PAY-103, PAY-105: StrictMode (next dev) runs the effect twice; the first run strips the
+  // fragment, and the second must keep the token it read, not fall back to "no token".
+  function strip() {
+    replaceState.mockImplementation(() => {
+      (window.location as { hash: string }).hash = "";
+    });
+  }
+
+  it("keeps the invite token after the effect re-runs", async () => {
+    at("/accept", `#token=${TOKEN}`);
+    strip();
+    const calls = stubApi((c) =>
+      c.path === "/api/auth/accept" ? { body: { user: { id: "u" } } } : undefined,
+    );
+    render(
+      <StrictMode>
+        <AcceptForm />
+      </StrictMode>,
+    );
+    await setPassword(PASSWORD);
+    expect(screen.queryByRole("alert")).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Set password and sign in" }));
+    await waitFor(() => expect(assign).toHaveBeenCalledWith("/dashboard"));
+    expect(calls[0]!.body).toEqual({ token: TOKEN, password: PASSWORD });
+    expect(window.location.hash).toBe("");
+  });
+
+  it("keeps the reset token after the effect re-runs", async () => {
+    at("/reset", `#token=${TOKEN}`);
+    strip();
+    render(
+      <StrictMode>
+        <ResetFlow />
+      </StrictMode>,
+    );
+    expect(await screen.findByLabelText("New password")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Send reset link" })).toBeNull();
   });
 });
 

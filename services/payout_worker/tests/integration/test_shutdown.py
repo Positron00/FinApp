@@ -32,6 +32,7 @@ from tests.integration.conftest import GROUP, STREAM, Stack, runtime, wait_for
 
 N = 16  # PAYOUT_CONCURRENCY's default: every slot holds a message
 GRACE_S = 75  # terminationGracePeriodSeconds (plan §2.2)
+DEPLOYED_OTLP_TIMEOUT_S = 3  # OTEL_EXPORTER_OTLP_TIMEOUT in Compose and k8s (C67)
 
 
 class GatedBank(httpx.AsyncBaseTransport):
@@ -231,7 +232,9 @@ def _free_port() -> int:
         return port
 
 
-def _worker_env(pg: PgBootstrapped, r: RedisAcl, fake_port: int, port: int) -> dict[str, str]:
+def _worker_env(
+    pg: PgBootstrapped, r: RedisAcl, fake_port: int, port: int, otlp_timeout_s: int
+) -> dict[str, str]:
     d, rr = pg.env_for("payouts_app"), r.env_for("payout-worker")
     keep = {k: v for k, v in os.environ.items() if k in {"PATH", "HOME", "VIRTUAL_ENV", "TMPDIR"}}
     return {
@@ -254,7 +257,7 @@ def _worker_env(pg: PgBootstrapped, r: RedisAcl, fake_port: int, port: int) -> d
         "PAYOUT_WORKER_JWT_PRIVATE_KEY": TOKENS.private_pems["payout-worker"],
         "PAYOUT_WORKER_JWT_KID": TOKENS.kids["payout-worker"],
         "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:9",  # nothing listens: drop quietly
-        "OTEL_EXPORTER_OTLP_TIMEOUT": "1",
+        "OTEL_EXPORTER_OTLP_TIMEOUT": str(otlp_timeout_s),
         "OTEL_METRIC_EXPORT_INTERVAL": "600000",
     }
 
@@ -267,19 +270,27 @@ async def _ready(port: int) -> bool:
         return False
 
 
-@pytest.mark.parametrize("released", [True, False], ids=["drained", "drain_timeout"])
+@pytest.mark.parametrize(
+    ("released", "otlp_timeout_s"),
+    [(True, 1), (False, 1), (False, DEPLOYED_OTLP_TIMEOUT_S)],
+    ids=["drained", "drain_timeout", "drain_timeout_deployed_otlp_timeout"],
+)
 async def test_sigterm_in_a_real_process(
     stack: Stack,
     fakes: tuple[_Fakes, int],
     tmp_path: Path,
     released: bool,
+    otlp_timeout_s: int,
 ) -> None:
     """PAY-408: a real `python -m pycommon.serve` worker gets SIGTERM while one handler is held
     in the bank call. It stops reading (an entry added after the signal is never delivered),
     then either finishes the held message (released within PAYOUT_SHUTDOWN_DRAIN_S: result
     posted, ACKed) or cancels it at the drain (left pending for another consumer). It exits
     (status 0, or SIGTERM re-raised by uvicorn after the graceful shutdown) well within the 75 s
-    grace period: drain 2 s + ≤ 10 s for close and flush."""
+    grace period: drain 2 s + ≤ 10 s for close and flush. The OTLP endpoint is unreachable, so
+    the flush waits out OTEL_EXPORTER_OTLP_TIMEOUT per exporter; the third case uses the value
+    Compose and Kubernetes deploy (3 s, C67): three exporters flushed in turn still fit in the
+    10 s, so a 60 s drain + flush stays under the 75 s grace."""
     fake, fake_port = fakes
     port = _free_port()
     env = envelope_dict(event_id=new_id(), payout_id=str(new_id()))
@@ -299,7 +310,7 @@ async def test_sigterm_in_a_real_process(
             sys.executable,
             "-m",
             "pycommon.serve",
-            env=_worker_env(stack.pg, stack.redis_acl, fake_port, port),
+            env=_worker_env(stack.pg, stack.redis_acl, fake_port, port, otlp_timeout_s),
             cwd=tmp_path,
             stdout=log,
             stderr=subprocess.STDOUT,

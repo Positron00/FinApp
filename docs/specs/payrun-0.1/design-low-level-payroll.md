@@ -44,7 +44,7 @@ All paths are under `services/payroll/`. The package is `payroll`.
 | `src/payroll/domain/__init__.py` | new | `DomainError` base class and all its subclasses (§3.7). |
 | `src/payroll/domain/periods.py` | new | Period derivation, `period_index`, the overlap test and the hours bounds (§3.1). |
 | `src/payroll/domain/calc.py` | new | Gross, tax, retirement, net and totals in integer arithmetic (§3.2). |
-| `src/payroll/domain/state.py` | new | Status enums, `run_status_from_payouts` (PAY-406), the mutability and approvability guards, `decide_result` and `instruction_allowed` (§3.3). |
+| `src/payroll/domain/state.py` | new | Status enums, `run_status_from_payouts` (PAY-406), the mutability and approvability guards, `decide_result`, `is_late_settlement` and `instruction_allowed` (§3.3). |
 | `src/payroll/domain/dual_approval.py` | new | `check_approve_dual` and `check_retry_dual` (PAY-401, PAY-500) (§3.4). |
 | `src/payroll/domain/retry.py` | new | `check_retry`, `republish_backoff_s` and `republish_decision` (PAY-500, PAY-407) (§3.5). |
 | `src/payroll/domain/resolve.py` | new | `ResolveAction`, `check_resolve` and `resolve_transition` (PAY-502) (§3.5a). |
@@ -318,7 +318,7 @@ CREATE INDEX ix_attempts_nonfinal ON payroll.payout_attempts (requested_at)
 - `account_last4` is a display copy, so the attempt history can show which account each attempt paid (J5) **[decision]**.
 - `bank_reference` is at most 64 characters, the same bound as the worker and bank-stub (C26).
 - **Meaning of `publish_count`:** how many times this attempt has been published since it was created or last redriven, counting that publication. So the number of re-publishes so far is `publish_count − 1` (§3.5). An operator redrive (PAY-502) sets it back to 1 (C13).
-- `failure_reason` holds the bank's reason for `rejected`, `operator_rejected` for an operator's mark_rejected (PAY-502), and the cause for `needs_operator` (`republish_limit`, or the worker's poison reason such as `schema_invalid`, `amount_mismatch`, `key_window_expired`). A redrive clears it.
+- `failure_reason` holds the bank's reason for `rejected`, `operator_rejected` for an operator's mark_rejected (PAY-502), and the cause for `needs_operator` (`republish_limit`, `envelope_invalid`, or the worker's poison reason such as `schema_invalid`, `amount_mismatch`, `key_window_expired`). A redrive clears it.
 
 ### 2.8 `audit_events`
 
@@ -355,7 +355,8 @@ Audit events and the shape of `details`:
 | `payrun.deleted` | `{status_at_delete}` | PAY-304 |
 | `payout.result_recorded` | `{attempt, outcome, applied: true, failure_reason?}`, written **only when the result is applied** (§4.7 APPLY). A STORED (no-change) result writes no audit row; it is visible in the log `payout.result_recorded` with `applied=false` | PAY-405 |
 | `payout.retry_requested` | `{attempt, account_last4}` | PAY-500 |
-| `payout.needs_operator` | `{attempt, reason}` (`poison`, `republish_limit` or the worker's reason) | PAY-407, PAY-409 |
+| `payout.needs_operator` | `{attempt, reason}` (`poison`, `republish_limit`, `envelope_invalid` or the worker's reason) | PAY-407, PAY-409, PAY-NFR-03 |
+| `payout.late_settlement` | `{attempt, current_attempt, attempt_status, failure_reason?, bank_reference, later_attempt_settled, later_settled_attempt?}`; actor `service:payout-worker`; once per payout and attempt (§4.7 "Late settlement") | PAY-NFR-02 |
 | `payout.operator_resolved` | `{attempt, action, note_len}` (`action` is `redrive` or `mark_rejected`; the note's length, never its text) | PAY-502 |
 
 No money amounts, names, emails or bank numbers other than `account_last4` appear in `details` (plan §6).
@@ -593,6 +594,11 @@ class ResultDecision:
 
 def decide_result(*, current_attempt: int, attempt: int, attempt_status: AttemptStatus | None,
                   outcome: ResultOutcome) -> ResultDecision: ...
+
+def is_late_settlement(*, current_attempt: int, attempt: int, attempt_status: AttemptStatus | None,
+                       outcome: ResultOutcome) -> bool:
+    # settled for the current attempt when it is already rejected, or for an earlier attempt
+    # that is not settled; never for an unknown attempt number (§4.7 "Late settlement")
 ```
 
 The `decide_result` decision table (PAY-405, ADR 0003 c):
@@ -607,6 +613,10 @@ The `decide_result` decision table (PAY-405, ADR 0003 c):
 The `needs_operator` row is R7 and PAY-405: a definite bank answer for that attempt's key is applied
 because the bank is authoritative. Ignoring a real `settled` would leave money paid but recorded as
 unpaid.
+
+`is_late_settlement` (PAY-NFR-02) flags the two `settled` cells that the table can't apply: STORED on
+a `rejected` attempt (usually `operator_rejected`) and NOT_CURRENT on an earlier, non-settled
+attempt. The response stays as the table says; the caller records the event (§4.7).
 
 ### 3.4 `domain/dual_approval.py` (PAY-401, PAY-500, ADR 0005)
 
@@ -663,14 +673,17 @@ class RepublishAction(StrEnum):
 
 def republish_decision(*, status: AttemptStatus, is_current: bool, publish_count: int,
                        last_published_at: datetime, now: datetime, has_unsent_outbox: bool,
-                       after_s: int, max_backoff_s: int, max_republish: int) -> RepublishAction:
+                       after_s: int, max_backoff_s: int, max_republish: int,
+                       envelope_invalid: bool = False) -> RepublishAction:
+    # has_unsent_outbox counts only rows the relay can still send; envelope_invalid: the only
+    # unsent rows were refused by the relay's envelope check (§5.2), so nothing will be sent
     if status not in LIVE_ATTEMPT or not is_current or has_unsent_outbox:
         return RepublishAction.SKIP
     due = (now - last_published_at).total_seconds() > republish_backoff_s(
         publish_count, after_s=after_s, max_backoff_s=max_backoff_s)
     if not due:
         return RepublishAction.SKIP
-    if publish_count - 1 >= max_republish:         # 10 re-publishes already made
+    if envelope_invalid or publish_count - 1 >= max_republish:   # refused, or 10 re-publishes made
         return RepublishAction.NEEDS_OPERATOR
     return RepublishAction.REPUBLISH
 ```
@@ -926,7 +939,7 @@ Rules (settled in F2):
 | `GET /v1/pay-runs/{run_id}/payslips/{payslip_id}` | any | — | 200 `PayslipOut` | 404 `pay_run_not_found`, 404 `payslip_not_found` |
 | `GET /v1/pay-runs/{run_id}/payouts?status=&cursor=&limit=` | any | query: `status: PayoutStatus \| None`, `cursor: str \| None`, `limit: Limit = 50` | 200 `Page[PayoutOut]`, ordered by the payslip's `employee_name`, then `id` (C8) | 404 `pay_run_not_found`, 422 |
 | `POST /v1/pay-runs/{run_id}/payouts/{payout_id}/retry` | approver | optional header `Idempotency-Key` **[decision]**, no body (so no 400) | 200 `PayoutOut` (with the attempt history; a replay carries `Idempotent-Replayed: true`) | 404 `pay_run_not_found`, 404 `payout_not_found`, 409 `payout_not_retryable`, 409 `retry_limit_reached`, 409 `employee_bank_details_missing`, 403 `approver_must_differ`, 422 `idempotency_key_reused`, 422 `validation_error` (malformed key) |
-| `POST /v1/pay-runs/{run_id}/payouts/{payout_id}/resolve` | approver | `ResolveIn`; no `Idempotency-Key` (a repeat finds the attempt no longer blocked) | 200 `PayoutOut` | 400 `bad_request` (body not JSON), 404 `pay_run_not_found`, 404 `payout_not_found`, 409 `payout_not_blocked`, 409 `resolve_too_early` (with `Retry-After`; mark_rejected within `PAYOUT_MARK_REJECTED_MIN_WAIT_S`, C48), 422 `validation_error` (unknown action, missing or too long note) |
+| `POST /v1/pay-runs/{run_id}/payouts/{payout_id}/resolve` | approver | `ResolveIn`; no `Idempotency-Key` (a repeat finds the attempt no longer blocked) | 200 `PayoutOut` | 400 `bad_request` (body not JSON), 404 `pay_run_not_found`, 404 `payout_not_found`, 409 `payout_not_blocked`, 409 `resolve_too_early` (with `Retry-After`, documented on the 409 response in `openapi.json`; mark_rejected within `PAYOUT_MARK_REJECTED_MIN_WAIT_S`, C48), 422 `validation_error` (unknown action, missing or too long note) |
 
 ```python
 class PayRunCreate(BaseModel):
@@ -1085,7 +1098,7 @@ class ResolveIn(BaseModel):              # PAY-502, R8
   5. Write the outbox row (`republish_seq = 0`).
   6. Recompute the run status. If it moved into `processing`, set `processing_since = now()`.
   7. Write the `payout.retry_requested` audit row.
-  8. Log `payout.retry_requested`, then commit and wake the relay.
+  8. Commit, then log `payout.retry_requested` and wake the relay (logs and metrics go out after commit, so a rolled-back retry logs nothing).
 - **Resolve (PAY-502, R8).** `run_id` and `payout_id` must match, else 404 `payout_not_found`.
   1. Lock the run (`FOR UPDATE`), then the payout (`FOR UPDATE`), then the current attempt (`FOR UPDATE`), the same order as retry and result (§4.10).
   2. `check_resolve(payout_status, attempt_status)` → 409 `payout_not_blocked` unless the current attempt is `needs_operator`.
@@ -1095,7 +1108,7 @@ class ResolveIn(BaseModel):              # PAY-502, R8
      - A rowcount of 0 raises `ConcurrentUpdate` (500).
   4. Recompute the run status as the result endpoint does (§4.7 step 5): a move into a final status sets `first_final_at` if NULL and observes `payroll_payout_settlement_seconds` once, increments `payroll_pay_runs_total{outcome}`, and logs `payrun.completed`.
   5. Write the `payout.operator_resolved` audit row `{attempt, action, note_len}`. The note's text is never stored, logged or traced (PAY-NFR-07); only its length is.
-  6. Log `payout.operator_resolved`, commit, and for a redrive wake the relay.
+  6. Commit, then log `payout.operator_resolved`, update the metrics, and for a redrive wake the relay.
   - The runbook `PayoutNeedsOperator.md` requires checking the bank first (`GET /v1/transfers/{key}` shows no settled transfer) before mark_rejected (R8). Payroll also enforces the C48 wait: `needs_operator_at` is set on entry to `needs_operator` and cleared by redrive.
   - The wait must exceed the worker's bound on in-flight POSTs: the worker never starts a bank POST later than `HANDLER_DEADLINE_S` (35 s) after its instruction fetch. A startup check requires `PAYOUT_MARK_REJECTED_MIN_WAIT_S > HANDLER_DEADLINE_S + 30`.
 - **Read endpoints** run plain read-committed SELECTs with no locks. `PayRunOut.counts` comes from one query: `SELECT p.status, a.status AS attempt_status, p.no_transfer, count(*) FROM payouts p LEFT JOIN payout_attempts a ON a.payout_id = p.id AND a.attempt = p.current_attempt WHERE p.pay_run_id=:id GROUP BY 1,2,3`, folded into the six keys: `requested` = all `requested` payouts, `awaiting_bank` = those whose attempt is `indeterminate`, `blocked` = those whose attempt is `needs_operator`, `paid` = all `paid` (including `no_transfer`), `no_transfer`, `failed`.
@@ -1189,15 +1202,23 @@ Whether the call changed anything is not in the response; it is in the log `payo
 3. Lock the payout (`FOR UPDATE`).
 4. Lock the attempt row `(payout_id, attempt)` (`FOR UPDATE`).
 5. Call `decide_result`.
-   - **NOT_CURRENT:** roll back and return 409. Log `payout.attempt_not_current` (source `result`).
-   - **STORED:** return 200 with `outcome` = the stored attempt status, and no change. Log `payout.result_recorded` with `applied=false`. Store the idempotency row.
-   - **APPLY:** first run `UPDATE payout_attempts SET status=:new, failure_reason=:reason, bank_reference=:ref, final_at=CASE WHEN :new IN ('settled','rejected') THEN now() END, needs_operator_at=CASE WHEN :new='needs_operator' THEN now() WHEN :new IN ('settled','rejected') THEN NULL ELSE needs_operator_at END WHERE id=:aid AND status=:expected_status` (belt and braces; a rowcount of 0 raises `ConcurrentUpdate`, which becomes 500). Then:
+   - **NOT_CURRENT:** roll back and return 409. Log `payout.attempt_not_current` (source `result`). A late settlement is recorded after the rollback (below).
+   - **STORED:** return 200 with `outcome` = the stored attempt status, and no change. Log `payout.result_recorded` with `applied=false`. A late settlement is recorded in this transaction (below). Store the idempotency row.
+   - **APPLY:** first run `UPDATE payout_attempts SET status=:new, failure_reason=:reason, bank_reference=:ref, final_at=CASE WHEN :new IN ('settled','rejected') THEN now() END, needs_operator_at=CASE WHEN :new='needs_operator' THEN clock_timestamp() WHEN :new IN ('settled','rejected') THEN NULL ELSE needs_operator_at END WHERE id=:aid AND status=:expected_status` (belt and braces; a rowcount of 0 raises `ConcurrentUpdate`, which becomes 500). Then:
      - set the payout status to `payout_status_for_attempt(new)`, and set `final_at` when it is final;
      - recompute the run status with `run_status_from_payouts(SELECT status FROM payouts WHERE pay_run_id=:rid)`, using `UPDATE pay_runs SET status=:s … WHERE id=:rid AND status IN ('processing','paid','partially_failed')`. If the status enters `processing`, set `processing_since`. If it enters a final status and `first_final_at IS NULL`, set `first_final_at = now()` and observe `payroll_payout_settlement_seconds = first_final_at − approved_at`;
      - write the `payout.result_recorded` audit row (plus `payout.needs_operator` for poison);
      - update the metrics and logs (§7);
      - return 200 with `outcome` = the new attempt status.
 6. Store the idempotency row and commit.
+
+**Late settlement [decision, review fix; PAY-NFR-02].** A `settled` answer for which `is_late_settlement` (§3.3) holds means the bank may have paid an attempt payroll no longer treats as payable: typically an operator's mark_rejected without the bank check (R8), followed perhaps by a retry that paid again. It is never dropped, and the HTTP contract with the worker does not change (200 with the stored outcome, or 409 `attempt_not_current`):
+- **Audit:** `payout.late_settlement` (actor `service:payout-worker`, §2.8) with `attempt`, `current_attempt`, `attempt_status`, `failure_reason` (when set), `bank_reference` (the late transfer's), `later_attempt_settled` and `later_settled_attempt` (the lowest later `settled` attempt: a likely double payment). It is written once per payout and attempt: under the payout lock, an existing row for the same `details.attempt` suppresses another.
+  - STORED path: in the result transaction.
+  - NOT_CURRENT path: the 409 rolls the result transaction back (and with it the idempotency key, as for every error), so the audit is written in a **second transaction** that locks the payout (4) and re-reads the later attempts; then the 409 is returned. If that transaction fails, its error (503) replaces the 409, the worker retries, and the answer is detected again.
+- **Log:** `payout.late_settlement` at **error** after commit, every time (`recorded` = whether this call wrote the audit row).
+- **Metric:** `payroll_late_settlements_total` + 1 only when the audit row was written; pre-initialised at 0 (C21). The page `PayoutLateSettlement` (`increase(…[15m]) > 0`) links the runbook `docs/runbooks/PayoutLateSettlement.md`: bank `GET /v1/transfers/<payout_id>:<n>` for every attempt, payroll audit, recall from the bank, record.
+- Not late: a duplicate `settled` for a `settled` attempt, any non-`settled` answer, and a result for an attempt number that doesn't exist.
 
 ### 4.8 Idempotency-Key handling
 
@@ -1266,15 +1287,16 @@ can form:
 | Retry | (1) → 3 → 4 → 5 → 6 (FOR SHARE) → inserts | Attempt `… WHERE status='rejected'`; payout `… WHERE status='failed'` |
 | Resolve | 3 → 4 → 5 → inserts (outbox for redrive) | Attempt `… WHERE status='needs_operator'`; payout `… WHERE status='requested'` |
 | Result | 1 → 3 → 4 → 5 | Attempt `… WHERE status=:expected` |
-| Re-publish (maintenance task) | 3 (every affected run, ordered by `id`) → 5 → outbox insert | Attempt `… WHERE status IN ('requested','indeterminate') AND publish_count=:seen` |
+| Re-publish (maintenance task) | 4 (every candidate payout, ordered by `id`) → 5 → outbox insert | Attempt `… WHERE status IN ('requested','indeterminate') AND publish_count=:seen` |
 | PUT settings | 7 (`FOR UPDATE`) → `pay_runs` read (no lock) | `anchor_locked` check after the lock |
 | Employee PATCH | 6 (FOR UPDATE) | — |
 | Bank purge (per employee) | 5 (the employee's attempt rows) → 6 (FOR UPDATE) | Re-checks "no non-final attempt" after the locks |
-| Outbox relay | outbox rows `FOR UPDATE SKIP LOCKED` → `payout_attempts.last_published_at` update | — |
+| Outbox relay | outbox rows `FOR UPDATE SKIP LOCKED` → 5 (the sent rows' attempts, ordered by `payout_id, attempt`) → `last_published_at` update | — |
+| Result, late settlement after a 409 (second transaction) | 4 → audit insert | — |
 
-- **Why the relay is safe:** it holds only outbox row locks when it touches `payout_attempts`. No other transaction waits on an existing outbox row's lock, so this cannot form a cycle.
+- **Why the relay is safe:** it holds only outbox row locks when it touches `payout_attempts`, and no other transaction waits on an existing outbox row's lock. It locks the attempts first, in `(payout_id, attempt)` order, before the update (review fix): a batch can hold two rows for one attempt (a re-publish beside an older row), and an unordered `UPDATE … FROM unnest(…)` could otherwise take attempt locks in an order opposite to re-publish's.
 - **Why approve cannot deadlock with PATCH:** PATCH never locks `pay_runs`.
-- **Why the re-publish task cannot deadlock:** it is the only transaction that locks several `pay_runs` rows, and it takes them in `id` order before any payout or attempt row; every other transaction locks at most one run, also first.
+- **Why the re-publish task cannot deadlock:** it locks no run; it locks its payouts in `id` order, then their attempts in `(payout_id, attempt)` order, which is the global order. Every other writer locks at most one payout. It does not lock the runs **[decision, review fix]**: re-publish never changes a run's status (a `needs_operator` payout stays `requested`), and holding up to `PAYROLL_REPUBLISH_BATCH` run locks for the whole tick made result calls for every payout of those runs wait (and risk 503 `db_timeout`). Now only results for the candidate payouts themselves wait, for one tick.
 - **Why create cannot deadlock with PUT settings:** create holds the advisory lock (2) and then `FOR SHARE` on settings (7); PUT settings takes only the settings row.
 - **Timeouts:** `DB_STATEMENT_TIMEOUT_MS` (2000) applies to every statement. A `QueryCanceled` maps to 503 `db_timeout`.
 
@@ -1339,6 +1361,9 @@ claim_unsent(session, *, limit = PAYROLL_OUTBOX_BATCH (100)) -> Sequence[StreamI
        StreamItem(event_id=row.id, type="payout.requested", envelope_json=…, ref=(row.payout_id, row.attempt, span))
 mark_sent(session, items):   # ends each item's span (OK)
     UPDATE payroll.outbox SET sent_at = now() WHERE id = ANY(:ids)
+    SELECT a.id FROM payroll.payout_attempts a JOIN unnest(:payout_ids, :attempts) AS s(pid, att)
+      ON a.payout_id = s.pid AND a.attempt = s.att
+      ORDER BY a.payout_id, a.attempt FOR UPDATE OF a          # lock order 5 (§4.10)
     UPDATE payroll.payout_attempts a SET last_published_at = now()
       FROM unnest(:payout_ids, :attempts) AS s(pid, att)
       WHERE a.payout_id = s.pid AND a.attempt = s.att AND a.status IN ('requested','indeterminate')
@@ -1359,7 +1384,7 @@ if PAYROLL_VALIDATE_EVENTS: validate_envelope(final payload)                 # C
   invalid → mark_failed(error_type="EnvelopeInvalidError"), log outbox.relay.error, don't publish
 ```
 
-- **Re-validation (C60, C63):** with `PAYROLL_VALIDATE_EVENTS` on, the relay validates the envelope it is about to publish (after the traceparent rewrite), not only the one written at approve. An invalid row is a bug: it is never published, it is marked failed (`relay_attempts`, `last_error = EnvelopeInvalidError`), `outbox.relay.error` is logged, and it stays unsent, so `OutboxStuck` fires. The valid rows of the same batch still go out.
+- **Re-validation (C60, C63):** with `PAYROLL_VALIDATE_EVENTS` on, the relay validates the envelope it is about to publish (after the traceparent rewrite), not only the one written at approve. An invalid row is a bug: it is never published, it is marked failed (`relay_attempts`, `last_error = EnvelopeInvalidError`), `outbox.relay.error` is logged, and it stays unsent, so `OutboxStuck` fires. The valid rows of the same batch still go out. Such a row no longer blocks re-publish; once the attempt's backoff has passed, re-publish moves the attempt to `needs_operator` with reason `envelope_invalid` (§5.3), so the payout can be resolved instead of staying stuck for good (PAY-NFR-03). The refused row itself stays unsent (evidence; `OutboxStuck` keeps firing until it is removed by hand).
 
 - **Loop:** wait for the wake event or `PAYROLL_OUTBOX_POLL_MS` (200 ms), whichever is first; this is pycommon `RelayLoop` (platform §3.9, C22) over `PayrollOutboxSource`: it calls `claim_unsent`, publishes the batch in one `publish_many` pipeline (under `REDIS_SOCKET_TIMEOUT_MS`), then `mark_sent` or `mark_failed`, and commits. On any failure log `outbox.relay.error` (`error_type`, `batch_size`, `failed`, `backoff_ms`) and back off `min(0.2 × 2^k, 5)` s with full jitter; a clean batch resets `k`. A full batch loops at once.
 - **Stream fields** (the contract with payout-worker, R7):
@@ -1374,33 +1399,40 @@ if PAYROLL_VALIDATE_EVENTS: validate_envelope(final payload)                 # C
 
 ### 5.3 Re-publish (`events/republish.py`, PAY-407)
 
-`republish_due_attempts(session, settings, clock) -> int` is the maintenance task `republish` (§5.4). It
+`republish_due_attempts(session, *, settings, outbox, metrics, clock) -> int` is the maintenance task `republish` (§5.4). It
 runs in the task's single transaction, while the runner holds the maintenance advisory lock:
 
 ```text
-candidates = SELECT a.id, a.payout_id, a.attempt, p.pay_run_id, p.company_id
+now = clock.now()                                      # first read: the candidate filter
+candidates = SELECT a.id, a.payout_id
   FROM payroll.payout_attempts a JOIN payroll.payouts p ON p.id = a.payout_id
   WHERE a.status IN ('requested','indeterminate')
     AND a.attempt = p.current_attempt
-    AND a.last_published_at < now() - make_interval(secs =>
-          LEAST(:after_s * power(2, a.publish_count - 1), :max_backoff_s))
+    AND a.last_published_at < :now - make_interval(secs =>
+          LEAST(:after_s * power(2, LEAST(a.publish_count - 1, 32)), :max_backoff_s))
     AND NOT EXISTS (SELECT 1 FROM payroll.outbox o
-                    WHERE o.payout_id = a.payout_id AND o.attempt = a.attempt AND o.sent_at IS NULL)
+                    WHERE o.payout_id = a.payout_id AND o.attempt = a.attempt AND o.sent_at IS NULL
+                      AND o.last_error IS DISTINCT FROM 'EnvelopeInvalidError')   # refused rows never send
   ORDER BY a.last_published_at
   LIMIT :PAYROLL_REPUBLISH_BATCH (1000)
 
-SELECT … FROM pay_runs WHERE id = ANY(:run_ids) ORDER BY id FOR UPDATE
-SELECT … FROM payout_attempts WHERE id = ANY(:ids) ORDER BY payout_id, attempt FOR UPDATE
+SELECT id FROM payouts WHERE id = ANY(:payout_ids) ORDER BY id FOR UPDATE                # lock order 4
+SELECT … FROM payout_attempts WHERE id = ANY(:ids) ORDER BY payout_id, attempt FOR UPDATE  # lock order 5
+unsent = SELECT payout_id, attempt, bool_and(last_error IS NOT DISTINCT FROM 'EnvelopeInvalidError')
+           FROM outbox WHERE sent_at IS NULL AND payout_id = ANY(:pids) GROUP BY 1, 2
+now = clock.now()                                      # second read, after the locks: the writes
 for each attempt:
   action = domain.retry.republish_decision(status, is_current, publish_count, last_published_at, now,
-                                           has_unsent_outbox (re-queried), after_s, max_backoff_s, max_republish)
+                                           has_unsent_outbox = (unsent row, not all refused),
+                                           after_s, max_backoff_s, max_republish,
+                                           envelope_invalid = (unsent rows, all refused))
   REPUBLISH:
     UPDATE payout_attempts SET publish_count = publish_count + 1, last_published_at = :now
       WHERE id = :aid AND publish_count = :seen AND status IN ('requested','indeterminate')
     rowcount 1 → OutboxWriter.add_payout_requested(..., amount_cents = payouts.amount_cents, republish_seq = :seen)
     payroll_payouts_republished_total += 1; log payout.republished
-  NEEDS_OPERATOR:
-    UPDATE payout_attempts SET status = 'needs_operator', failure_reason = 'republish_limit', needs_operator_at = :now
+  NEEDS_OPERATOR:   # reason = 'envelope_invalid' if envelope_invalid else 'republish_limit'
+    UPDATE payout_attempts SET status = 'needs_operator', failure_reason = :reason, needs_operator_at = :now
       WHERE id = :aid AND status IN ('requested','indeterminate')
     audit payout.needs_operator; payroll_payouts_total{outcome="needs_operator"} += 1
     log payout.needs_operator (level error)
@@ -1409,7 +1441,8 @@ for each attempt:
 return the number of rows re-published plus moved to needs_operator
 ```
 
-- **Time source [decision, F4a]:** `:now` is `Runtime.clock.now()`, read once per tick and used both in the candidate filter (`a.last_published_at < :now - …`) and in the writes (`last_published_at`, `needs_operator_at`). Resolve uses the same clock for the C48 wait and the redrive's `last_published_at`. One source for the comparisons and the writes keeps the backoff exact under a fake clock in tests; in production `SystemClock` and the DB clock agree to NTP precision. The relay's send-time `last_published_at` and the result endpoint's `needs_operator_at` still use the DB's `now()`.
+- **Time source [decision, F4a; amended by the review fix]:** "now" is `Runtime.clock.now()`. It is read once before the candidate query (the filter `a.last_published_at < :now - …`) and **again after the payout and attempt locks** for the decision and the writes (`last_published_at`, `needs_operator_at`). The tick may wait on those locks, and an earlier stamp would start the C48 wait before the attempt actually stops being deliverable, shrinking the margin over the worker's in-flight bound. Resolve uses the same clock for the C48 wait and the redrive's `last_published_at`; its read before the locks is conservative for the wait check. One source for the comparisons and the writes keeps the backoff exact under a fake clock in tests; in production `SystemClock` and the DB clock agree to NTP precision. The relay's send-time `last_published_at` uses the DB's `now()`. The result endpoint's `needs_operator_at` uses `clock_timestamp()` (the statement's wall time, not the transaction start) for the same C48 reason.
+- **Envelope refused by the relay [decision, review fix; PAY-NFR-03]:** an unsent row with `last_error = 'EnvelopeInvalidError'` is never sent (§5.2), so it does not count as "unsent" for the candidate filter or `has_unsent_outbox`. When such rows are the attempt's only unsent rows, the due attempt goes to `needs_operator` with `failure_reason = envelope_invalid` instead of a re-publish, which would build the same envelope. Without this the payout was stuck for good: re-publish skipped it, and neither retry (needs `failed`) nor resolve (needs `needs_operator`) accepted it. A row that failed for another reason (Redis down) is still sendable and still blocks.
 - The exponent is capped (`LEAST(publish_count − 1, 32)`), so `power()` can't overflow; the cap is far past `PAYOUT_REPUBLISH_MAX`.
 - Metrics (`payroll_payouts_republished_total`, `payroll_payouts_total{outcome="needs_operator"}`) and the `payout.republished` / `payout.needs_operator` logs are emitted from an `after_commit` hook, so a rolled-back tick counts nothing. The `payout.needs_operator` log carries `pay_run_id`, `attempt` and `reason`; the audit actor is `system:maintenance`.
 - `after_s` = `PAYOUT_REPUBLISH_AFTER_S` (360, R1), `max_backoff_s` = `PAYOUT_REPUBLISH_MAX_BACKOFF_S` (900), `max_republish` = `PAYOUT_REPUBLISH_MAX` (10).
@@ -1417,6 +1450,7 @@ return the number of rows re-published plus moved to needs_operator
 - Each re-publish is a **new outbox row with a fresh UUIDv7 `event_id`**, carrying the same `payout_id` and `attempt`, so the bank key is the same. The worker's instruction check is the gate (ADR 0003 d).
 - Re-publishing stops for `needs_operator`, because `republish_decision` returns SKIP for it. An operator redrive (PAY-502) makes the attempt `requested` again with `publish_count = 1` and `last_published_at = now()` (C13), so the backoff starts over.
 - The per-tick batch limit keeps a tick bounded. Due attempts not reached in this tick are handled in the next one.
+- **Locks:** the payouts (order 4) and attempts (order 5), not the runs (§4.10). A result call for a candidate payout waits for the tick's commit; result calls for the run's other payouts don't.
 
 ### 5.4 Maintenance (`maintenance.py`, PAY-407, PAY-608)
 
@@ -1581,7 +1615,8 @@ Payroll calls `pycommon.startup_checks.run_startup_checks(settings, extra=STARTU
 | `payout.republished` | info | `payout_id`, `attempt`, `republish_seq`, `event_id`, `attempt_status` | re-publish row written | PAY-407 |
 | `payout.operator_resolved` | warning | `payout_id`, `pay_run_id`, `attempt`, `action` (`redrive` \| `mark_rejected`), `note_len`, `actor_id`, `event_id` (redrive only) | resolve committed | PAY-502, R8 |
 | `payout.resolve_rejected` | info | `payout_id`, `code` (`payout_not_blocked`, `resolve_too_early`), `attempt_status` (`needs_operator` for `resolve_too_early`) | resolve 409 | PAY-502 |
-| `payout.needs_operator` | error | `payout_id`, `pay_run_id`, `attempt`, `reason` (`poison`, `republish_limit`, or the worker's reason such as `key_window_expired`, `amount_mismatch`) | attempt → `needs_operator` | PAY-407, PAY-409, PAY-410 |
+| `payout.needs_operator` | error | `payout_id`, `pay_run_id`, `attempt`, `reason` (`poison`, `republish_limit`, `envelope_invalid`, or the worker's reason such as `key_window_expired`, `amount_mismatch`) | attempt → `needs_operator` | PAY-407, PAY-409, PAY-410, PAY-NFR-03 |
+| `payout.late_settlement` | error | `payout_id`, `pay_run_id`, `attempt`, `current_attempt`, `attempt_status`, `failure_reason` (when set), `bank_reference`, `later_attempt_settled`, `later_settled_attempt` (when set), `recorded` | a `settled` result for a rejected or superseded attempt (§4.7 "Late settlement") | PAY-NFR-02 |
 | `payout.instruction_served` | debug | `payout_id`, `attempt` | instruction 200 | PAY-411 |
 | `crypto.decrypt_failed` | error | `kid`, `entity` (`employee` \| `payout_attempt`), `entity_id` | `FieldDecryptError` | PAY-204 |
 | `idempotency.replayed` | info | `route`, `status` | stored response replayed | PAY-400 |
@@ -1610,6 +1645,7 @@ pycommon also emits `http.request`, `http.error`, `http.unhandled`, `auth.token.
 | `payroll_payouts_stuck` | observable gauge, **collection-time** | — | `SELECT count(*) FROM payout_attempts WHERE status IN ('requested','indeterminate','needs_operator') AND requested_at < now() - make_interval(secs => :PAYOUT_STUCK_AFTER_S)` | plan §11, PAY-NFR-11 |
 | `payroll_attempts_needs_operator` | observable gauge, **collection-time** **[decision]** | — | `SELECT count(*) FROM payout_attempts WHERE status='needs_operator'` | plan §11, PAY-409 |
 | `payroll_payouts_republished_total` | counter | — | each re-publish outbox row | PAY-407 |
+| `payroll_late_settlements_total` | counter (unit `{attempt}`, pre-initialised at 0, C21) | — | each newly recorded late settlement (§4.7); alert `PayoutLateSettlement` | PAY-NFR-02 |
 | `outbox_unsent` | observable gauge, collection-time | — | `SELECT count(*) FROM outbox WHERE sent_at IS NULL` | PAY-402, observability §5 |
 | `outbox_oldest_age_seconds` | observable gauge, collection-time | — | `SELECT COALESCE(EXTRACT(EPOCH FROM now() - min(created_at)), 0) FROM outbox WHERE sent_at IS NULL` | PAY-402 (`OutboxStuck`) |
 | `rate_limiter_errors_total` | counter (pycommon) | `component` | Redis error in the limiter (fail open) | PAY-603 |
@@ -1716,8 +1752,8 @@ issuer/kid mismatch → 401 `invalid_token` (C30). The route guards then apply:
 | `test_calc_properties.py` | **Hypothesis:** (a) gross = net + tax + retirement and net ≥ 0 for any salary, rate, hours, `tax_bps ≤ 5000` and `retirement_bps ≤ 2000`; (b) Σ `salaried_gross(annual, k, n)` over k = 1..n == annual for n ∈ {12, 26}; (c) `run_totals(...).net_cents == Σ net` and gross total = Σ gross; and biweekly `period_index` is periodic in 26 | PAY-NFR-01, PAY-302 |
 | `test_no_float.py` | AST scan of `src/payroll/domain/**`: no `float(` call, no float literal, no `/` true division, no `Decimal` | PAY-NFR-01 |
 | `test_run_status.py` | `run_status_from_payouts` table plus a hypothesis property (any multiset of statuses → the plan's rule); empty input raises; `payout_status_for_attempt` | PAY-406 |
-| `test_state_transitions.py` | Every row and column of the `decide_result` table (§3.3), including `needs_operator`; `instruction_allowed` for every status × current/stale; `assert_run_mutable` and `assert_run_approvable` per status | PAY-405, PAY-411, PAY-301, PAY-304, PAY-400 |
-| `test_retry_rules.py` | `check_retry` order and each error (indeterminate, needs_operator, requested, paid → not retryable; `current_attempt` = 5 → limit; inactive or purged → bank missing); `republish_backoff_s` sequence 360, 720, 900, 900 at the defaults (R1); `republish_decision` (not due, due, unsent outbox, non-current, the boundary at 10 re-publishes → NEEDS_OPERATOR) | PAY-500, PAY-407 |
+| `test_state_transitions.py` | Every row and column of the `decide_result` table (§3.3), including `needs_operator`; the `is_late_settlement` table (PAY-NFR-02); `instruction_allowed` for every status × current/stale; `assert_run_mutable` and `assert_run_approvable` per status | PAY-405, PAY-411, PAY-301, PAY-304, PAY-400 |
+| `test_retry_rules.py` | `check_retry` order and each error (indeterminate, needs_operator, requested, paid → not retryable; `current_attempt` = 5 → limit; inactive or purged → bank missing); `republish_backoff_s` sequence 360, 720, 900, 900 at the defaults (R1); `republish_decision` (not due, due, unsent outbox, non-current, the boundary at 10 re-publishes → NEEDS_OPERATOR; `envelope_invalid` → NEEDS_OPERATOR once due) | PAY-500, PAY-407, PAY-NFR-03 |
 | `test_resolve_rules.py` | `check_resolve`: only a `requested` payout whose current attempt is `needs_operator` passes; every other attempt status (`requested`, `indeterminate`, `settled`, `rejected`) → `PayoutNotBlocked`; `resolve_transition` for both actions (redrive: `requested`, reason cleared, `publish_count = 1`, publish with `republish_seq = 0`; mark_rejected: `rejected`, `operator_rejected`, final, payout `failed`; mark_rejected before the 120 s wait → `ResolveTooEarly`, and redrive has no wait) | PAY-502 |
 | `test_dual_approval.py` | Off → always passes; calculator == approver; a bank editor after `created_at` is blocked and one before it is allowed; several employees list all IDs; retry dual rule | PAY-401, PAY-500 |
 | `test_payout_model.py` | **Hypothesis `RuleBasedStateMachine`** (§9.4). Owned by payroll only (C44) | PAY-NFR-02, PAY-406, PAY-405, PAY-411, PAY-500, PAY-502 |
@@ -1730,7 +1766,7 @@ issuer/kid mismatch → 401 `invalid_token` (C30). The route guards then apply:
 | `test_cursor.py` | Encode and decode round trip; a garbage, wrong-version or non-UUID cursor → `validation_error` with `details = [{field: "query.cursor", issue: "invalid_cursor"}]` | PAY-202, PAY-303, PAY-602 |
 | `test_event_envelope.py` | `build_payout_requested` output validates against the schema; `traceparent` is taken from the active span, or synthesised when there is none; the schema rejects extra properties, a wrong currency, amount 0 and a negative `republish_seq` | PAY-402 |
 | `test_settings.py` | Settings load the pycommon names (`DB_*`, `REDIS_*`, `DEBUG`, `DOCS_ENABLED`, `MAX_BODY_BYTES`; C1) and the `PAYROLL_*` keys; `LOG_LEVEL=info` is accepted as `INFO` (C24); startup checks through `run_startup_checks`: a `dev-` field kid in uat → `startup.check_failed` and exit 2 (C29); wrong key length; an active kid missing; `DOCS_ENABLED` on in prod; `PAYOUT_REPUBLISH_AFTER_S` = 360 passes and 300 fails the timing check (R1) → exit 2 in uat, warning in dev; logs the setting name and never the value | PAY-605 |
-| `test_metrics.py` | The five gauge names and units (never `"1"`, C63); the callbacks report the source's values at collection, nothing once closed or when the query fails (`metrics.gauge_query_failed`); `payroll_payouts_republished` name and unit. The per-path counter checks (`operator_rejected`, `needs_operator`, the settlement histogram once per run) live in the integration files that drive those paths (`test_resolve.py`, `test_republish.py`, `test_internal_result.py`) | PAY-NFR-10, PAY-NFR-11, PAY-406, PAY-407 |
+| `test_metrics.py` | The five gauge names and units (never `"1"`, C63); the callbacks report the source's values at collection, nothing once closed or when the query fails (`metrics.gauge_query_failed`); `payroll_payouts_republished` name and unit; `payroll_late_settlements` pre-initialised at 0 with unit `{attempt}`. The per-path counter checks (`operator_rejected`, `needs_operator`, the settlement histogram once per run) live in the integration files that drive those paths (`test_resolve.py`, `test_republish.py`, `test_internal_result.py`) | PAY-NFR-10, PAY-NFR-11, PAY-406, PAY-407 |
 
 ### 9.2 `services/payroll/tests/integration/`
 
@@ -1752,9 +1788,9 @@ issuer/kid mismatch → 401 `invalid_token` (C30). The route guards then apply:
 | `test_internal_instruction.py` | 200 shape and decrypted values for a current requested or indeterminate attempt; 409 for stale, final and `needs_operator`; 404 for another `cid`; 401 for a web token, 403 for a worker-issued token with the wrong `sub` (C30); `Cache-Control: no-store` | PAY-411 |
 | `test_internal_result.py` | The response is exactly `{payout_id, attempt, outcome}` with `outcome` = the stored attempt status (R7, C26); each outcome → attempt, payout and run state; already final → 200 with the stored status and no change; stale → 409; `indeterminate` after `settled` → unchanged; `settled` after `indeterminate` → applied; poison → `needs_operator` and re-publishing stops; on a `needs_operator` attempt `settled` and `rejected` apply while `indeterminate` and `poison` return 200 unchanged; a 65-character `bank_reference` → 422; run status equals the function after every call; `processing_since` and `first_final_at` behaviour; the settlement histogram is observed once | PAY-405, PAY-406, PAY-409 |
 | `test_retry.py` | Retry after rejected → attempt 2 with the new bank snapshot, outbox row, run back to `processing`; `payout_not_retryable` (requested, indeterminate, needs_operator, paid); `retry_limit_reached` at attempt 5; `employee_bank_details_missing` (inactive, purged); dual approval vs `bank_updated_by` using the run's snapshot; a late result for attempt 1 after the retry → 409 `attempt_not_current`; retry racing a late result (parallel tasks) → consistent final state; the payout list (paginated, C8) shows `payslip_id`, `amount_cents` and every attempt with `account_last4` only | PAY-500, PAY-501, PAY-NFR-02 |
-| `test_resolve.py` | A `needs_operator` attempt (poison or republish limit): **redrive** → attempt `requested`, `failure_reason` NULL, `publish_count = 1`, `last_published_at` = now, `requested_at` unchanged, a new outbox row with a fresh `event_id` and `republish_seq = 0` (C13), then a `settled` result → payout `paid`; **mark_rejected** → attempt `rejected` / `operator_rejected`, payout `failed`, run final when it was the last open payout (`first_final_at`, histogram once), then a retry → attempt 2 → `paid` (with `needs_operator_at` set more than 120 s back via time-machine); mark_rejected inside the wait → 409 `resolve_too_early` with `Retry-After`; 409 `payout_not_blocked` for `requested`, `indeterminate`, `settled`, `rejected` and `no_transfer` payouts; 404 for a payout of another run or company; 422 for an unknown action or a missing note; audit `payout.operator_resolved` holds `note_len` and never the note; a resolve racing a late result (parallel tasks) → one consistent outcome (lock order §4.10); approver only | PAY-502 |
+| `test_resolve.py` | A `needs_operator` attempt (poison or republish limit): **redrive** → attempt `requested`, `failure_reason` NULL, `publish_count = 1`, `last_published_at` = now, `requested_at` unchanged, a new outbox row with a fresh `event_id` and `republish_seq = 0` (C13), then a `settled` result → payout `paid`; **mark_rejected** → attempt `rejected` / `operator_rejected`, payout `failed`, run final when it was the last open payout (`first_final_at`, histogram once), then a retry → attempt 2 → `paid` (with `needs_operator_at` set more than 120 s back via time-machine); mark_rejected inside the wait → 409 `resolve_too_early` with `Retry-After`; 409 `payout_not_blocked` for `requested`, `indeterminate`, `settled`, `rejected` and `no_transfer` payouts; 404 for a payout of another run or company; 422 for an unknown action or a missing note; audit `payout.operator_resolved` holds `note_len` and never the note; a resolve racing a late result (parallel tasks) → one consistent outcome (lock order §4.10); approver only; **late settlement** after mark_rejected (200 `rejected`, audit `payout.late_settlement`, error log, counter once, a repeat not counted again) and after mark_rejected + retry + attempt 2 settled (409 `attempt_not_current`, audit in its own transaction with `later_attempt_settled`); duplicate or non-settled answers and unknown attempts are not late | PAY-502, PAY-NFR-02 |
 | `test_outbox.py` | The state change and the outbox row commit together, and a forced rollback leaves neither; the relay publishes through `StreamProducer.publish` with exactly the fields `event_id`, `type` and `envelope` (R7, C22), `MAXLEN ~`, marks the row sent and updates `last_published_at`; two relays in parallel never send a row twice (SKIP LOCKED); Redis down → rows stay unsent, `outbox.relay.error`, catch-up after Redis is back; the published envelope validates against the schema; `traceparent` continues the approve trace (in-memory span exporter) | PAY-402, PAY-NFR-09 |
-| `test_republish.py` | Not due → nothing; due (frozen clock) → a new outbox row with a fresh `event_id`, `republish_seq = publish_count` before the increment (R34), the count incremented; backoff 360, 720, 900, 900 (R1); after a redrive the backoff restarts at 360; an unsent outbox row blocks re-publish; after 10 re-publishes → `needs_operator` and the audit row; stream FLUSHALL, then a tick re-publishes every non-final attempt; indeterminate attempts are re-published with the same `(payout_id, attempt)` | PAY-407, PAY-NFR-03 |
+| `test_republish.py` | Not due → nothing; due (frozen clock) → a new outbox row with a fresh `event_id`, `republish_seq = publish_count` before the increment (R34), the count incremented; backoff 360, 720, 900, 900 (R1); after a redrive the backoff restarts at 360; an unsent outbox row blocks re-publish; after 10 re-publishes → `needs_operator` and the audit row; stream FLUSHALL, then a tick re-publishes every non-final attempt; indeterminate attempts are re-published with the same `(payout_id, attempt)`; a relay-refused envelope no longer blocks: the due attempt → `needs_operator` / `envelope_invalid` and can be redriven, while a sendable unsent row beside it still blocks; `needs_operator_at` comes from the clock read after the locks (C48); two unsent rows of one attempt are relayed in one batch (ordered attempt locks) | PAY-407, PAY-NFR-03, C48 |
 | `test_maintenance.py` | Advisory lock `payroll:maintenance`: two runners → only one ticks; each task logs `maintenance.task.completed` (or `maintenance.task.failed` without stopping the others; C44); sent outbox rows older than 7 days purged and unsent kept; idempotency keys past `expires_at` purged; bank purge after 30 days of deactivation nulls the employee fields and the final attempts' snapshots, **skips** an employee with a non-final attempt, and writes the audit row; a draft run with a purged employee → approve 409 | PAY-608, PAY-407 |
 | `test_collection_gauges.py` | `payroll_runs_processing_oldest_age_seconds`, `payroll_payouts_stuck`, `payroll_attempts_needs_operator`, `outbox_unsent` and `outbox_oldest_age_seconds` computed at collection on two app instances against the same DB give the same fresh values; zero when nothing matches; DB down → no observation plus a warning | plan §2.1, §11; PAY-NFR-11 |
 | `test_rate_limit.py` | Per-caller limit shared across two app instances (Redis) → 429 with `Retry-After`; the worker uses the worker limit; Redis down → fail open, `rate_limiter_errors_total` incremented | PAY-603 |
@@ -1851,8 +1887,8 @@ harness that mirrors the services layer. It runs with no I/O.
 | PAY-607 | `settings.py` (ACL user), relay | `integration/test_outbox.py` (connects as `payroll`) |
 | PAY-608 | `maintenance.py` (pycommon `MaintenanceRunner`) | `integration/test_maintenance.py`, `integration/test_retry.py` (purged employee) |
 | PAY-NFR-01 | `domain/calc.py`, `domain/periods.py` | `unit/test_calc_properties.py`, `unit/test_no_float.py` |
-| PAY-NFR-02 | `domain/state.py`, `domain/retry.py`, `domain/resolve.py`, services | `unit/test_payout_model.py`, `integration/test_retry.py`, `integration/test_resolve.py`, `integration/test_republish.py`, `integration/test_internal_result.py` |
-| PAY-NFR-03 | `events/republish.py` | `integration/test_republish.py`, `unit/test_payout_model.py` (liveness) |
+| PAY-NFR-02 | `domain/state.py` (incl. `is_late_settlement`), `domain/retry.py`, `domain/resolve.py`, services (`record_result.py` late settlement), `metrics.py` (`payroll_late_settlements`), alert `PayoutLateSettlement` | `unit/test_state_transitions.py`, `unit/test_metrics.py`, `unit/test_payout_model.py`, `integration/test_retry.py`, `integration/test_resolve.py`, `integration/test_republish.py`, `integration/test_internal_result.py` |
+| PAY-NFR-03 | `events/republish.py` (incl. `envelope_invalid`), `events/relay.py` | `integration/test_republish.py`, `unit/test_retry_rules.py`, `unit/test_payout_model.py` (liveness) |
 | PAY-NFR-06 | `metrics.py` (settlement histogram) | `unit/test_metrics.py`, `integration/test_internal_result.py` |
 | PAY-NFR-07 | logging calls, redactor | `integration/test_secret_not_logged.py` |
 | PAY-NFR-08 | `api/schemas.py` (`account_last4` only), `maintenance.py` | `integration/test_employees_api.py`, `integration/test_maintenance.py` |
@@ -1889,6 +1925,15 @@ PAY-403, PAY-404, PAY-408 and PAY-412 are owned by payout-worker and bank-stub. 
   - **PAY-501** (payout list with history) was verified against C5 and the requirement with no field change.
   - **OpenAPI:** adds the retry and resolve paths and `ResolveIn`.
   - **Tests:** unit `test_retry_rules.py`, `test_resolve_rules.py`, `test_metrics.py` and the completed `test_payout_model.py` (§9.4 "As built"); integration `test_retry.py`, `test_resolve.py`, `test_republish.py`, `test_maintenance.py` and `test_collection_gauges.py`; `test_secret_not_logged.py` now covers retry and resolve, including the note text.
+
+- 2026-11-11 (review 4 fixes on F2-F4a):
+  - **Late settlement (PAY-NFR-02):** a `settled` answer for a `rejected` current attempt or a superseded, non-settled one is never dropped. The response contract is unchanged. Payroll writes the audit row `payout.late_settlement` once per payout and attempt (on the 409 path in a second transaction after the rollback), logs `payout.late_settlement` at error and increments `payroll_late_settlements_total`, which is pre-initialised. The page `PayoutLateSettlement` has a promtool test and the runbook `docs/runbooks/PayoutLateSettlement.md` (§2.8, §3.3 `is_late_settlement`, §4.7, §7.1, §7.2).
+  - **Envelope refused by the relay (PAY-NFR-03):** such a row no longer blocks re-publish. The attempt goes to `needs_operator` / `envelope_invalid` once due (§3.5, §5.2, §5.3).
+  - **C48 margin:** re-publish re-reads the clock after its locks for `needs_operator_at` and `last_published_at`, and the result endpoint stamps `needs_operator_at` with `clock_timestamp()` (§4.7, §5.3 "Time source").
+  - **Locks:** the relay locks the attempts it touches in `(payout_id, attempt)` order. Re-publish locks payouts (order 4) instead of runs (§4.10, §5.2, §5.3).
+  - **OpenAPI:** resolve's 409 documents the `Retry-After` header (§4.4).
+  - **Docs:** the §5.3 pseudo-code now matches the code (`:now`, the capped exponent, the payout locks, the refused-row filter). Retry step 8 and resolve step 6 log after commit (§4.4).
+  - **Tests:** unit `test_state_transitions.py` (`is_late_settlement`), `test_retry_rules.py` (`envelope_invalid`) and `test_metrics.py` (pre-initialised counter); integration `test_resolve.py` (both late-settlement paths and the not-late cases) and `test_republish.py` (refused envelope, sendable row still blocks, clock read after locks, two rows of one attempt relayed); contract `test_openapi.py` (`Retry-After`).
 
 **Open:**
 

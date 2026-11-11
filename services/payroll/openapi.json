@@ -3745,7 +3745,16 @@
                 }
               }
             },
-            "description": "Conflict"
+            "description": "Conflict",
+            "headers": {
+              "Retry-After": {
+                "description": "Whole seconds to wait before the request can succeed (sent with the codes that carry details.retry_after_s, e.g. resolve_too_early, C48).",
+                "schema": {
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              }
+            }
           },
           "422": {
             "content": {

@@ -5,7 +5,7 @@ re-publish"). Time is a ``FakeClock`` on the runtime: no sleeps."""
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
@@ -236,3 +236,119 @@ async def test_ticks_cover_several_runs_and_skip_stale_attempts(api: Api, db: An
     assert sorted(r["attempt"] for r in rows) == [1, 2]
     assert all(r["payload"]["data"]["republish_seq"] == 1 for r in rows)
     assert {r["payload"]["data"]["pay_run_id"] for r in rows} == {runs[0]["id"], runs[1]["id"]}
+
+
+_COPY = "company_id, event_type, event_version, payload, payout_id, attempt"
+_COLS = f"id, {_COPY}"
+
+
+def _relay(api: Api) -> Any:
+    return build_relay(
+        api.rt.sessions, StreamProducer(api.app.state.ctx.redis), maxlen=1000, batch_size=10,
+        poll_ms=10,
+    )  # fmt: skip
+
+
+async def test_relay_refused_envelope_goes_to_the_operator(
+    api: Api, db: Any, caplog_json: JsonLogCapture
+) -> None:
+    """PAY-NFR-03, PAY-407, PAY-502, §5.2: an outbox row the relay refuses (EnvelopeInvalidError)
+    is never sent, so it no longer blocks re-publish: once the backoff has passed the attempt
+    goes to needs_operator with reason envelope_invalid (audited, needs_operator_at = now)
+    instead of staying stuck for good, and the operator can resolve it."""
+    run = await api.approved_run(1)
+    [p] = await api.payouts(run["id"])
+    await db.execute(
+        "UPDATE payroll.outbox SET payload = jsonb_set(payload, '{data,currency}', '\"EUR\"')"
+    )
+    assert await _relay(api).relay_once() == 0
+    [row] = await _unsent(db)
+    assert (
+        await db.fetchval("SELECT last_error FROM payroll.outbox WHERE id = $1", row["id"])
+    ) == "EnvelopeInvalidError"
+    await _clock_at_last_publish(api, db)
+    _advance(api, 360)
+    await _tick(api)
+    assert (await _attempt(db, p["id"]))["status"] == "requested"  # backoff not yet passed
+    _advance(api, 1)
+    await _tick(api)
+    a = await _attempt(db, p["id"])
+    assert (a["status"], a["failure_reason"]) == ("needs_operator", "envelope_invalid")
+    assert a["needs_operator_at"] == api.rt.clock.now()
+    assert [r["id"] for r in await _unsent(db)] == [row["id"]]  # no new (equally bad) row
+    audit = await db.fetchval(
+        "SELECT details::text FROM payroll.audit_events WHERE event = 'payout.needs_operator'"
+    )
+    assert json.loads(audit) == {"attempt": 1, "reason": "envelope_invalid"}
+    [log] = caplog_json.events("payout.needs_operator")
+    assert log["reason"] == "envelope_invalid"
+    assert (await api.resolve(run["id"], p["id"], "redrive", "fixed")).status_code == 200
+
+
+async def test_a_sendable_unsent_row_still_blocks_beside_a_refused_one(api: Api, db: Any) -> None:
+    """PAY-407, §5.2: a row that failed for another reason (Redis down) is still sendable, so it
+    blocks re-publish even when a refused row exists for the same attempt."""
+    run = await api.approved_run(1)
+    [p] = await api.payouts(run["id"])
+    await db.execute(
+        "UPDATE payroll.outbox SET relay_attempts = 1, last_error = 'EnvelopeInvalidError'"
+    )
+    await db.execute(
+        f"INSERT INTO payroll.outbox ({_COLS}, relay_attempts, last_error) "
+        f"SELECT gen_random_uuid(), {_COPY}, 1, 'ConnectionError' FROM payroll.outbox"
+    )
+    await _clock_at_last_publish(api, db)
+    _advance(api, 5000)
+    await _tick(api)
+    assert (await _attempt(db, p["id"]))["status"] == "requested"
+    assert len(await _unsent(db)) == 2
+
+
+async def test_relay_sends_two_rows_of_one_attempt_in_one_batch(api: Api, db: Any) -> None:
+    """PAY-402, §4.10: two unsent rows for one attempt (a re-publish beside an older row) are
+    sent in one batch; mark_sent locks the attempt rows in (payout_id, attempt) order and touches
+    last_published_at once."""
+    _, ps = await _setup(api, db, 2)
+    _advance(api, 361)
+    await _tick(api)
+    await db.execute(
+        f"INSERT INTO payroll.outbox ({_COLS}) "
+        f"SELECT gen_random_uuid(), {_COPY} FROM payroll.outbox WHERE sent_at IS NULL"
+    )
+    assert len(await _unsent(db)) == 4
+    assert await _relay(api).relay_once() == 4
+    assert await _unsent(db) == []
+    for p in ps:
+        assert (await _attempt(db, p["id"]))["publish_count"] == 2
+
+
+class _ReadCountingClock(FakeClock):
+    """Every ``now()`` read moves time on by 5 s, so a test can tell the reads apart."""
+
+    def __init__(self, start: datetime) -> None:
+        super().__init__(start)
+        self.reads: list[datetime] = []
+
+    def now(self) -> datetime:
+        t = super().now()
+        self.reads.append(t)
+        self.advance(5)
+        return t
+
+
+async def test_needs_operator_at_is_read_after_the_locks(api: Api, db: Any) -> None:
+    """C48, PAY-502, §5.3 "Time source": the tick filters candidates with its first clock read
+    but stamps needs_operator_at with a read taken after the payout and attempt locks, so the
+    C48 wait never starts before the attempt stops being deliverable."""
+    run = await api.approved_run(1)
+    [p] = await api.payouts(run["id"])
+    await db.execute(
+        "UPDATE payroll.outbox SET relay_attempts = 1, last_error = 'EnvelopeInvalidError'"
+    )
+    start: datetime = await db.fetchval("SELECT last_published_at FROM payroll.payout_attempts")
+    clock = _ReadCountingClock(start + timedelta(seconds=361))
+    api.rt.clock = clock
+    await _tick(api)
+    a = await _attempt(db, p["id"])
+    assert a["status"] == "needs_operator"
+    assert a["needs_operator_at"] == clock.reads[1] > clock.reads[0]

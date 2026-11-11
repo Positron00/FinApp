@@ -63,6 +63,11 @@ describe("Dashboard", () => {
     expect(screen.getByRole("link", { name: "New pay run" })).toBeTruthy();
     expect(screen.getByRole("link", { name: "Add employee" })).toBeTruthy();
     expect(new Set(calls.map((c) => c.path)).size).toBe(4);
+    // PAY-NFR-14: each card is a region named by its heading (IDs without whitespace)
+    for (const name of ["Paying now", "Needs attention", "Latest pay runs"]) {
+      const region = screen.getByRole("region", { name });
+      expect(region.getAttribute("aria-labelledby")).not.toMatch(/\s/);
+    }
   });
 
   // PAY-601: no quick actions without payroll_admin.

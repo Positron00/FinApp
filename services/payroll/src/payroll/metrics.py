@@ -2,8 +2,10 @@
 PAY-406, PAY-407, R26, C18, C63).
 
 Counters are created without ``_total`` (the Collector appends it) and with annotation units, so
-the Prometheus names are exactly ``payroll_pay_runs_total``, ``payroll_payouts_total`` and
-``payroll_payouts_republished_total``.
+the Prometheus names are exactly ``payroll_pay_runs_total``, ``payroll_payouts_total``,
+``payroll_payouts_republished_total`` and ``payroll_late_settlements_total``. The last one is
+pre-initialised at 0 so the ``PayoutLateSettlement`` alert's ``increase()`` sees its first
+increment (C21).
 
 The five gauges (``payroll_runs_processing_oldest_age_seconds``, ``payroll_payouts_stuck``,
 ``payroll_attempts_needs_operator``, ``outbox_unsent``, ``outbox_oldest_age_seconds``) are
@@ -72,11 +74,22 @@ class Metrics:
     payouts: Counter
     settlement: Histogram
     republished: Counter
+    late_settlements: Counter
 
     @classmethod
     def create(cls) -> Metrics:
         m = meter(METER_NAME)
+        late_settlements = m.create_counter(
+            "payroll_late_settlements",
+            unit="{attempt}",
+            description=(
+                "Settled answers for an attempt already rejected or no longer current: a "
+                "possible double payment (PAY-NFR-02, PayoutLateSettlement)"
+            ),
+        )
+        late_settlements.add(0)
         return cls(
+            late_settlements=late_settlements,
             pay_runs=m.create_counter(
                 "payroll_pay_runs", unit="{run}", description="Pay-run transitions by outcome"
             ),
@@ -98,6 +111,9 @@ class Metrics:
 
     def run_outcome(self, outcome: str, n: int = 1) -> None:
         self.pay_runs.add(n, {"outcome": outcome})
+
+    def late_settlement(self) -> None:
+        self.late_settlements.add(1)
 
     def payout_outcome(self, outcome: str, n: int = 1) -> None:
         if n:

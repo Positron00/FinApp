@@ -5,6 +5,7 @@ import { http, HttpResponse } from "msw";
 import { POST as accept, GET as acceptGet } from "@/app/api/auth/accept/route";
 import { POST as resetConfirm } from "@/app/api/auth/reset/confirm/route";
 import { POST as resetRequest } from "@/app/api/auth/reset/request/route";
+import { metricsApi } from "@/lib/metrics";
 import { resolveSession } from "@/lib/require-session";
 import { sessKey, sessionKeyOf, userSessKey } from "@/lib/session";
 
@@ -274,8 +275,11 @@ describe("POST /api/auth/reset/confirm", () => {
     expect(await t.redis.exists(sessKey(sessionKeyOf(a)))).toBe(1);
   });
 
-  // PAY-107 §4.4: a Redis failure during the revoke still answers 204 and logs revoke_failed.
+  // PAY-107 §4.4: a Redis failure during the revoke still answers 204 and logs revoke_failed;
+  // the current-session delete failing too is session.backend_error at error level and counts
+  // in bff_session_backend_errors_total (§7.1, §7.2).
   it("answers 204 when the revoke fails", async () => {
+    const counted = vi.spyOn(metricsApi, "sessionBackendError");
     server.use(
       http.post(`${IDENTITY}/v1/auth/password-reset/confirm`, () => {
         t.redis.fail = true; // identity has applied the reset; Redis fails afterwards
@@ -294,6 +298,12 @@ describe("POST /api/auth/reset/confirm", () => {
     expect(t.logs.events("auth.session.revoke_failed")[0]).toMatchObject({
       reason: "password_reset",
     });
+    expect(t.logs.events("session.backend_error")[0]).toMatchObject({
+      level: "error",
+      op: "reset_confirm",
+    });
+    expect(counted).toHaveBeenCalledOnce();
+    counted.mockRestore();
   });
 
   // PAY-603: fails closed.

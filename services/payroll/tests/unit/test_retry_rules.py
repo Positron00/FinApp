@@ -128,3 +128,16 @@ def test_republish_decision() -> None:
     assert _decide(publish_count=10, last_published_at=late) is RepublishAction.REPUBLISH
     assert _decide(publish_count=11, last_published_at=late) is RepublishAction.NEEDS_OPERATOR
     assert _decide(publish_count=11, last_published_at=NOW) is RepublishAction.SKIP
+
+
+def test_republish_decision_envelope_invalid() -> None:
+    """PAY-NFR-03, PAY-407: when the only unsent rows were refused by the relay, a due attempt
+    goes to the operator instead of re-publishing the same envelope; not due, a sendable
+    unsent row or a non-live attempt still SKIP."""
+    assert _decide(envelope_invalid=True) is RepublishAction.NEEDS_OPERATOR
+    not_due = NOW - timedelta(seconds=360)
+    assert _decide(envelope_invalid=True, last_published_at=not_due) is RepublishAction.SKIP
+    assert _decide(envelope_invalid=True, has_unsent_outbox=True) is RepublishAction.SKIP
+    assert (
+        _decide(envelope_invalid=True, status=AttemptStatus.NEEDS_OPERATOR) is RepublishAction.SKIP
+    )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from email.message import EmailMessage
 from typing import Any
 from uuid import UUID
 
@@ -205,6 +206,50 @@ async def test_not_issuable_rows_are_cancelled(
     assert [r["status"] for r in await outbox(admin_db)] == ["cancelled", "cancelled"]
     reasons = sorted(e["reason"] for e in caplog_json.events("email.cancelled"))
     assert reasons == ["invite_not_pending", "reset_not_pending"]
+
+
+class ResendingSender:
+    """Resends the invite (which cancels the claimed row) while the message is in flight."""
+
+    def __init__(self, h: Harness, admin: UUID, invite_id: str, *, fail: bool) -> None:
+        self._h, self._admin, self._invite_id, self._fail = h, admin, invite_id, fail
+        self.resends: list[int] = []
+
+    def available(self) -> bool:
+        return True
+
+    async def send(self, msg: EmailMessage) -> None:
+        r = await self._h.client.post(
+            f"/v1/invites/{self._invite_id}/resend", headers=self._h.admin_headers(self._admin)
+        )
+        self.resends.append(r.status_code)
+        if self._fail:
+            raise ConnectionRefusedError
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["sent", "last_attempt_failed"])
+async def test_row_cancelled_during_send_stays_cancelled(
+    harness: HarnessFactory,
+    admin_db: Any,
+    otel_memory: OtelMemory,
+    caplog_json: JsonLogCapture,
+    fail: bool,
+) -> None:
+    """PAY-110, PAY-102, R25: a resend that cancels a row the relay has claimed wins. The relay's
+    outcome (sent, or failed on the last attempt) does not overwrite 'cancelled', and a cancelled
+    row is not counted in identity_emails_failed_total nor logged as email.failed."""
+    async with harness(email_max_attempts=1) as h:
+        admin = await h.create_user("admin@example.com", password=PW)
+        created = await invite(h, admin)
+        sender = ResendingSender(h, admin, created["pending_invite_id"], fail=fail)
+        relay = EmailRelay(h.rt.sessions, h.rt.settings, sender, h.rt.metrics)
+        assert await relay.run_once() == 1
+        assert sender.resends == [200]
+        [old, new] = await outbox(admin_db)
+        assert (old["status"], new["status"]) == ("cancelled", "pending")
+        assert old["last_error"] is None
+        assert [v for _, v in otel_memory.metric_points("identity_emails_failed")] == [0]
+    assert caplog_json.events("email.failed") == []
 
 
 async def test_reset_email_gets_a_token_at_send(harness: HarnessFactory, admin_db: Any) -> None:

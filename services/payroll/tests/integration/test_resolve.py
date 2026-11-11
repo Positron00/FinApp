@@ -219,3 +219,123 @@ async def test_resolve_racing_a_late_result(api: Api, db: Any) -> None:
     a = await _attempt(db, p["id"])
     assert (a["status"], a["bank_reference"]) == ("settled", "late")
     await _assert_run_rule(db, run["id"])
+
+
+async def _mark_rejected(api: Api, db: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """A blocked payout marked rejected by the operator after the C48 wait."""
+    run, p = await _blocked(api, db)
+    api.rt.clock.advance(120)  # type: ignore[attr-defined]
+    assert (await api.resolve(run["id"], p["id"], "mark_rejected")).status_code == 200
+    return run, p
+
+
+async def _late_audits(db: Any, pid: str) -> list[dict[str, Any]]:
+    rows = await db.fetch(
+        "SELECT actor_id, details::text AS d FROM payroll.audit_events "
+        "WHERE event = 'payout.late_settlement' AND entity_id = $1",
+        pid,
+    )
+    return [{"actor_id": r["actor_id"], **json.loads(r["d"])} for r in rows]
+
+
+def _late_count(otel_memory: OtelMemory) -> float:
+    [(_, value)] = otel_memory.metric_points("payroll_late_settlements")
+    return float(value)
+
+
+async def test_late_settled_after_mark_rejected_is_recorded(
+    api_factory: ApiFactory, db: Any, otel_memory: OtelMemory, caplog_json: JsonLogCapture
+) -> None:
+    """PAY-NFR-02, PAY-405, C48: a settled answer for the attempt the operator marked rejected
+    keeps the contract (200, outcome rejected, nothing applied) but is never dropped: an audit row
+    payout.late_settlement (attempt, bank_reference, no later settled attempt), an error log and
+    payroll_late_settlements_total + 1 (pre-initialised at 0). A second report with another key
+    logs again but neither audits nor counts twice."""
+    api = await api_factory(instrument=True)
+    assert _late_count(otel_memory) == 0
+    run, p = await _mark_rejected(api, db)
+    late = {"attempt": 1, "outcome": "settled", "bank_reference": "BR-LATE-1"}
+    r = await api.result(p["id"], late)
+    assert (r.status_code, r.json()["outcome"]) == (200, "rejected")
+    a = await _attempt(db, p["id"])
+    assert (a["status"], a["failure_reason"], a["bank_reference"]) == (
+        "rejected",
+        "operator_rejected",
+        None,
+    )
+    assert await _late_audits(db, p["id"]) == [
+        {
+            "actor_id": "service:payout-worker",
+            "attempt": 1,
+            "current_attempt": 1,
+            "attempt_status": "rejected",
+            "failure_reason": "operator_rejected",
+            "bank_reference": "BR-LATE-1",
+            "later_attempt_settled": False,
+        }
+    ]
+    [log] = caplog_json.events("payout.late_settlement")
+    assert log["level"] == "error"
+    assert (log["payout_id"], log["pay_run_id"], log["recorded"]) == (p["id"], run["id"], True)
+    assert _late_count(otel_memory) == 1
+    again = await api.result(p["id"], late)
+    assert (again.status_code, again.json()["outcome"]) == (200, "rejected")
+    assert len(await _late_audits(db, p["id"])) == 1
+    assert [e["recorded"] for e in caplog_json.events("payout.late_settlement")] == [True, False]
+    assert _late_count(otel_memory) == 1
+
+
+async def test_late_settled_for_a_superseded_attempt_is_recorded(
+    api_factory: ApiFactory, db: Any, otel_memory: OtelMemory, caplog_json: JsonLogCapture
+) -> None:
+    """PAY-NFR-02, PAY-500, PAY-405: after mark_rejected and a retry whose attempt 2 settled, a
+    late settled answer for attempt 1 still gets 409 attempt_not_current, and the rollback of
+    that 409 does not lose it: payout.late_settlement is audited in its own transaction with
+    later_attempt_settled (attempt 2: paid twice), logged at error and counted."""
+    api = await api_factory(instrument=True)
+    run, p = await _mark_rejected(api, db)
+    assert (await api.retry(run["id"], p["id"])).status_code == 200
+    settled = {"attempt": 2, "outcome": "settled", "bank_reference": "BR-2"}
+    assert (await api.result(p["id"], settled)).json()["outcome"] == "settled"
+    late = {"attempt": 1, "outcome": "settled", "bank_reference": "BR-LATE-1"}
+    r = await api.result(p["id"], late)
+    assert _code(r) == (409, "attempt_not_current")
+    assert r.json()["error"]["details"] == {"current_attempt": 2}
+    assert await _late_audits(db, p["id"]) == [
+        {
+            "actor_id": "service:payout-worker",
+            "attempt": 1,
+            "current_attempt": 2,
+            "attempt_status": "rejected",
+            "failure_reason": "operator_rejected",
+            "bank_reference": "BR-LATE-1",
+            "later_attempt_settled": True,
+            "later_settled_attempt": 2,
+        }
+    ]
+    [log] = caplog_json.events("payout.late_settlement")
+    assert (log["level"], log["later_attempt_settled"], log["recorded"]) == ("error", True, True)
+    assert _late_count(otel_memory) == 1
+    # nothing else changed: attempt 1 stays rejected, the payout stays paid by attempt 2
+    assert (await _attempt(db, p["id"]))["status"] == "rejected"
+    assert await db.fetchval("SELECT status FROM payroll.payouts WHERE id = $1", p["id"]) == "paid"
+    # the same answer again: still 409, no second audit row or count
+    assert _code(await api.result(p["id"], late)) == (409, "attempt_not_current")
+    assert len(await _late_audits(db, p["id"])) == 1
+    assert _late_count(otel_memory) == 1
+
+
+async def test_ordinary_answers_are_not_late_settlements(api: Api, db: Any) -> None:
+    """PAY-NFR-02, PAY-405: a duplicate settled for a settled attempt, a rejected answer for an
+    operator-rejected attempt and a result for an unknown attempt number are not late
+    settlements."""
+    run, p = await _mark_rejected(api, db)
+    rejected = {"attempt": 1, "outcome": "rejected", "reason": "account_closed"}
+    assert (await api.result(p["id"], rejected)).json()["outcome"] == "rejected"
+    unknown = {"attempt": 7, "outcome": "settled", "bank_reference": "BR-7"}
+    assert _code(await api.result(p["id"], unknown)) == (409, "attempt_not_current")
+    assert (await api.retry(run["id"], p["id"])).status_code == 200
+    settled = {"attempt": 2, "outcome": "settled", "bank_reference": "BR-2"}
+    for _ in range(2):
+        assert (await api.result(p["id"], settled)).json()["outcome"] == "settled"
+    assert await _late_audits(db, p["id"]) == []

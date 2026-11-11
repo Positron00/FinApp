@@ -19,9 +19,11 @@ export function readFragmentToken(path: string): string | null {
 export function useFragmentToken(path: string): string | null | undefined {
   const [token, setToken] = useState<string | null | undefined>(undefined);
   useEffect(() => {
-    // Reading location.hash must wait for the browser; this runs once after mount.
+    // Reading location.hash must wait for the browser; this runs once after mount. The reader
+    // strips the hash, so a second run (React StrictMode re-runs effects in dev) would find
+    // nothing: keep the first result.
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    setToken(readFragmentToken(path));
+    setToken((prev) => (prev !== undefined ? prev : readFragmentToken(path)));
   }, [path]);
   return token;
 }

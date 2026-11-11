@@ -516,22 +516,29 @@ class OutboxRepo:
         claimed = [ClaimedEmail(*row) for row in rows]
         return sorted(claimed, key=lambda c: c.id)
 
-    async def finish(self, email_id: UUID, status: str, *, last_error: str | None = None) -> None:
-        await self._s.execute(
+    async def finish(self, email_id: UUID, status: str, *, last_error: str | None = None) -> bool:
+        """Record the outcome of a claimed row; False if it is no longer ``pending``.
+
+        A resend, deactivation or repeat reset request may cancel the row while the relay is
+        sending it (§6.9); the cancellation stands and the outcome is dropped.
+        """
+        result = await self._s.execute(
             update(EmailOutbox)
-            .where(EmailOutbox.id == email_id)
+            .where(EmailOutbox.id == email_id, EmailOutbox.status == "pending")
             .values(
                 status=status,
                 finished_at=func.now(),
                 last_error=last_error,
                 updated_at=func.now(),
             )
+            .returning(EmailOutbox.id)
         )
+        return len(result.all()) == 1
 
     async def retry_in(self, email_id: UUID, delay_s: float, *, last_error: str) -> None:
         await self._s.execute(
             update(EmailOutbox)
-            .where(EmailOutbox.id == email_id)
+            .where(EmailOutbox.id == email_id, EmailOutbox.status == "pending")
             .values(
                 next_attempt_at=func.now()
                 + text("make_interval(secs => :d)").bindparams(d=float(delay_s)),
@@ -544,7 +551,7 @@ class OutboxRepo:
         """The breaker was open: undo the claim's attempt and come back after ``delay_s``."""
         await self._s.execute(
             update(EmailOutbox)
-            .where(EmailOutbox.id == email_id)
+            .where(EmailOutbox.id == email_id, EmailOutbox.status == "pending")
             .values(
                 attempts=EmailOutbox.attempts - 1,
                 next_attempt_at=func.now()

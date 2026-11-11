@@ -10,12 +10,13 @@ import { makeReq, params, signIn } from "../helpers/request";
 
 setupMsw();
 
+// The cursor cap of each service's OpenAPI: identity 64, payroll 512.
 const CASES = [
-  ["/api/audit/auth", authAudit, `${IDENTITY}/v1/audit-log`, authAuditEvent()],
-  ["/api/audit/payroll", payrollAudit, `${PAYROLL}/v1/audit-events`, payrollAuditEvent()],
+  ["/api/audit/auth", authAudit, `${IDENTITY}/v1/audit-log`, authAuditEvent(), 64],
+  ["/api/audit/payroll", payrollAudit, `${PAYROLL}/v1/audit-events`, payrollAuditEvent(), 512],
 ] as const;
 
-describe.each(CASES)("GET %s", (path, handler, upstream, item) => {
+describe.each(CASES)("GET %s", (path, handler, upstream, item, cursorMax) => {
   // PAY-109, plan §8, C8: admin; cursor and limit pass through; Page<T> returned.
   it("returns a page with pass-through", async () => {
     const cookie = await signIn({ roles: ["admin"] });
@@ -42,6 +43,23 @@ describe.each(CASES)("GET %s", (path, handler, upstream, item) => {
     expect((await handler(makeReq(path), params())).status).toBe(401);
     const cookie = await signIn();
     expect((await handler(makeReq(`${path}?limit=0`, { cookie }), params())).status).toBe(422);
+  });
+
+  // PAY-602, C8: the cursor is capped at the service's own maxLength.
+  it("caps the cursor at the service's maxLength", async () => {
+    const cookie = await signIn();
+    server.use(http.get(upstream, () => HttpResponse.json({ items: [], next_cursor: null })));
+    const at = await handler(
+      makeReq(`${path}?cursor=${"c".repeat(cursorMax)}`, { cookie }),
+      params(),
+    );
+    expect(at.status).toBe(200);
+    const over = await handler(
+      makeReq(`${path}?cursor=${"c".repeat(cursorMax + 1)}`, { cookie }),
+      params(),
+    );
+    expect(over.status).toBe(422);
+    expect(seen).toHaveLength(1);
   });
 
   // PAY-602: an invalid response (bad entity_type / non-UUID id) → 500.

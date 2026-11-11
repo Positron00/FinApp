@@ -6,7 +6,7 @@ Scope: `apps/web`, the only public entry point. It serves the pages and the BFF 
 
 **Stack decisions for this area:**
 - **Next.js 16 (App Router), strict TypeScript.** The request interceptor is `src/proxy.ts`. Next 16's proxy runs on the Node.js runtime, but it stays a cookie-presence check for pages plus the CSP nonce and is **not** a security boundary. It never gates `/api/*` (C63) (`architecture.md` §9; CVE-2025-29927). Every route handler and every page calls `requireSession()` itself (PAY-601). No reason was found to stay on 15.
-- Tailwind with shadcn/ui (Radix primitives); TanStack Query v5 in the browser; Zod at every boundary.
+- Tailwind with small local WAI-ARIA primitives (`dialog.tsx`, `tabs.tsx`, `field.tsx`; ADR 0013, C69) instead of shadcn/ui; TanStack Query v5 in the browser; Zod at every boundary.
 - **Service clients:** `openapi-typescript` types plus `openapi-fetch`, from `packages/api-client` (`@payrun/api-client`, exports `IdentityPaths` and `PayrollPaths`).
 - **Server libraries:** `ioredis` for Redis, `jose` for EdDSA, `pino` for logs (bridged to the OTel logs SDK, C62), `@vercel/otel` for traces, metrics and logs.
 - **Pages render dynamically.** The root layout reads the nonce header, so there's no static export (ADR 0009).
@@ -120,15 +120,14 @@ Every module here starts with `import "server-only"`, except the ones marked *sh
 |---|---|
 | `src/instrumentation.ts` | `register()`: on `nodejs` only, runs `loadConfig()` (on a failed check: logs `config.invalid` and exits 2; C29), then `registerOTel` (§7.4). `onRequestError` logs `web.server_error` |
 | `src/proxy.ts` | Cookie-presence gate, CSP nonce, `x-request-id` (§5.5) |
-| `src/components/ui/*` | shadcn/ui primitives (Button, Dialog, AlertDialog, Table, Tabs, Badge, Form, Input, Select, Checkbox, Toast, Skeleton). **As built (F5):** no shadcn/Radix or react-hook-form dependency was added (the lock file is the lead's). The same contracts come from small local components: `dialog.tsx` (`Dialog`/`ConfirmDialog`: `role="dialog"`/`"alertdialog"`, `aria-modal`, initial focus, Tab trap, Escape, focus returned to the opener), `tabs.tsx` (`TabList`/`TabPanel`, the WAI-ARIA pattern of §6.3), `field.tsx` (`TextField`/`SelectField`/`FormError`: `<label htmlFor>` with the hint and error outside the label, linked by `aria-describedby`). Toasts are inline `role="status"` notices |
+| `src/components/{dialog,tabs,field}.tsx` | Planned as shadcn/ui primitives under `components/ui/`. **As built (F5, ADR 0013):** no shadcn/Radix or react-hook-form dependency was added (the lock file is the lead's). The same contracts come from small local components: `dialog.tsx` (`Dialog`/`ConfirmDialog`: `role="dialog"`/`"alertdialog"`, `aria-modal`, initial focus, Tab trap, Escape, focus returned to the opener), `tabs.tsx` (`TabList`/`TabPanel`, the WAI-ARIA pattern of §6.3), `field.tsx` (`TextField`/`SelectField`/`FormError`: `<label htmlFor>` with the hint and error outside the label, linked by `aria-describedby`). Toasts are inline `role="status"` notices |
 | `src/components/app-shell.tsx`, `nav.tsx` | Layout, skip link, nav items filtered by role, user menu with sign-out |
-| `src/components/role-gate.tsx` | Shows children only for the given roles. This is a UI convenience; the server enforces |
-| `src/components/providers.tsx` | QueryClientProvider (defaults in §6.1) and the Toaster |
+| `src/components/providers.tsx` | QueryClientProvider (defaults in §6.1). There is no Toaster: notices are inline `role="status"` regions |
 | `src/components/web-vitals.tsx` | `useReportWebVitals` → `navigator.sendBeacon("/api/telemetry")`; a `window.onerror` / `unhandledrejection` reporter |
-| `src/components/money.tsx`, `data-table.tsx`, `cursor-pager.tsx`, `error-banner.tsx`, `confirm-dialog.tsx`, `live-region.tsx`, `forbidden.tsx` | Shared UI |
+| `src/components/dialog.tsx` (`Dialog`, `ConfirmDialog`), `tabs.tsx`, `field.tsx`, `cursor-pager.tsx`, `error-banner.tsx`, `live-region.tsx`, `forbidden.tsx` | Shared UI (ADR 0013). Money is formatted by `lib/money.ts` (`formatCents`); tables are plain `<table>` markup in each component |
 | `src/components/forms/{login-form,accept-form,reset-forms,password-set-form,employee-form,settings-form,run-create-form}.tsx`, `src/components/users/users-page.tsx` (with the invite and user-edit dialogs), `src/components/employees/{employee-list,employee-detail,bank-fields}.tsx`, `src/components/dashboard.tsx` | Forms with the shared Zod schemas (controlled React state, no react-hook-form). `lib/client/form-errors.ts` maps 422 `details` (C56 `body.<field>`) to inline field errors and moves focus to the first invalid field; `lib/client/fragment-token.ts` reads and strips `#token` |
 | `src/components/runs/{run-detail,run-status-badge,hours-editor,payslip-dialog,payouts-tab,approve-button,retry-button,resolve-dialog}.tsx` | The run page (§6.3). As built, the header, actions and payslips tab live in `run-detail.tsx`, and the attempt history in `payouts-tab.tsx` |
-| `src/components/audit/{auth-audit-table,payroll-audit-table}.tsx` | Audit tabs |
+| `src/components/audit/audit-page.tsx` | `/audit`: both audit tabs (auth and payroll), each with its own cursor pager |
 
 ## 2. Data models
 
@@ -170,7 +169,8 @@ These are common to all of them:
 - `Password = z.string().min(12).max(256)` (12 is PAY-103; the BFF checks it early so the user gets instant feedback, and identity stays authoritative)
 - `Uuid = z.string().uuid()`
 - `IsoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/)`
-- `Cursor = z.string().max(512).regex(/^[A-Za-z0-9_-]+$/).optional()`: opaque base64url, passed through unchanged (R4)
+- `Cursor = z.string().max(512).regex(/^[A-Za-z0-9_-]+$/).optional()`: opaque base64url, passed through unchanged (R4). This is payroll's `maxLength`
+- `IdentityCursor`: the same with `.max(64)`, identity's `maxLength` on `/v1/users` and `/v1/audit-log`
 - `Limit = z.coerce.number().int().min(1).max(100).default(50)`
 
 Every object schema is `.strict()`: an unknown key gives 422 `validation_error`. Validation `details` are always `[{field, issue}]` (`field` is the dotted path, `issue` the Zod issue code) and never echo the submitted value (C14).
@@ -181,10 +181,11 @@ Every object schema is `.strict()`: an unknown key gives 422 `validation_error`.
 | `AcceptBody` | `{token: z.string().regex(/^[A-Za-z0-9_-]{20,128}$/), password: Password}` | PAY-103 |
 | `ResetRequestBody` | `{email: Email}` | PAY-105 |
 | `ResetConfirmBody` | `{token: <as AcceptBody>, password: Password}` | PAY-105 |
-| `ListQuery` | `{cursor: Cursor, limit: Limit}`. Used by every list route; the BFF passes both to the service unchanged (C8) | PAY-108, 109, 202, 303, 501, 602 |
+| `ListQuery` | `{cursor: Cursor, limit: Limit}`. Used by the payroll list routes (payslips, payroll audit); the BFF passes both to the service unchanged (C8) | PAY-109, 303, 602 |
+| `IdentityListQuery` | `{cursor: IdentityCursor, limit: Limit}`. Used by `/api/users` and `/api/audit/auth`, so a cursor identity would reject is a BFF 422 with no upstream call (C8) | PAY-108, 109, 602 |
 | `InviteBody` | `{email: Email, name: z.string().trim().min(1).max(200), roles: z.array(RoleEnum).min(1).max(3)}`, with roles required to be unique | PAY-101 |
 | `UserPatchBody` | `{roles?: RoleEnum[] (min 1, max 3, unique), status?: z.literal("inactive")}`; at least one field. There is no user reactivation in 0.1.0 (R37, C25), so `"active"` is a 422 | PAY-108 |
-| `SettingsBody` | `{name: 1–200, tax_rate_bps: int 0–5000, retirement_bps: int 0–2000, timezone: one of Intl.supportedValuesOf("timeZone"), biweekly_anchor: IsoDate that is a Monday, require_dual_approval: boolean}` | PAY-200 |
+| `SettingsBody` | `{name: 1–200, tax_rate_bps: int 0–5000, retirement_bps: int 0–2000, timezone: string 1–64 (format and length only: payroll's `zoneinfo` check is authoritative, and the runtime's ICU list omits valid zones such as `Etc/UTC` and `Asia/Kolkata`; the settings form still offers `timeZones()` as its select options, plus the stored zone), biweekly_anchor: IsoDate that is a Monday, require_dual_approval: boolean}` | PAY-200 |
 | `EmployeeCreateBody` | A discriminated union on `pay_type`. Common fields: `name` 1–200, `email: Email`, `schedule: "biweekly"\|"monthly"`, `bank_routing: /^\d{9}$/` with the ABA checksum, `bank_account: /^\d{4,17}$/`. Then `salaried` with `annual_salary_cents: int 1–1_000_000_000`, or `hourly` with `hourly_rate_cents: int 1–100_000` | PAY-201 |
 | `EmployeePatchBody` | Every field of `EmployeeCreateBody` optional, plus `status?: "active"\|"inactive"`; at least one field. Employee reactivation stays in scope (PAY-203); reactivating an employee whose bank details were purged needs `bank_routing` and `bank_account` in the same PATCH (payroll returns 422 otherwise) | PAY-203 |
 | `EmployeeListQuery` | `ListQuery & {status?: "active"\|"inactive"}` | PAY-202 |
@@ -233,7 +234,7 @@ The generated types in `packages/api-client` are the contract. **The Zod schemas
 | `PayrollAuditEvent` | payroll `AuditEventOut` | `{id: Uuid, at: DateTime, actor_id: string, event: string, entity_type: "company_settings"\|"employee"\|"pay_run"\|"payout", entity_id: Uuid, details: Record<string, unknown>}` (C5) | plan §8 |
 | `ValidationDetails` | the C14 shape | `z.array(z.object({field: z.string().max(200), issue: z.string().max(100)})).max(100)` | PAY-602 |
 | `EmployeeIdsDetails` | payroll domain errors | `{employee_ids: z.array(Uuid).max(500)}` | PAY-300–302 |
-| `ErrorBody` | PAY-602 | `{error: {code: string, message: string, request_id: string, details?: ValidationDetails \| EmployeeIdsDetails}}` | PAY-602 |
+| `ErrorBody` | PAY-602 | `{error: {code: string, message: string, request_id: string, details?: ValidationDetails \| EmployeeIdsDetails}}`, the body the BFF sends (its `request_id` is always set; the services' `ErrorDetail.request_id` may be null). A type, not a Zod export: `lib/errors.ts` parses upstream error bodies with its own schema (F5 review) | PAY-602 |
 
 ## 3. Interfaces
 
@@ -698,12 +699,12 @@ The route wrapper adds `Cache-Control: no-store` to every `/api/*` response. Pag
   - mutations: `retry: 0`.
 - **401 on any `/api` call:** `apiFetch` sends the user to `/login?next=<current path>`.
 - **Error display:**
-  - 403 `forbidden_role` → a toast with the mapped message;
+  - 403 `forbidden_role` → an inline `role="alert"` with the mapped message;
   - 503 → a banner, "The service is temporarily unavailable", with a Retry button;
-  - other errors → a toast with the mapped message;
+  - other errors → an inline `role="alert"` (`ErrorBanner` or the form's alert) with the mapped message;
   - 422 → errors shown inline, per field, from `details`.
 
-  Every error toast shows `request_id` as "Reference: …".
+  Every error notice shows `request_id` as "Reference: …". There are no toasts (ADR 0013): success notices are inline `role="status"` regions.
 - **Never stale money.** The BFF caches nothing. When a refetch fails, the UI keeps the last snapshot but marks it ("Last updated 14:02:31. Updates paused.") and **disables approve, retry and calculate** until a fresh fetch succeeds.
 - **Formatting:**
   - `formatCents` uses integer division into dollars and cents, then `Intl.NumberFormat("en-US", { style: "currency", currency: "USD" })` on the parts;
@@ -712,7 +713,7 @@ The route wrapper adds `Cache-Control: no-store` to every `/api/*` response. Pag
   - a null amount (a `pending` payslip) shows as "—".
 - **Paging (C8).** Every list is paged with `<CursorPager>`: it keeps a stack of the cursors seen, so "Next" sends `cursor=next_cursor` and "Previous" pops the stack; "Next" is disabled when `next_cursor` is null. Page size is 50 unless stated. The cursor is opaque and kept in component state, not in the URL. Changing a filter resets the stack.
 - **User references.** `created_by`, `calculated_by`, `approved_by`, `bank_updated_by` and `actor_id` are user IDs as strings. They show as "you" when equal to `Me.id`; otherwise the `*_name` field where the model has one, else the first 8 characters of the ID.
-- **Role gating.** `<RoleGate roles>` hides controls the user can't use, and the BFF still enforces. A page the user can't open at all renders `<Forbidden/>` (status 403 text, a link to the dashboard).
+- **Role gating.** Each page passes role flags from the session (`canPrepare`, `canApprove`, `me.canEdit`) and components hide controls the user can't use; the BFF still enforces (PAY-601). There is no `<RoleGate>` component: every gate also depends on run or row state, so an inline condition is clearer. A page the user can't open at all renders `<Forbidden/>` (status 403 text, a link to the dashboard).
 
 ### 6.2 Pages
 
@@ -734,14 +735,14 @@ The route wrapper adds `Cache-Control: no-store` to every `/api/*` response. Pag
 
 ### 6.3 The run page (`/pay-runs/[id]`)
 
-**Header (`run-header.tsx`).**
+**Header (in `run-detail.tsx`).**
 - Period, schedule, pay date and status badge (`draft`, `calculated`, `processing`, `paid`, `partially_failed`), each with a text label and icon, not colour alone.
 - Totals: gross, tax, retirement, net, and **funding required** (from `totals`; "—" while `draft`). Employee count (`employee_count`).
 - Payout counts from `counts` (C9): paid (with "{no_transfer} with no transfer" when non-zero), failed, requested, and within requested, awaiting bank and blocked.
 - "Calculated by {calculated_by_name}" and "Approved by {approved_by_name}" (R21), each shown as "you" when the ID equals `Me.id`, with `calculated_at` and `approved_at`. A null name falls back to the short ID (§6.1).
 - When `require_dual_approval` is true: a "Dual approval" label (the calculate-time snapshot).
 
-**Actions (`run-actions.tsx`).**
+**Actions (in `run-detail.tsx`; `approve-button.tsx` for Approve).**
 
 | Action | Shown when | Role | Call |
 |---|---|---|---|
@@ -751,9 +752,9 @@ The route wrapper adds `Cache-Control: no-store` to every `/api/*` response. Pag
 | Approve | `calculated` | approver | `approve-button.tsx` (§3.2). The confirm dialog shows the funding total and the employee count. If `require_dual_approval` is true and `calculated_by === Me.id`, a hint above the button says "You calculated this run. With dual approval on, another approver must approve it." The button stays enabled, because payroll also applies the bank-change rule, which the UI can't see. On 403 `approver_must_differ`, an inline `role="alert"` shows the dual-approval message (§3.3); 409 `employee_bank_details_missing` shows the approve message |
 
 **Tabs** (`RunTabs` in `run-detail.tsx`, the WAI-ARIA tabs pattern without Radix: a roving `tabIndex`, ArrowLeft/ArrowRight/Home/End with automatic activation, one `role="tabpanel"` per tab with the inactive one `hidden` and unmounted; the default is `payslips` before approval and `payouts` after):
-- **Payslips** (`payslips-tab.tsx`). `GET …/payslips?cursor&limit=50` with a cursor pager (C8). One row per payslip: employee, pay type, hours, gross, tax, retirement, net (amounts "—" while `pending`). Clicking a row opens `payslip-dialog.tsx` (`GET …/payslips/[payslipId]`). The table footer shows the totals from the run summary, never sums computed in the browser.
+- **Payslips** (a tab panel in `run-detail.tsx`). `GET …/payslips?cursor&limit=50` with a cursor pager (C8). One row per payslip: employee, pay type, hours, gross, tax, retirement, net (amounts "—" while `pending`). Clicking a row opens `payslip-dialog.tsx` (`GET …/payslips/[payslipId]`). The table footer shows the totals from the run summary, never sums computed in the browser.
 - **Hours editor** (`hours-editor.tsx`; payroll_admin, `draft`/`calculated` only). It loads **every** payslip by following `next_cursor` (`limit=100`) until it is null (C8), and lists the `hourly` ones with an input each (prefilled from `hours_hundredths`). Save sends one `HoursBody` with the changed rows (max 500 per request; more are sent in sequential requests of 500).
-- **Payouts** (`payouts-tab.tsx`, PAY-501). `GET …/payouts?cursor&limit=50` with a cursor pager and a status filter (all, requested, paid, failed). One row per payout: employee, amount (`amount_cents`), bank `••••<account_last4>` of the current attempt, badge, failure reason, attempt number, and a "History" disclosure (`attempt-history.tsx`) listing every attempt with its status, reason, bank reference, `••••account_last4`, `requested_at` and `final_at`. Rows link to their payslip by `payslip_id`.
+- **Payouts** (`payouts-tab.tsx`, PAY-501). `GET …/payouts?cursor&limit=50` with a cursor pager and a status filter (all, requested, paid, failed). One row per payout: employee, amount (`amount_cents`), bank `••••<account_last4>` of the current attempt, badge, failure reason, attempt number, and a "History" disclosure (in `payouts-tab.tsx`) listing every attempt with its status, reason, bank reference, `••••account_last4`, `requested_at` and `final_at`. Rows link to their payslip by `payslip_id`.
   - A "Retry" button (`retry-button.tsx`, approver) appears on `failed` rows only. On 403 `approver_must_differ` it shows the retry message (§3.3). The other 409s show their messages.
   - A "Resolve" button (approver) appears on **Blocked** rows only (current attempt `needs_operator`) and opens `resolve-dialog.tsx` (PAY-502, R8; below).
 
@@ -765,10 +766,10 @@ The route wrapper adds `Cache-Control: no-store` to every `/api/*` response. Pag
   - "Mark rejected": "Use when the bank shows no settled transfer. The payout becomes failed, and Retry becomes available." → `action: "mark_rejected"`.
 - **A required note** (`<textarea>`, 1–500 characters, with a live counter), labelled "Note for the audit log (what you checked at the bank)". Only its length is audited.
 - The submit button reads "Resolve" and is disabled until a choice and a note are present, and while the mutation is pending. Submit → `POST /api/pay-runs/[id]/payouts/[payoutId]/resolve` with `ResolveBody` (never retried, `retry: 0`).
-- **On 200:** close the dialog, toast "Payout resent" or "Payout marked rejected", and invalidate the run and payouts queries. A redrive moves the run back to `processing`, which restarts polling.
+- **On 200:** close the dialog, show "Payout resent" or "Payout marked rejected" in an inline `role="status"` notice, and invalidate the run and payouts queries. A redrive moves the run back to `processing`, which restarts polling.
 - **On 409 `payout_not_blocked`:** show its message in the dialog's `role="alert"` and refetch the payouts.
 - **On 409 `resolve_too_early`:** keep the dialog open, show the message with a countdown from `Retry-After`, and disable "Mark rejected" until it reaches 0. "Redrive" stays available, because it has no wait. 422 errors show inline on the note or the choice. Other errors follow §6.1.
-- Built on Radix `AlertDialog`: focus starts on the warning heading, is trapped, and returns to the Resolve button on close.
+- Built on the local `Dialog` (`alertdialog`, ADR 0013): focus starts on the warning heading (`tabIndex={-1}`), is trapped (Tab and Shift+Tab from the heading or the container wrap to the first or last control), and returns to the Resolve button on close.
 
 **Payout badge (`lib/payout-badge.ts`).** The input is the payout plus its current attempt (`attempts` where `attempt === current_attempt`).
 
@@ -797,9 +798,9 @@ Failure reasons display as: `account_closed` → "Account closed", `insufficient
 - **Status changes** are announced through a polite `aria-live` region (`live-region.tsx`). It speaks only when the status or a count changes (for example "Run paid: 498 paid, 2 failed"), never on every poll.
 - **Badges** carry text; colour is never the only signal. Contrast is at least 4.5:1 in the theme tokens.
 - **Errors.** The dual-approval and other action errors render in `role="alert"`, linked to the button with `aria-describedby`. Form fields use `aria-invalid` and `aria-describedby` for their errors. After a failed submit, focus moves to the first invalid field.
-- **Dialogs** (Radix) trap focus and return it to the trigger. Destructive confirms and the resolve dialog use `AlertDialog`; the resolve choices are a labelled radio group, and the note's counter is announced politely.
+- **Dialogs** (`components/dialog.tsx`, ADR 0013) trap focus, including from a non-tabbable initial focus, and return it to the trigger. Destructive confirms (`ConfirmDialog`) and the resolve dialog use `role="alertdialog"`; the resolve choices are a labelled radio group, and the note's counter is announced politely.
 - **Tables** use `<th scope="col">` and a `<caption>` (visually hidden where needed). The hours inputs have labels like "Hours for {employee}".
-- **Tabs** follow the WAI-ARIA tabs pattern (Radix), with arrow keys.
+- **Tabs** follow the WAI-ARIA tabs pattern (`components/tabs.tsx`, ADR 0013), with arrow keys.
 - **Navigation:** every page has a unique `<title>` and one `<h1>`; a skip link goes to `<main>`.
 - **Motion:** spinners respect `prefers-reduced-motion`. Polling never moves focus.
 
@@ -979,7 +980,7 @@ The web gates are ESLint, Prettier, `tsc --noEmit` and Vitest coverage ≥ 80% l
 - **Clock:** fake timers (`vi.useFakeTimers()`).
 - **Route handlers** are tested as functions: import `{ POST }` from the route file and call it with a `NextRequest` built by `tests/helpers/request.ts` (cookie, Origin, body, params Promise). `next/headers` `cookies()` is mocked from the request.
 - **Integration files** (`*.int.test.ts`) use Testcontainers `redis:7-alpine` and run in the same CI job (`vitest --project integration`). **Deferred (C63):** S7 ships none; `vitest.config.ts` already excludes the pattern. `session.int.test.ts` (PAY-106 TTLs, the `web` ACL `NOPERM` checks for PAY-607) lands when the stack's Redis exists. **F5:** the rate-limit row is covered by `tests/api/rate-limits.routes.test.ts` at the **production values** (the 121st request in a session and the 301st from one IP are 429 with `Retry-After`), with two module graphs ("replicas") sharing one `FakeRedis` store, so they share counts. The Testcontainers variant needs the `testcontainers` dev dependency, which isn't in the workspace (a lock-file change for the lead).
-- **F5 file layout.** `tests/api/{auth-flows,users,settings,employees,pay-runs-f5,payouts,resolve,audit,rate-limits}.route(s).test.ts`; `tests/schemas/schemas-f5.test.ts` (the new `expectTypeOf` checks; `toExtend` where the service type allows `| null`); `tests/lib/money.test.ts` (parsers and ABA); `tests/components/{auth-forms,employee-form,settings-form,users-page,audit-page,dashboard,role-gate,hours-editor,payouts-tab,resolve-dialog,run-actions}.test.tsx` (the retry-button rows are in `payouts-tab.test.tsx`; accept, reset and the public pages in `auth-forms.test.tsx`); `tests/app/page-gates.test.tsx` covers every `(app)` page, including the F5 ones and the malformed-`[id]` 404.
+- **F5 file layout.** `tests/api/{auth-flows,users,settings,employees,pay-runs-f5,payouts,resolve,audit,rate-limits}.route(s).test.ts`; `tests/schemas/schemas-f5.test.ts` (the new `expectTypeOf` checks; `toExtend` where the service type allows `| null`); `tests/lib/money.test.ts` (parsers and ABA); `tests/components/{auth-forms,employee-form,settings-form,users-page,audit-page,dashboard,dialog,hours-editor,payouts-tab,resolve-dialog,run-actions}.test.tsx` (the retry-button rows are in `payouts-tab.test.tsx`; accept, reset and the public pages in `auth-forms.test.tsx`); `tests/app/page-gates.test.tsx` covers every `(app)` page, including the F5 ones and the malformed-`[id]` 404.
 - **S7 file layout.** Several rows below are combined in fewer files: `tests/lib/security.test.ts` (client IP, rate limit, Origin, body, CSP), `tests/lib/observability.test.ts` (logger, redaction, metrics, `originRegex`), `tests/lib/otel.test.ts` (the `registerOTel` wiring), `tests/lib/shared.test.ts` (money, payout badge), `tests/api/infra.routes.test.ts` (health, fallback, standard headers, pipeline limits, telemetry), `tests/app/page-gates.test.tsx` (every `(app)` page and the layout call `requireSessionForPage`; PAY-601) and `tests/components/forms.test.tsx` (login, run create, list, telemetry client).
 
 | Test file | Covers | Req |
@@ -990,9 +991,9 @@ The web gates are ESLint, Prettier, `tsc --noEmit` and Vitest coverage ≥ 80% l
 | `tests/lib/api/resilient-fetch.test.ts` | Per-attempt timeout → 503; 10 s for calculate and approve; GET retried twice on 429/502/503/504 and connect errors, not on 500/4xx/read timeout; POST, PUT, PATCH and DELETE never retried; `Retry-After` ≤ 1 s honoured, > 1 s not retried; deadline 5 s; `X-Request-ID` and `Authorization` sent; metrics outcome labels | plan §4 |
 | `tests/lib/api/breaker.test.ts` | Opens after 5 consecutive failures; fails fast with no fetch while open; half-open after 30 s lets one probe through; success closes, failure re-opens; an aborted probe frees the slot (`release()`, C63); 4xx and 500 don't count; `circuit_breaker_state` values | plan §4 |
 | `tests/lib/errors.test.ts` | One case per §3.3 row, including the C15 additions (`employee_not_in_run`, `idempotency_key_required`, `company_settings_not_found`, `payslip_not_found`, `not_found`, `method_not_allowed`, `bad_request`, `payout_not_blocked`, `anchor_locked`): status, code and message; context-specific `approver_must_differ` and `employee_bank_details_missing` messages; unknown 4xx → `request_failed`; unknown 5xx → 500; `invalid_token` → 500 + `bff.upstream_auth_failed`; `validation_error` details re-parsed to `[{field, issue}]` with extra keys (for example `input`) stripped (C14); `details.employee_ids` forwarded only for `not_hourly`, `employee_not_in_run`, `employee_in_overlapping_run` and `hours_missing`; no upstream message leaks | PAY-602 |
-| `tests/lib/rate-limit.test.ts` | Sliding-window estimate across a window boundary; deny at limit + 1 with `Retry-After`; subjects are hashed (no raw IP in keys); fail-closed vs fail-open per route mode; `rate_limiter_errors_total` | PAY-603 |
-| `tests/lib/rate-limit.int.test.ts` | Real Redis: **two limiter instances share counts**; **production values** 120/min per session and 300/min per IP limit (the 121st and 301st requests are 429) | PAY-603 |
-| `tests/lib/session.int.test.ts` | Real Redis: TTLs as set (`PTTL`), absolute cap, revocation across "two replicas"; the `web` ACL user can't `XADD stream:payout.requested` or `GET identity:*` (NOPERM) | PAY-106, 607 |
+| `tests/lib/security.test.ts` (rate limit) | Sliding-window estimate across a window boundary; deny at limit + 1 with `Retry-After`; subjects are hashed (no raw IP in keys); fail-closed vs fail-open per route mode; `rate_limiter_errors_total` | PAY-603 |
+| `tests/api/rate-limits.routes.test.ts` | **Two module graphs ("replicas") over one fake store share counts**; **production values** 120/min per session and 300/min per IP limit (the 121st and 301st requests are 429). The real-Redis variant (`rate-limit.int.test.ts`) is deferred to H1 (C69) | PAY-603 |
+| `tests/lib/session.int.test.ts` (**deferred to H1**, §9.1) | Real Redis: TTLs as set (`PTTL`), absolute cap, revocation across "two replicas"; the `web` ACL user can't `XADD stream:payout.requested` or `GET identity:*` (NOPERM) | PAY-106, 607 |
 | `tests/lib/client-ip.test.ts` | hops 0/1/2 with 1–4 XFF entries; too few entries → `null`; invalid IP → `null`; never the left-most value when hops < n−1; with `null`, the identity client sends **no** `X-Client-IP` header (C16) and the limiter uses the shared `unknown` subject | PAY-603 |
 | `tests/lib/origin.test.ts` | Same origin passes; other scheme, host or port, `null`, or missing → 403 `bad_origin`; GET not checked | PAY-604 |
 | `tests/lib/body.test.ts` | Content-Length > 64 KB → 413 without reading; a chunked body over the limit → 413; bad JSON → 400; wrong content type → 422; schema errors → 422 with `[{field, issue}]` and no values | PAY-604, 602 |
@@ -1017,7 +1018,7 @@ The web gates are ESLint, Prettier, `tsc --noEmit` and Vitest coverage ≥ 80% l
 | `tests/components/retry-button.test.tsx`, `payouts-tab.test.tsx` | Retry only on failed rows for approvers; Resolve only on Blocked rows for approvers; retry messages; amount and `••••account_last4` columns; attempt history rows; cursor pager follows `next_cursor` and disables Next on null | PAY-500, 501, 502 |
 | `tests/components/resolve-dialog.test.tsx` | The bank-check warning is shown before the choices; no default choice; submit disabled until a choice and a 1–500 character note exist and while pending; sends `ResolveBody`; 409 `payout_not_blocked` in `role="alert"` and a payouts refetch; success invalidates the run and payouts; focus management | PAY-502, NFR-14 |
 | `tests/components/accept-form.test.tsx`, `reset-forms.test.tsx`, `login-form.test.tsx` | Token read from the fragment and stripped with `replaceState`; never sent in a URL; 12-character rule; mapped errors; `next` open-redirect guard, including `/\t/evil`, `/\n/evil` and backslashes (C63) | PAY-103–105 |
-| `tests/components/employee-form.test.tsx`, `hours-editor.test.tsx`, `settings-form.test.tsx`, `users-page.test.tsx`, `role-gate.test.tsx` | Field validation and inline 422 details; ABA checksum; bank fields never prefilled; reactivating an employee without bank details requires new ones; the hours editor follows `next_cursor` across 3 pages before showing rows, then refetches the run after save (C7, C8); `anchor_locked` on the anchor field; the users page shows Deactivate but **no Reactivate** (C25) and uses `pending_invite_id` for Resend; role-gated controls hidden | PAY-200–203, 301, 108, 601 |
+| `tests/components/employee-form.test.tsx`, `hours-editor.test.tsx`, `settings-form.test.tsx`, `users-page.test.tsx`, `dialog.test.tsx` | Field validation and inline 422 details; ABA checksum; bank fields never prefilled; reactivating an employee without bank details requires new ones; the hours editor follows `next_cursor` across 3 pages before showing rows, then refetches the run after save (C7, C8); `anchor_locked` on the anchor field; the users page shows Deactivate but **no Reactivate** (C25) and uses `pending_invite_id` for Resend; role-gated controls hidden; the dialog focus trap (Tab and Shift+Tab wrap, also from a non-tabbable initial focus) | PAY-200–203, 301, 108, 601, NFR-14 |
 
 ### 9.2 Playwright (`apps/web/e2e/`)
 
@@ -1098,9 +1099,9 @@ Nightly runs the suite three times in a row (plan §12). No `waitForTimeout`: ev
 | PAY-501 Payout history | §2.4 (`Payout`, `Attempt` strict), §3.2, §6.3 | `payouts.routes.test.ts`, `payouts-tab.test.tsx`, `approve-pay.spec.ts`, `recover.spec.ts` |
 | PAY-502 Operator resolution | §2.3 `ResolveBody`, §3.2 resolve route, §3.3 `payout_not_blocked` and `resolve_too_early`, §6.3 resolve dialog | `resolve.route.test.ts`, `resolve-dialog.test.tsx`, `payouts-tab.test.tsx`, `recover.spec.ts` (blocked case) |
 | PAY-600 Internal JWT | §3.4.1, §3.2 (`U`/`S`) | `internal-jwt.test.ts`, `auth.routes.test.ts`, `employees.routes.test.ts` |
-| PAY-601 Authorization | §3.1, §4.3, §5.5, §6.1 | `require-session.test.ts`, `proxy.test.ts`, `*.routes.test.ts`, `role-gate.test.tsx`, `employees.spec.ts` |
+| PAY-601 Authorization | §3.1, §4.3, §5.5, §6.1 | `require-session.test.ts`, `proxy.test.ts`, `*.routes.test.ts`, `page-gates.test.tsx`, `dashboard.test.tsx`, `users-page.test.tsx`, `employees.spec.ts` |
 | PAY-602 Error format | §2.4 `ErrorBody`, `Page<T>`, §3.3, §1.2 fallback routes | `errors.test.ts`, `*.routes.test.ts`, `fallback.routes.test.ts`, `errors.spec.ts` |
-| PAY-603 Rate limits | §4.5, §5.1, §5.2 | `rate-limit.test.ts`, `rate-limit.int.test.ts`, `client-ip.test.ts`, `auth.routes.test.ts` |
+| PAY-603 Rate limits | §4.5, §5.1, §5.2 | `security.test.ts`, `rate-limits.routes.test.ts` (`rate-limit.int.test.ts` deferred to H1, C69), `auth.routes.test.ts` |
 | PAY-604 BFF protections | §5.3–5.6, §7.3 | `body.test.ts`, `origin.test.ts`, `csp.test.ts`, `proxy.test.ts`, `headers.test.ts`, `errors.spec.ts`, CSP listener in `fixtures.ts` |
 | PAY-605 Health and startup (web part) | §1.2 `/api/livez`/`/api/readyz`, §8 startup checks (exit 2) | `config.test.ts`, `health.routes.test.ts` |
 | PAY-607 Redis ACLs (web) | §2.1 ACL, §8 Redis keys | `session.int.test.ts` |
@@ -1117,6 +1118,7 @@ Nightly runs the suite three times in a row (plan §12). No `waitForTimeout`: ev
 
 ## Change log
 
+- 2026-11-11 (F5 review fixes, web): `useFragmentToken` keeps the first token it read, so React StrictMode's second effect run (`next dev`) no longer turns a valid `/accept` or `/reset` link into "expired" (§1.4, PAY-103, PAY-105); `Dialog` wraps Tab and Shift+Tab when focus sits outside the tab order (the resolve dialog's warning heading, the container), so focus can't leave (§6.3, PAY-NFR-14); dashboard cards are labelled by `useId()` headings instead of IDs with spaces; `SettingsBody.timezone` checks format and length only (1–64), leaving the zone check to payroll (§2.3, PAY-200); `/api/users` and `/api/audit/auth` use `IdentityListQuery` (cursor ≤ 64, identity's limit; §2.3); the unused Zod `ErrorBody` and the unused `RoleGate` were removed (§1.4, §2.4, §6.1); reset confirm and logout log `session.backend_error` at error and count `bff_session_backend_errors_total` (§7.1, §7.2); §1.4, §6.1, §6.3 and §9 now name the files as built (no Radix, no toasts, no `run-header`/`run-actions`/`payslips-tab`/`attempt-history`/`money.tsx`/`data-table.tsx`/`confirm-dialog.tsx`, `audit/audit-page.tsx`), and the real-Redis rate-limit and session int tests are marked deferred to H1.
 - 2026-11-11 (F6 e2e fixes, web): the approve confirmation is now a `Dialog` (`alertdialog`, title "Confirm approval") with the Approve button kept mounted, so focus moves in, Escape closes it and focus returns to Approve (§6.3, PAY-NFR-14); the employee, settings and invite forms commit field errors with `flushSync` before `focusFirstInvalid`, so after a server-side field error (e.g. 409 `employee_email_taken`) focus lands on the field (§6.3); `/pay-runs/new` fills `{biweekly_anchor}` into the biweekly `invalid_period_start` message from the settings it already loads, as §3.3 says (the BFF text, which has no anchor, stands when settings are unavailable).
 - 2026-11-11 (F5, web complete): every remaining BFF route of §3.2 (accept, reset request and confirm, users, invite, user PATCH with revocation, resend, settings, employees, run DELETE, hours, payslip detail, retry, resolve, both audit routes) and every page of §6.2 (`/accept`, `/reset`, `/employees`, `/employees/new`, `/employees/[id]`, `/settings`, `/users`, `/audit`, the dashboard cards, both schedules on `/pay-runs/new`, and on the run page the hours editor, payslip dialog, delete, payouts filter and history, retry and resolve). Recorded as built: no shadcn/Radix or react-hook-form (§1.4: local `Dialog`, `TabList` and `field.tsx` with the same accessibility contract; inline notices instead of toasts); reset confirm returns 204 even when the revoke hits a Redis error (§3.2, as user PATCH); reset request maps identity's empty 202 (C68) to `{}`; `/login?reset=1` shows the "Password changed" notice; the hours editor sends only rows whose parsed value changed; the rate-limit int test is replaced by a production-value pipeline test on the fake store (§9.1). No contract change was needed: every route matches `services/*/openapi.json`. Not forwarded, as §3.3 says: payroll's `pay_run_exists` `details.pay_run_id` (the create page finds the run in the list instead) and the payroll audit filters (`entity_type`, `entity_id`, `event`).
 - 2026-11-11: folded C62 (S7 follow-ups) and the web part of C63 into the body: §1 module list, §2.1 ACL, §3.1–§3.4.2 (no connect-timeout key, `release()`, `unsupported_media_type`/`conflict`, `/api/auth/me` 503 while deferred, telemetry outside the session budget), §4.3 (signatures; re-check outcomes per C63), §5.2 (the R36 result and formula), §5.5 (`/api/*` not gated), §5.6 (HSTS in `proxy.ts`), §6.2 (`safeNext`), §6.3 (tabs), §7.1 (OTel logs bridge, exact allow-list, real field names), §7.4, §7.5, §8, §9.1 (int-test deferral and file layout).

@@ -67,6 +67,18 @@ describe("GET /api/users", () => {
       { field: "query.cursor", issue: "invalid_format" },
     ]);
   });
+
+  // PAY-602, C8: identity caps /v1/users cursors at 64 characters; the BFF matches.
+  it("rejects a cursor longer than identity's 64", async () => {
+    const cookie = await signIn();
+    const res = await listUsers(
+      makeReq(`/api/users?cursor=${"c".repeat(65)}`, { cookie }),
+      params(),
+    );
+    expect(res.status).toBe(422);
+    expect((await errorOf(res)).details).toEqual([{ field: "query.cursor", issue: "too_big" }]);
+    expect(seen).toHaveLength(0);
+  });
 });
 
 describe("POST /api/users/invite", () => {

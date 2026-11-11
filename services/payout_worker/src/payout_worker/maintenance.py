@@ -43,6 +43,12 @@ def _text(value: Any) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
+def _lost_stream_or_group(exc: ResponseError) -> bool:
+    """NOGROUP (no group) or ``ERR no such key`` (no stream; redis-py strips the ``ERR``)."""
+    message = str(exc)
+    return message.startswith("NOGROUP") or "no such key" in message.lower()
+
+
 async def prune_consumers(redis: Redis, settings: Settings) -> int:
     """Delete idle consumers that hold no pending entries; returns the number deleted.
 
@@ -51,14 +57,18 @@ async def prune_consumers(redis: Redis, settings: Settings) -> int:
     redelivered); XAUTOCLAIM moves those entries to a live consumer first, and a later tick
     deletes the emptied one. XAUTOCLAIM only ever moves entries *to* the claimer, so an idle
     consumer can't gain entries between the XINFO and the DELCONSUMER. A lost stream or group
-    (NOGROUP, no such key) means nothing to prune.
+    (NOGROUP, no such key) means nothing to prune; any other error, notably ``NoPermissionError``
+    (a ``ResponseError`` subclass) for a missing ``+xinfo`` grant, propagates so the runner logs
+    ``maintenance.task.failed``.
     """
     stream, group = settings.payout_stream, settings.payout_group
     threshold_ms = settings.payout_consumer_gc_idle_s * 1000
     try:
         consumers: Any = await redis.xinfo_consumers(stream, group)
-    except ResponseError:
-        return 0
+    except ResponseError as exc:
+        if _lost_stream_or_group(exc):
+            return 0
+        raise
     deleted = 0
     for c in consumers:
         name = _text(c.get("name", ""))

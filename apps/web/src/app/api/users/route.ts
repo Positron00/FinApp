@@ -1,6 +1,6 @@
 import { callService } from "@/lib/api/call";
 import { json, methodNotAllowed, route } from "@/lib/route";
-import { ListQuery } from "@/lib/schemas/requests";
+import { IdentityListQuery } from "@/lib/schemas/requests";
 import { Page, User } from "@/lib/schemas/responses";
 
 const NAME = "/api/users";
@@ -13,7 +13,7 @@ const ALLOWED = ["GET"];
 export const GET = route({
   name: NAME,
   auth: { roles: ["admin"] },
-  query: ListQuery,
+  query: IdentityListQuery,
   async handler({ query, identity }) {
     const page = await callService(
       "identity",

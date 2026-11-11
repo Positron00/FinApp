@@ -8,10 +8,11 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from identity.api.deps import ActorUser, admin_actor
 from identity.domain.ip import ip_hash
 from pycommon.testing import JsonLogCapture
 
-from tests.helpers import AUDIT_KEY, passphrase
+from tests.helpers import AUDIT_KEY, COMPANY_ID, passphrase
 from tests.integration.conftest import CLIENT_IP, Harness, HarnessFactory, token_in
 
 PW = passphrase()
@@ -182,6 +183,8 @@ async def test_deactivating_a_pending_user_revokes_the_invite(
         assert (r.json()["status"], r.json()["pending_invite_id"]) == ("inactive", None)
         r = await h.client.post(f"/v1/invites/{invite_id}/resend", headers=h.admin_headers(admin))
         assert (r.status_code, r.json()["error"]["code"]) == (409, "invite_not_pending")
+        # PAY-602: the message fits a deactivated user too (it never accepted an invite).
+        assert r.json()["error"]["message"] == "This user is no longer waiting for an invite."
     assert await admin_db.fetchval("SELECT status FROM identity.invites") == "revoked"
     assert await admin_db.fetchval("SELECT status FROM identity.email_outbox") == "cancelled"
     [log] = caplog_json.events("user.deactivated")
@@ -231,11 +234,12 @@ async def test_self_and_unknown_targets(
 
 
 async def test_two_admins_demoting_each_other_never_leave_zero_admins(
-    harness: HarnessFactory, admin_db: Any
+    harness: HarnessFactory, admin_db: Any, caplog_json: JsonLogCapture
 ) -> None:
-    """PAY-108: two admins demote (or deactivate) each other at once: the admin set is locked
-    first, so one wins (200) and the other is refused (403, no longer an admin), and one
-    active admin always remains."""
+    """PAY-108, PAY-601: two admins demote (or deactivate) each other at once: the admin set is
+    locked first, so one wins (200) and the other is refused (403, no longer an admin), and one
+    active admin always remains. The refusal logs auth.forbidden with the same route label
+    whether admin_actor or the in-transaction re-check caught it."""
     for i, body in enumerate(({"roles": ["approver"]}, {"status": "inactive"})):
         async with harness() as h:
             a = await h.create_user(f"a{i}@example.com", password=PW)
@@ -247,6 +251,8 @@ async def test_two_admins_demoting_each_other_never_leave_zero_admins(
         )
         assert admins == 1
         await admin_db.execute("TRUNCATE identity.users CASCADE")
+    denied = [(e["reason"], e["route"]) for e in caplog_json.events("auth.forbidden")]
+    assert denied == [("db_role", "/v1/users/{id:uuid}")] * 2
 
 
 async def test_actor_demoted_in_the_db_is_403(harness: HarnessFactory) -> None:
@@ -258,6 +264,22 @@ async def test_actor_demoted_in_the_db_is_403(harness: HarnessFactory) -> None:
         assert (await h.patch_user(a, b, {"roles": ["approver"]})).status_code == 200
         r = await h.patch_user(b, c, {"roles": ["admin"]})
         assert (r.status_code, r.json()["error"]["code"]) == (403, "forbidden_role")
+
+
+async def test_in_transaction_recheck_is_403_with_the_route_label(
+    harness: HarnessFactory, caplog_json: JsonLogCapture
+) -> None:
+    """PAY-108, PAY-601: when admin_actor's read is stale (the actor lost admin before the
+    PATCH transaction locked the admin set), the in-transaction re-check refuses with 403 and
+    logs auth.forbidden with admin_actor's route label."""
+    async with harness() as h:
+        stale = await h.create_user("st@example.com", password=PW, roles=("approver",))
+        target = await h.create_user("t@example.com", roles=("approver",))
+        h.app.dependency_overrides[admin_actor] = lambda: ActorUser(stale, COMPANY_ID)
+        r = await h.patch_user(stale, target, {"status": "inactive"})
+        assert (r.status_code, r.json()["error"]["code"]) == (403, "forbidden_role")
+    denied = [(e["reason"], e["route"]) for e in caplog_json.events("auth.forbidden")]
+    assert denied == [("db_role", "/v1/users/{id:uuid}")]
 
 
 async def test_last_admin_rule_when_the_target_is_the_only_other_admin(

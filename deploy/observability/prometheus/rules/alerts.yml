@@ -49,6 +49,14 @@ groups:
           description: "{{ $value }} payout attempt(s) are blocked in needs_operator. Check the bank for each before choosing Send again or Mark rejected."
           runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutNeedsOperator.md"
           dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
+      - alert: PayoutLateSettlement
+        expr: "increase(payroll_late_settlements_total[15m]) > 0"
+        labels: { severity: page, service_name: payroll }
+        annotations:
+          summary: "The bank settled a payout attempt that payroll had already rejected or replaced"
+          description: "{{ $value }} late settled answer(s) in the last 15 minutes: an employee may have been paid twice. Find the payout.late_settlement audit row, check the bank for every attempt's key, then recall or record."
+          runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutLateSettlement.md"
+          dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
       - alert: PayoutsStuck
         expr: "max(payroll_payouts_stuck) > 0"
         for: 10m

@@ -120,7 +120,8 @@ def test_pay_run_mutation_error_codes_are_documented(spec: dict[str, Any]) -> No
 def test_retry_and_resolve_contract(spec: dict[str, Any]) -> None:
     """PAY-500, PAY-502, C34, C52, C48: retry takes an optional, pattern-checked Idempotency-Key
     and documents 404 and 409 (no 400: the key is optional and there is no body); resolve takes
-    ResolveIn (action enum, note 1-500) and documents 400, 404 and 409 (resolve_too_early)."""
+    ResolveIn (action enum, note 1-500) and documents 400, 404 and 409 (resolve_too_early) with
+    its Retry-After header (integer seconds); retry's 409 has no Retry-After."""
     retry = spec["paths"]["/v1/pay-runs/{run_id}/payouts/{payout_id}/retry"]["post"]
     [header] = [p for p in retry["parameters"] if p["in"] == "header"]
     assert (header["name"], header.get("required", False)) == ("Idempotency-Key", False)
@@ -128,6 +129,9 @@ def test_retry_and_resolve_contract(spec: dict[str, Any]) -> None:
     assert {"404", "409"} <= set(retry["responses"])
     resolve = spec["paths"]["/v1/pay-runs/{run_id}/payouts/{payout_id}/resolve"]["post"]
     assert {"400", "404", "409", "422"} <= set(resolve["responses"])
+    retry_after = resolve["responses"]["409"]["headers"]["Retry-After"]
+    assert retry_after["schema"] == {"type": "integer", "minimum": 1}
+    assert "headers" not in retry["responses"]["409"]
     schema = spec["components"]["schemas"]["ResolveIn"]
     assert schema["required"] == ["action", "note"]
     assert schema["additionalProperties"] is False

@@ -30,7 +30,9 @@ defaults:
 jobs:
   load:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    # Nominal ~55 min (bake, stack up, 500 seed, full 11 min, soak 30 min, settlement <= ~15 min)
+    # plus slack, so a slow night fails a check instead of being killed before the summary.
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -83,7 +85,8 @@ jobs:
 
   e2e-repeat:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    # Three full e2e.sh runs on fresh stacks: three times the PR e2e job's 40 min budget.
+    timeout-minutes: 120
     env:
       PLAYWRIGHT_SKIP_INSTALL: "1"
     steps:

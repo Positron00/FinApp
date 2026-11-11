@@ -79,3 +79,13 @@ def test_republished_counter_name(otel_memory: OtelMemory) -> None:
     assert otel_memory.metric_points("payroll_payouts_republished") == [({}, 1)]
     assert otel_memory.metric_unit("payroll_payouts_republished") == "{event}"
     assert metrics_mod.STATS_REUSE_S > 0
+
+
+def test_late_settlements_counter_is_pre_initialised(otel_memory: OtelMemory) -> None:
+    """PAY-NFR-02, C21: payroll_late_settlements (Prometheus adds _total) exists at 0 from the
+    start, so the PayoutLateSettlement alert's increase() sees the first late settlement."""
+    m = Metrics.create()
+    assert otel_memory.metric_points("payroll_late_settlements") == [({}, 0)]
+    assert otel_memory.metric_unit("payroll_late_settlements") == "{attempt}"
+    m.late_settlement()
+    assert otel_memory.metric_points("payroll_late_settlements") == [({}, 1)]

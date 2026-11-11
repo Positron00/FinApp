@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import hashlib
 import math
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Final
 
 import redis.exceptions
+from opentelemetry.trace import Span
 from pycommon import Clock, SystemClock
 from pycommon.errors import ServiceUnavailable
+from pycommon.otel import tracer
 from pycommon.ratelimit import FailMode, Limit, RateLimiter
 from redis.asyncio import Redis
 
@@ -150,16 +153,30 @@ class AuthLimits:
             self._backend_error(exc)
 
     async def check_accept(self, ip_subject: str) -> int | None:
-        """``accept_ip`` (R18); the ``Retry-After`` seconds when denied, else ``None``."""
-        decision = await self.accept.hit(self.accept_ip, ip_subject)
+        """``accept_ip`` (R18); the ``Retry-After`` seconds when denied, else ``None``.
+
+        Used by invite accept and reset confirm; traced as ``identity.ratelimit.check`` (§5.3).
+        """
+        with _check_span("accept") as span:
+            decision = await self.accept.hit(self.accept_ip, ip_subject)
+            span.set_attribute("identity.allowed", decision.allowed)
         return None if decision.allowed else decision.retry_after_s
 
     async def check_reset(self, ip_subject: str, ek: str) -> int | None:
         """``reset_ip`` then ``reset_account`` (§6.4); ``Retry-After`` when denied."""
-        decision = await self.reset.hit(self.reset_ip, ip_subject)
-        if decision.allowed:
-            decision = await self.reset.hit(self.reset_account, ek)
+        with _check_span("reset") as span:
+            decision = await self.reset.hit(self.reset_ip, ip_subject)
+            if decision.allowed:
+                decision = await self.reset.hit(self.reset_account, ek)
+            span.set_attribute("identity.allowed", decision.allowed)
         return None if decision.allowed else decision.retry_after_s
+
+
+def _check_span(component: str) -> AbstractContextManager[Span]:
+    """The ``identity.ratelimit.check`` span (§5.3); login opens its own in ``usecases/signin``."""
+    return tracer("identity").start_as_current_span(
+        "identity.ratelimit.check", attributes={"identity.component": component}
+    )
 
 
 def _ceil_s(pttl_ms: int) -> int:

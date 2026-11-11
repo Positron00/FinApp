@@ -55,10 +55,14 @@ export function Dialog({
     if (items.length === 0) return;
     const firstEl = items[0]!;
     const lastEl = items[items.length - 1]!;
-    if (e.shiftKey && document.activeElement === firstEl) {
+    const active = document.activeElement as HTMLElement | null;
+    // Focus on something outside the tab order (the container, a `tabIndex={-1}` heading as the
+    // resolve dialog's initial focus) would let Tab leave the dialog: wrap it in as well.
+    const outside = active === null || !items.includes(active);
+    if (e.shiftKey && (outside || active === firstEl)) {
       e.preventDefault();
       lastEl.focus();
-    } else if (!e.shiftKey && document.activeElement === lastEl) {
+    } else if (!e.shiftKey && (outside || active === lastEl)) {
       e.preventDefault();
       firstEl.focus();
     }
