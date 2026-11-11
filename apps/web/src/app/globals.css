@@ -1,0 +1,17 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink: #1f2933;
+  --color-muted: #52606d;
+  --color-brand: #1d4ed8;
+  --color-danger: #b91c1c;
+  --color-ok: #166534;
+  --color-warn: #92400e;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}

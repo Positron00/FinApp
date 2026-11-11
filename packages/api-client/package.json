@@ -1,0 +1,21 @@
+{
+  "name": "@payrun/api-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Types generated from the service OpenAPI specs, plus openapi-fetch client factories",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "generate": "openapi-typescript ../../services/identity/openapi.json -o src/generated/identity.ts && openapi-typescript ../../services/payroll/openapi.json -o src/generated/payroll.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "openapi-fetch": "0.17.0"
+  },
+  "devDependencies": {
+    "openapi-typescript": "7.13.0",
+    "typescript": "6.0.3"
+  }
+}

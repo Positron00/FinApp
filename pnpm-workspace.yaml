@@ -4,3 +4,7 @@ packages:
 
 # Two-week rule: only install versions published at least 14 days ago (minutes).
 minimumReleaseAge: 20160
+
+# Native build scripts we do not need (ESLint resolver ships prebuilt binaries).
+ignoredBuiltDependencies:
+  - unrs-resolver

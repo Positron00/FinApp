@@ -1,0 +1,2 @@
+# The root .gitignore anchors /coverage at the repo root only.
+coverage/
