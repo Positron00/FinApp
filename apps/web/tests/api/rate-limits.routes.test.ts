@@ -10,8 +10,8 @@ import type { t as State } from "../helpers/state";
  * PAY-603 at the production values (web LLD §5.1, §9.1 `rate-limit.int.test.ts`): 120 requests
  * a minute per session and 300 per IP; the 121st and 301st are 429 with `Retry-After`. Two
  * "replicas" (fresh module graphs) share one store, so they share counts. The store here is the
- * in-memory fake behind the same `RedisLike` port; the Testcontainers variant needs the
- * `testcontainers` dev dependency, which isn't in the workspace yet.
+ * in-memory fake behind the same `RedisLike` port; the real-Redis variant (Testcontainers) is
+ * tests/lib/rate-limit.int.test.ts.
  */
 setupMsw();
 

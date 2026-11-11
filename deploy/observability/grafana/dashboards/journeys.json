@@ -1,0 +1,2063 @@
+{
+  "uid": "payrun-journeys",
+  "title": "Journeys",
+  "tags": ["payrun"],
+  "timezone": "utc",
+  "editable": false,
+  "schemaVersion": 41,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "description": "The SLOs and one row per journey J1-J5 at its BFF routes: success, p95 latency and burn rate (platform LLD \u00a78.8; PAY-NFR-04, 05, 06).",
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": [
+      {
+        "name": "Firing alerts",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "enable": true,
+        "iconColor": "red",
+        "expr": "ALERTS{alertstate=\"firing\"}",
+        "titleFormat": "{{alertname}}",
+        "textFormat": "{{severity}}",
+        "step": "60s",
+        "useValueForTime": false
+      }
+    ]
+  },
+  "links": [
+    {
+      "type": "dashboards",
+      "tags": ["payrun"],
+      "asDropdown": true,
+      "title": "PayRun dashboards",
+      "includeVars": false,
+      "keepTime": true
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "SLO (PAY-NFR-04, 05, 06; budget 0.005; ADR 0012)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Availability, 30 days",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.99
+              },
+              {
+                "color": "green",
+                "value": 0.995
+              }
+            ]
+          },
+          "decimals": 3
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "1 - avg_over_time(sli:bff_errors:ratio_rate1h[30d])",
+          "legendFormat": "availability",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "description": "Non-5xx share of J1-J5 BFF requests (health and telemetry routes excluded, C4). Target 99.5%.",
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 4,
+        "h": 8
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Error budget remaining, 30 days",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.25
+              },
+              {
+                "color": "green",
+                "value": 0.5
+              }
+            ]
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "1 - avg_over_time(sli:bff_errors:ratio_rate1h[30d]) / 0.005",
+          "legendFormat": "budget",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "description": "1 - (30-day error ratio / 0.005). Below 0 means the SLO is missed for the window.",
+      "gridPos": {
+        "x": 4,
+        "y": 1,
+        "w": 4,
+        "h": 8
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Burn rate (1 h, 6 h, 5 m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "x",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 14.4
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sli:bff_errors:ratio_rate1h / 0.005",
+          "legendFormat": "1 h",
+          "range": true,
+          "exemplar": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "B",
+          "expr": "sli:bff_errors:ratio_rate6h / 0.005",
+          "legendFormat": "6 h",
+          "range": true,
+          "exemplar": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "C",
+          "expr": "sli:bff_errors:ratio_rate5m / 0.005",
+          "legendFormat": "5 m",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "description": "Error ratio / 0.005. BffAvailabilityFastBurn pages when 1 h and 5 m are both above 14.4 (line); BffAvailabilitySlowBurn opens a ticket when 6 h and 30 m are above 6.",
+      "gridPos": {
+        "x": 8,
+        "y": 1,
+        "w": 16,
+        "h": 8
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "p95 latency: reads and simple writes",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.3
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sli:bff_latency_p95:5m",
+          "legendFormat": "p95",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "description": "sli:bff_latency_p95:5m against the 300 ms objective (PAY-NFR-05).",
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "p95 latency: calculate and approve",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1.5
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sli:bff_latency_heavy_p95:5m",
+          "legendFormat": "p95 heavy",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "description": "sli:bff_latency_heavy_p95:5m against the 1.5 s objective (PAY-NFR-05).",
+      "gridPos": {
+        "x": 8,
+        "y": 9,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "p95 settlement time (approve to final)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 60
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sli:payout_settlement_p95:1h",
+          "legendFormat": "p95 settlement",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "description": "sli:payout_settlement_p95:1h against the 60 s objective (PAY-NFR-06).",
+      "gridPos": {
+        "x": 16,
+        "y": 9,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "J1 Access (invite, accept, sign in, sign out, reset)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Success (non-5xx) by route",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0.995
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum by (route) (rate(bff_request_duration_seconds_count{route=~\"/api/users/invite|/api/invites/[^/]+/resend|/api/auth/accept|/api/auth/login|/api/auth/logout|/api/auth/me|/api/auth/reset/request|/api/auth/reset/confirm|/api/users|/api/users/[^/]+|/api/audit/auth\",status!~\"5..\"}[$__rate_interval])) / sum by (route) (rate(bff_request_duration_seconds_count{route=~\"/api/users/invite|/api/invites/[^/]+/resend|/api/auth/accept|/api/auth/login|/api/auth/logout|/api/auth/me|/api/auth/reset/request|/api/auth/reset/confirm|/api/users|/api/users/[^/]+|/api/audit/auth\"}[$__rate_interval]))",
+          "legendFormat": "{{route}}",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "description": "The share of non-5xx responses per BFF route of this journey; it starts at /api/auth/login. 4xx count as success, as in the SLI.",
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "p95 latency by route",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.3
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, route) (rate(bff_request_duration_seconds_bucket{route=~\"/api/users/invite|/api/invites/[^/]+/resend|/api/auth/accept|/api/auth/login|/api/auth/logout|/api/auth/me|/api/auth/reset/request|/api/auth/reset/confirm|/api/users|/api/users/[^/]+|/api/audit/auth\"}[$__rate_interval])))",
+          "legendFormat": "{{route}}",
+          "range": true,
+          "exemplar": true
+        }
+      ],
+      "description": "bff_request_duration_seconds p95. Exemplars link to the trace in Tempo.",
+      "gridPos": {
+        "x": 8,
+        "y": 18,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Burn rate (journey routes)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "x",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 14.4
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "(sum(rate(bff_request_duration_seconds_count{route=~\"/api/users/invite|/api/invites/[^/]+/resend|/api/auth/accept|/api/auth/login|/api/auth/logout|/api/auth/me|/api/auth/reset/request|/api/auth/reset/confirm|/api/users|/api/users/[^/]+|/api/audit/auth\",status=~\"5..\"}[1h])) / sum(rate(bff_request_duration_seconds_count{route=~\"/api/users/invite|/api/invites/[^/]+/resend|/api/auth/accept|/api/auth/login|/api/auth/logout|/api/auth/me|/api/auth/reset/request|/api/auth/reset/confirm|/api/users|/api/users/[^/]+|/api/audit/auth\"}[1h]))) / 0.005",
+          "legendFormat": "1 h",
+          "range": true,
+          "exemplar": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "B",
+          "expr": "(sum(rate(bff_request_duration_seconds_count{route=~\"/api/users/invite|/api/invites/[^/]+/resend|/api/auth/accept|/api/auth/login|/api/auth/logout|/api/auth/me|/api/auth/reset/request|/api/auth/reset/confirm|/api/users|/api/users/[^/]+|/api/audit/auth\",status=~\"5..\"}[5m])) / sum(rate(bff_request_duration_seconds_count{route=~\"/api/users/invite|/api/invites/[^/]+/resend|/api/auth/accept|/api/auth/login|/api/auth/logout|/api/auth/me|/api/auth/reset/request|/api/auth/reset/confirm|/api/users|/api/users/[^/]+|/api/audit/auth\"}[5m]))) / 0.005",
+          "legendFormat": "5 m",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "description": "This journey's 5xx ratio / 0.005 over 1 h and 5 m; the paging threshold of the BFF-wide alert is 14.4.",
+      "gridPos": {
+        "x": 16,
+        "y": 18,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Sign-ins by outcome",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum by (outcome) (increase(auth_signins_total{service_name=\"identity\"}[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "description": "auth_signins_total: success, failure, rate_limited (C19).",
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Sessions created and revoked",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum by (via) (increase(bff_sessions_created_total[$__rate_interval]))",
+          "legendFormat": "created via {{via}}",
+          "range": true,
+          "exemplar": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "B",
+          "expr": "sum by (reason) (increase(bff_sessions_revoked_total[$__rate_interval]))",
+          "legendFormat": "revoked: {{reason}}",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "gridPos": {
+        "x": 12,
+        "y": 26,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "id": 14,
+      "type": "row",
+      "title": "J2 Company setup (settings, employees)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Success (non-5xx) by route",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0.995
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum by (route) (rate(bff_request_duration_seconds_count{route=~\"/api/settings|/api/employees|/api/employees/[^/]+|/api/audit/payroll\",status!~\"5..\"}[$__rate_interval])) / sum by (route) (rate(bff_request_duration_seconds_count{route=~\"/api/settings|/api/employees|/api/employees/[^/]+|/api/audit/payroll\"}[$__rate_interval]))",
+          "legendFormat": "{{route}}",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "description": "The share of non-5xx responses per BFF route of this journey; it starts at /api/employees. 4xx count as success, as in the SLI.",
+      "gridPos": {
+        "x": 0,
+        "y": 35,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "p95 latency by route",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.3
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, route) (rate(bff_request_duration_seconds_bucket{route=~\"/api/settings|/api/employees|/api/employees/[^/]+|/api/audit/payroll\"}[$__rate_interval])))",
+          "legendFormat": "{{route}}",
+          "range": true,
+          "exemplar": true
+        }
+      ],
+      "description": "bff_request_duration_seconds p95. Exemplars link to the trace in Tempo.",
+      "gridPos": {
+        "x": 8,
+        "y": 35,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Burn rate (journey routes)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "x",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 14.4
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "(sum(rate(bff_request_duration_seconds_count{route=~\"/api/settings|/api/employees|/api/employees/[^/]+|/api/audit/payroll\",status=~\"5..\"}[1h])) / sum(rate(bff_request_duration_seconds_count{route=~\"/api/settings|/api/employees|/api/employees/[^/]+|/api/audit/payroll\"}[1h]))) / 0.005",
+          "legendFormat": "1 h",
+          "range": true,
+          "exemplar": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "B",
+          "expr": "(sum(rate(bff_request_duration_seconds_count{route=~\"/api/settings|/api/employees|/api/employees/[^/]+|/api/audit/payroll\",status=~\"5..\"}[5m])) / sum(rate(bff_request_duration_seconds_count{route=~\"/api/settings|/api/employees|/api/employees/[^/]+|/api/audit/payroll\"}[5m]))) / 0.005",
+          "legendFormat": "5 m",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "description": "This journey's 5xx ratio / 0.005 over 1 h and 5 m; the paging threshold of the BFF-wide alert is 14.4.",
+      "gridPos": {
+        "x": 16,
+        "y": 35,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 18,
+      "type": "row",
+      "title": "J3 Prepare a pay run (create, hours, calculate, review)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 43,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Success (non-5xx) by route",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0.995
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum by (route) (rate(bff_request_duration_seconds_count{route=~\"/api/pay-runs|/api/pay-runs/[^/]+/hours|/api/pay-runs/[^/]+/calculate|/api/pay-runs/[^/]+/payslips|/api/pay-runs/[^/]+/payslips/[^/]+\",status!~\"5..\"}[$__rate_interval])) / sum by (route) (rate(bff_request_duration_seconds_count{route=~\"/api/pay-runs|/api/pay-runs/[^/]+/hours|/api/pay-runs/[^/]+/calculate|/api/pay-runs/[^/]+/payslips|/api/pay-runs/[^/]+/payslips/[^/]+\"}[$__rate_interval]))",
+          "legendFormat": "{{route}}",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "description": "The share of non-5xx responses per BFF route of this journey; it starts at /api/pay-runs. 4xx count as success, as in the SLI.",
+      "gridPos": {
+        "x": 0,
+        "y": 44,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "p95 latency by route",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1.5
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, route) (rate(bff_request_duration_seconds_bucket{route=~\"/api/pay-runs|/api/pay-runs/[^/]+/hours|/api/pay-runs/[^/]+/calculate|/api/pay-runs/[^/]+/payslips|/api/pay-runs/[^/]+/payslips/[^/]+\"}[$__rate_interval])))",
+          "legendFormat": "{{route}}",
+          "range": true,
+          "exemplar": true
+        }
+      ],
+      "description": "bff_request_duration_seconds p95. Exemplars link to the trace in Tempo.",
+      "gridPos": {
+        "x": 8,
+        "y": 44,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Burn rate (journey routes)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "x",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 14.4
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "(sum(rate(bff_request_duration_seconds_count{route=~\"/api/pay-runs|/api/pay-runs/[^/]+/hours|/api/pay-runs/[^/]+/calculate|/api/pay-runs/[^/]+/payslips|/api/pay-runs/[^/]+/payslips/[^/]+\",status=~\"5..\"}[1h])) / sum(rate(bff_request_duration_seconds_count{route=~\"/api/pay-runs|/api/pay-runs/[^/]+/hours|/api/pay-runs/[^/]+/calculate|/api/pay-runs/[^/]+/payslips|/api/pay-runs/[^/]+/payslips/[^/]+\"}[1h]))) / 0.005",
+          "legendFormat": "1 h",
+          "range": true,
+          "exemplar": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "B",
+          "expr": "(sum(rate(bff_request_duration_seconds_count{route=~\"/api/pay-runs|/api/pay-runs/[^/]+/hours|/api/pay-runs/[^/]+/calculate|/api/pay-runs/[^/]+/payslips|/api/pay-runs/[^/]+/payslips/[^/]+\",status=~\"5..\"}[5m])) / sum(rate(bff_request_duration_seconds_count{route=~\"/api/pay-runs|/api/pay-runs/[^/]+/hours|/api/pay-runs/[^/]+/calculate|/api/pay-runs/[^/]+/payslips|/api/pay-runs/[^/]+/payslips/[^/]+\"}[5m]))) / 0.005",
+          "legendFormat": "5 m",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "description": "This journey's 5xx ratio / 0.005 over 1 h and 5 m; the paging threshold of the BFF-wide alert is 14.4.",
+      "gridPos": {
+        "x": 16,
+        "y": 44,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Runs calculated",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(increase(payroll_pay_runs_total{outcome=\"calculated\"}[$__rate_interval]))",
+          "legendFormat": "calculated",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 52,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "id": 23,
+      "type": "row",
+      "title": "J4 Approve and pay (approve, progress)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 60,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Success (non-5xx) by route",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0.995
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum by (route) (rate(bff_request_duration_seconds_count{route=~\"/api/pay-runs/[^/]+/approve|/api/pay-runs/[^/]+|/api/pay-runs/[^/]+/payouts\",status!~\"5..\"}[$__rate_interval])) / sum by (route) (rate(bff_request_duration_seconds_count{route=~\"/api/pay-runs/[^/]+/approve|/api/pay-runs/[^/]+|/api/pay-runs/[^/]+/payouts\"}[$__rate_interval]))",
+          "legendFormat": "{{route}}",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "description": "The share of non-5xx responses per BFF route of this journey; it starts at /api/pay-runs/[id]/approve. 4xx count as success, as in the SLI.",
+      "gridPos": {
+        "x": 0,
+        "y": 61,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "p95 latency by route",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1.5
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, route) (rate(bff_request_duration_seconds_bucket{route=~\"/api/pay-runs/[^/]+/approve|/api/pay-runs/[^/]+|/api/pay-runs/[^/]+/payouts\"}[$__rate_interval])))",
+          "legendFormat": "{{route}}",
+          "range": true,
+          "exemplar": true
+        }
+      ],
+      "description": "bff_request_duration_seconds p95. Exemplars link to the trace in Tempo.",
+      "gridPos": {
+        "x": 8,
+        "y": 61,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Burn rate (journey routes)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "x",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 14.4
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "(sum(rate(bff_request_duration_seconds_count{route=~\"/api/pay-runs/[^/]+/approve|/api/pay-runs/[^/]+|/api/pay-runs/[^/]+/payouts\",status=~\"5..\"}[1h])) / sum(rate(bff_request_duration_seconds_count{route=~\"/api/pay-runs/[^/]+/approve|/api/pay-runs/[^/]+|/api/pay-runs/[^/]+/payouts\"}[1h]))) / 0.005",
+          "legendFormat": "1 h",
+          "range": true,
+          "exemplar": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "B",
+          "expr": "(sum(rate(bff_request_duration_seconds_count{route=~\"/api/pay-runs/[^/]+/approve|/api/pay-runs/[^/]+|/api/pay-runs/[^/]+/payouts\",status=~\"5..\"}[5m])) / sum(rate(bff_request_duration_seconds_count{route=~\"/api/pay-runs/[^/]+/approve|/api/pay-runs/[^/]+|/api/pay-runs/[^/]+/payouts\"}[5m]))) / 0.005",
+          "legendFormat": "5 m",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "description": "This journey's 5xx ratio / 0.005 over 1 h and 5 m; the paging threshold of the BFF-wide alert is 14.4.",
+      "gridPos": {
+        "x": 16,
+        "y": 61,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Pay runs by outcome",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum by (outcome) (increase(payroll_pay_runs_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 69,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "Payouts by outcome",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum by (outcome) (increase(payroll_payouts_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "gridPos": {
+        "x": 8,
+        "y": 69,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "Oldest processing run",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 60
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "max(payroll_runs_processing_oldest_age_seconds)",
+          "legendFormat": "oldest processing run",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "description": "PayoutSettlementSlow pages above 60 s for 2 minutes.",
+      "gridPos": {
+        "x": 16,
+        "y": 69,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 30,
+      "type": "heatmap",
+      "title": "Settlement time (approve to final), heatmap",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "calculate": false,
+        "yAxis": {
+          "unit": "s"
+        },
+        "color": {
+          "mode": "scheme",
+          "scheme": "Oranges"
+        },
+        "cellGap": 1,
+        "exemplars": {
+          "color": "rgba(255,0,255,0.7)"
+        },
+        "tooltip": {
+          "mode": "single",
+          "yHistogram": true
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum by (le) (increase(payroll_payout_settlement_seconds_bucket[$__rate_interval]))",
+          "legendFormat": "{{le}}",
+          "range": true,
+          "exemplar": true,
+          "format": "heatmap"
+        }
+      ],
+      "description": "payroll_payout_settlement_seconds, observed once per run.",
+      "gridPos": {
+        "x": 0,
+        "y": 77,
+        "w": 24,
+        "h": 8
+      }
+    },
+    {
+      "id": 31,
+      "type": "row",
+      "title": "J5 Recover failed payouts (retry, resolve)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 85,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Success (non-5xx) by route",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0.995
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum by (route) (rate(bff_request_duration_seconds_count{route=~\"/api/pay-runs/[^/]+/payouts/[^/]+/retry|/api/pay-runs/[^/]+/payouts/[^/]+/resolve\",status!~\"5..\"}[$__rate_interval])) / sum by (route) (rate(bff_request_duration_seconds_count{route=~\"/api/pay-runs/[^/]+/payouts/[^/]+/retry|/api/pay-runs/[^/]+/payouts/[^/]+/resolve\"}[$__rate_interval]))",
+          "legendFormat": "{{route}}",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "description": "The share of non-5xx responses per BFF route of this journey; it starts at /api/pay-runs/[id]/payouts/[payoutId]/retry. 4xx count as success, as in the SLI.",
+      "gridPos": {
+        "x": 0,
+        "y": 86,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "p95 latency by route",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.3
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, route) (rate(bff_request_duration_seconds_bucket{route=~\"/api/pay-runs/[^/]+/payouts/[^/]+/retry|/api/pay-runs/[^/]+/payouts/[^/]+/resolve\"}[$__rate_interval])))",
+          "legendFormat": "{{route}}",
+          "range": true,
+          "exemplar": true
+        }
+      ],
+      "description": "bff_request_duration_seconds p95. Exemplars link to the trace in Tempo.",
+      "gridPos": {
+        "x": 8,
+        "y": 86,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "Burn rate (journey routes)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "x",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 14.4
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "(sum(rate(bff_request_duration_seconds_count{route=~\"/api/pay-runs/[^/]+/payouts/[^/]+/retry|/api/pay-runs/[^/]+/payouts/[^/]+/resolve\",status=~\"5..\"}[1h])) / sum(rate(bff_request_duration_seconds_count{route=~\"/api/pay-runs/[^/]+/payouts/[^/]+/retry|/api/pay-runs/[^/]+/payouts/[^/]+/resolve\"}[1h]))) / 0.005",
+          "legendFormat": "1 h",
+          "range": true,
+          "exemplar": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "B",
+          "expr": "(sum(rate(bff_request_duration_seconds_count{route=~\"/api/pay-runs/[^/]+/payouts/[^/]+/retry|/api/pay-runs/[^/]+/payouts/[^/]+/resolve\",status=~\"5..\"}[5m])) / sum(rate(bff_request_duration_seconds_count{route=~\"/api/pay-runs/[^/]+/payouts/[^/]+/retry|/api/pay-runs/[^/]+/payouts/[^/]+/resolve\"}[5m]))) / 0.005",
+          "legendFormat": "5 m",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "description": "This journey's 5xx ratio / 0.005 over 1 h and 5 m; the paging threshold of the BFF-wide alert is 14.4.",
+      "gridPos": {
+        "x": 16,
+        "y": 86,
+        "w": 8,
+        "h": 8
+      }
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "Failed payouts and operator actions",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["lastNotNull", "max"]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(increase(payroll_payouts_total{outcome=\"failed\"}[$__rate_interval]))",
+          "legendFormat": "failed",
+          "range": true,
+          "exemplar": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "B",
+          "expr": "sum(increase(payroll_payouts_total{outcome=\"operator_rejected\"}[$__rate_interval]))",
+          "legendFormat": "operator rejected",
+          "range": true,
+          "exemplar": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "C",
+          "expr": "max(payroll_attempts_needs_operator)",
+          "legendFormat": "needs operator (now)",
+          "range": true,
+          "exemplar": false
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 94,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "id": 36,
+      "type": "logs",
+      "title": "Retry and resolve events",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending",
+        "enableLogDetails": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "refId": "A",
+          "expr": "{service_name=\"payroll\"} | event=~\"payout[.](retry_requested|retry_rejected|operator_resolved|resolve_rejected|late_settlement)\""
+        }
+      ],
+      "gridPos": {
+        "x": 12,
+        "y": 94,
+        "w": 12,
+        "h": 8
+      }
+    }
+  ]
+}

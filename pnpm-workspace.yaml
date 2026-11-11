@@ -8,3 +8,7 @@ minimumReleaseAge: 20160
 # Native build scripts we do not need (ESLint resolver ships prebuilt binaries).
 ignoredBuiltDependencies:
   - unrs-resolver
+  # testcontainers' optional native deps (docker-modem ssh transport, protobuf): unused here
+  - cpu-features
+  - ssh2
+  - protobufjs

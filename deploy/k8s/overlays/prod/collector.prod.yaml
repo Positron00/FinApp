@@ -52,7 +52,9 @@ exporters:
     enable_open_metrics: true # exemplars
     resource_constant_labels:
       included: ["service.name", "deployment.environment.name"]
-    metric_expiration: 10m
+    # 2m (C72): gauges export every 15 s; a restarted process's stale series must drop fast or
+    # max()-based paging alerts (PayoutsStuck, PayoutNeedsOperator, …) linger ~10 min after recovery.
+    metric_expiration: 2m
 
 service:
   extensions: [health_check]

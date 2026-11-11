@@ -13,7 +13,8 @@
 #      role changes, errors, the trace test and axe; web LLD §9.2).
 #   4. Both suites: tests/platform/test_seed.py -m stack (PAY-609), k6 smoke, Schemathesis per
 #      service (after Playwright and k6: its stateful phase deletes and changes seeded data; C65),
-#      the PR fault smoke tests (tests/resilience -m smoke, C38), check_metrics.sh. The seed tests
+#      the PR fault smoke tests (tests/resilience -m smoke, C38: slow DB and identity down; the
+#      other faults run nightly in nightly-resilience.sh), check_metrics.sh. The seed tests
 #      and the fault smoke must run every test: a skip (stack or summary missing) fails the job.
 # On failure the Compose logs go to ci-logs/compose.log; the stack is always torn down with -v.
 # shellcheck source=scripts/ci/lib.sh disable=SC1091  # followed with -x; single-file runs (pre-commit) cannot

@@ -6,8 +6,9 @@ worker becomes its child (PAY-NFR-09). ``mark_sent``/``mark_failed`` end the spa
 
 With ``validate`` on (``PAYROLL_VALIDATE_EVENTS``), the envelope is re-validated against the JSON
 Schema after the traceparent rewrite (C60, C63). An invalid row is never published: it is marked
-failed (``relay_attempts``, ``last_error``), logged as ``outbox.relay.error`` and left unsent, so
-``OutboxStuck`` fires, while the rest of the batch still goes out. Re-publish then moves the
+failed (``relay_attempts``, ``last_error``), logged as ``outbox.relay.error`` once and left
+unsent, so ``OutboxStuck`` fires, while the rest of the batch still goes out. ``claim_unsent``
+skips such rows from then on (C71). Re-publish then moves the
 attempt to ``needs_operator`` (``envelope_invalid``), so the payout is never stuck for good
 (§5.3, PAY-NFR-03).
 
@@ -38,9 +39,16 @@ __all__ = ["PayrollOutboxSource", "RelayRef", "build_relay"]
 SPAN_NAME: Final = "payroll.outbox.publish"
 _log: Final = get_logger("payroll.outbox")
 
+# A row the relay refused (``last_error = 'EnvelopeInvalidError'``) is never claimed again (C71):
+# re-validating it on every poll would only log ``outbox.relay.error`` again and take a batch
+# slot from a valid row. It stays unsent, so ``outbox_unsent`` and ``OutboxStuck`` still see it,
+# and re-publish moves its attempt to ``needs_operator`` (``envelope_invalid``). Rows that failed
+# for any other reason (an XADD error) are retried as before.
+REFUSED_ERROR: Final = EnvelopeInvalidError.__name__
 _CLAIM: Final = text(
     "SELECT id, payload, payout_id, attempt FROM payroll.outbox "
-    "WHERE sent_at IS NULL ORDER BY created_at, id "
+    "WHERE sent_at IS NULL AND last_error IS DISTINCT FROM :refused "
+    "ORDER BY created_at, id "
     "LIMIT :limit FOR UPDATE SKIP LOCKED"
 )
 _MARK_SENT: Final = text("UPDATE payroll.outbox SET sent_at = now() WHERE id = ANY(:ids)")
@@ -75,7 +83,7 @@ class PayrollOutboxSource:
         self._validate = validate
 
     async def claim_unsent(self, session: AsyncSession, *, limit: int) -> Sequence[StreamItem]:
-        rows = (await session.execute(_CLAIM, {"limit": limit})).all()
+        rows = (await session.execute(_CLAIM, {"limit": limit, "refused": REFUSED_ERROR})).all()
         items: list[StreamItem] = []
         for row in rows:
             payload: dict[str, Any] = dict(row.payload)
@@ -111,7 +119,7 @@ class PayrollOutboxSource:
         return items
 
     async def _reject(self, session: AsyncSession, item: StreamItem) -> None:
-        error_type = EnvelopeInvalidError.__name__
+        error_type = REFUSED_ERROR
         await self.mark_failed(session, [item], error_type=error_type)
         log_event(
             _log, logging.ERROR, "outbox.relay.error", error_type=error_type, batch_size=1,

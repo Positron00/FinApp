@@ -83,7 +83,7 @@ FinApp/
         nightly-resilience.sh, nightly-e2e.sh, nightly-schemathesis.sh, nightly-audit.sh,
         report_failure.sh}
   docs/{plan,specs,adr,runbooks}/  docs/{ARCHITECTURE,RUNBOOK,TESTING}.md
-    runbooks/<AlertName>.md  # one per alert in §8.3 (17 files)
+    runbooks/<AlertName>.md  # one per alert in §8.3 plus PodRestarts (18 files)
   .github/workflows/ci.yml  .github/workflows/nightly.yml  .github/dependabot.yml
 ```
 

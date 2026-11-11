@@ -1,0 +1,314 @@
+{
+  "description": "Every Prometheus metric name the dashboards and alert rules may use (platform LLD §8.8; PAY-NFR-10; C21, C55, C63, C65). 'app' entries are created in our code: 'source' is the file and 'instrument' the OTel instrument name there, which tests/platform/test_dashboards.py greps for (and every instrument the code creates must be listed here). The Collector's Prometheus exporter adds '_total' to counters and the unit suffix ('s' -> '_seconds') to the name, and turns a histogram into '_bucket', '_count' and '_sum'. 'auto' entries come from OTel auto-instrumentation in pycommon.otel.setup_telemetry. 'external' entries come from exporters and the observability stack at the versions pinned in deploy/compose/compose.yaml; Collector 0.164 self-metrics have no '_total' suffix (C65).",
+  "app": {
+    "auth_signins_total": {
+      "type": "counter",
+      "source": "services/identity/src/identity/metrics.py",
+      "instrument": "auth_signins",
+      "labels": ["outcome"]
+    },
+    "identity_emails_failed_total": {
+      "type": "counter",
+      "source": "services/identity/src/identity/metrics.py",
+      "instrument": "identity_emails_failed",
+      "labels": []
+    },
+    "identity_password_hash_seconds": {
+      "type": "histogram",
+      "source": "services/identity/src/identity/metrics.py",
+      "instrument": "identity_password_hash_seconds",
+      "labels": []
+    },
+    "identity_emails_pending": {
+      "type": "gauge",
+      "source": "services/identity/src/identity/metrics.py",
+      "instrument": "identity_emails_pending",
+      "labels": []
+    },
+    "identity_email_oldest_pending_age_seconds": {
+      "type": "gauge",
+      "source": "services/identity/src/identity/metrics.py",
+      "instrument": "identity_email_oldest_pending_age_seconds",
+      "labels": []
+    },
+    "payroll_late_settlements_total": {
+      "type": "counter",
+      "source": "services/payroll/src/payroll/metrics.py",
+      "instrument": "payroll_late_settlements",
+      "labels": []
+    },
+    "payroll_pay_runs_total": {
+      "type": "counter",
+      "source": "services/payroll/src/payroll/metrics.py",
+      "instrument": "payroll_pay_runs",
+      "labels": ["outcome"]
+    },
+    "payroll_payouts_total": {
+      "type": "counter",
+      "source": "services/payroll/src/payroll/metrics.py",
+      "instrument": "payroll_payouts",
+      "labels": ["outcome"]
+    },
+    "payroll_payout_settlement_seconds": {
+      "type": "histogram",
+      "source": "services/payroll/src/payroll/metrics.py",
+      "instrument": "payroll_payout_settlement_seconds",
+      "labels": []
+    },
+    "payroll_payouts_republished_total": {
+      "type": "counter",
+      "source": "services/payroll/src/payroll/metrics.py",
+      "instrument": "payroll_payouts_republished",
+      "labels": []
+    },
+    "payroll_runs_processing_oldest_age_seconds": {
+      "type": "gauge",
+      "source": "services/payroll/src/payroll/metrics.py",
+      "instrument": "payroll_runs_processing_oldest_age_seconds",
+      "labels": []
+    },
+    "payroll_payouts_stuck": {
+      "type": "gauge",
+      "source": "services/payroll/src/payroll/metrics.py",
+      "instrument": "payroll_payouts_stuck",
+      "labels": []
+    },
+    "payroll_attempts_needs_operator": {
+      "type": "gauge",
+      "source": "services/payroll/src/payroll/metrics.py",
+      "instrument": "payroll_attempts_needs_operator",
+      "labels": []
+    },
+    "outbox_unsent": {
+      "type": "gauge",
+      "source": "services/payroll/src/payroll/metrics.py",
+      "instrument": "outbox_unsent",
+      "labels": []
+    },
+    "outbox_oldest_age_seconds": {
+      "type": "gauge",
+      "source": "services/payroll/src/payroll/metrics.py",
+      "instrument": "outbox_oldest_age_seconds",
+      "labels": []
+    },
+    "queue_messages_total": {
+      "type": "counter",
+      "source": "services/payout_worker/src/payout_worker/metrics.py",
+      "instrument": "queue_messages",
+      "labels": ["stream", "group", "outcome"]
+    },
+    "queue_processing_seconds": {
+      "type": "histogram",
+      "source": "services/payout_worker/src/payout_worker/metrics.py",
+      "instrument": "queue_processing_seconds",
+      "labels": ["stream", "group"]
+    },
+    "queue_consumer_lag": {
+      "type": "gauge",
+      "source": "services/payout_worker/src/payout_worker/metrics.py",
+      "instrument": "queue_consumer_lag",
+      "labels": ["stream", "group"]
+    },
+    "queue_dlq_messages": {
+      "type": "gauge",
+      "source": "services/payout_worker/src/payout_worker/metrics.py",
+      "instrument": "queue_dlq_messages",
+      "labels": ["stream"]
+    },
+    "payouts_bank_transfers_total": {
+      "type": "counter",
+      "source": "services/payout_worker/src/payout_worker/metrics.py",
+      "instrument": "payouts_bank_transfers",
+      "labels": ["outcome", "reason"]
+    },
+    "bank_stub_transfers_total": {
+      "type": "counter",
+      "source": "services/bank_stub/src/bank_stub/metrics.py",
+      "instrument": "bank_stub_transfers",
+      "labels": ["outcome"]
+    },
+    "external_requests_total": {
+      "type": "counter",
+      "source": "libs/pycommon/src/pycommon/http.py",
+      "instrument": "external_requests",
+      "labels": ["provider", "operation", "outcome"]
+    },
+    "external_request_duration_seconds": {
+      "type": "histogram",
+      "source": "libs/pycommon/src/pycommon/http.py",
+      "instrument": "external_request_duration_seconds",
+      "labels": ["provider", "operation"]
+    },
+    "circuit_breaker_state": {
+      "type": "gauge",
+      "source": "libs/pycommon/src/pycommon/http.py",
+      "instrument": "circuit_breaker_state",
+      "labels": ["target"]
+    },
+    "rate_limiter_errors_total": {
+      "type": "counter",
+      "source": "libs/pycommon/src/pycommon/ratelimit.py",
+      "instrument": "rate_limiter_errors",
+      "labels": ["component"]
+    },
+    "rate_limited_total": {
+      "type": "counter",
+      "source": "libs/pycommon/src/pycommon/ratelimit.py",
+      "instrument": "rate_limited",
+      "labels": ["scope"]
+    },
+    "maintenance_runs_total": {
+      "type": "counter",
+      "source": "libs/pycommon/src/pycommon/maintenance.py",
+      "instrument": "maintenance_runs",
+      "labels": ["task", "outcome"]
+    },
+    "maintenance_duration_seconds": {
+      "type": "histogram",
+      "source": "libs/pycommon/src/pycommon/maintenance.py",
+      "instrument": "maintenance_duration_seconds",
+      "labels": ["task"]
+    },
+    "asyncio_event_loop_lag_seconds": {
+      "type": "gauge",
+      "source": "libs/pycommon/src/pycommon/app.py",
+      "instrument": "asyncio_event_loop_lag_seconds",
+      "labels": []
+    },
+    "bff_request_duration_seconds": {
+      "type": "histogram",
+      "source": "apps/web/src/lib/metrics.ts",
+      "instrument": "bff_request_duration",
+      "labels": ["route", "status"]
+    },
+    "bff_upstream_requests_total": {
+      "type": "counter",
+      "source": "apps/web/src/lib/metrics.ts",
+      "instrument": "bff_upstream_requests",
+      "labels": ["target", "outcome"]
+    },
+    "bff_session_backend_errors_total": {
+      "type": "counter",
+      "source": "apps/web/src/lib/metrics.ts",
+      "instrument": "bff_session_backend_errors",
+      "labels": []
+    },
+    "bff_sessions_created_total": {
+      "type": "counter",
+      "source": "apps/web/src/lib/metrics.ts",
+      "instrument": "bff_sessions_created",
+      "labels": ["via"]
+    },
+    "bff_sessions_revoked_total": {
+      "type": "counter",
+      "source": "apps/web/src/lib/metrics.ts",
+      "instrument": "bff_sessions_revoked",
+      "labels": ["reason"]
+    }
+  },
+  "outcomes": {
+    "auth_signins_total": ["success", "failure", "rate_limited"],
+    "queue_messages_total": ["ok", "retry", "dlq"],
+    "external_requests_total": [
+      "ok",
+      "client_error",
+      "rate_limited",
+      "server_error",
+      "timeout",
+      "connect_error",
+      "breaker_open"
+    ],
+    "payroll_payouts_total": [
+      "paid",
+      "failed",
+      "indeterminate",
+      "needs_operator",
+      "operator_rejected",
+      "no_transfer"
+    ],
+    "payouts_bank_transfers_total": ["settled", "rejected", "no_answer", "not_found"],
+    "bank_stub_transfers_total": ["settled", "rejected", "replayed"],
+    "bff_upstream_requests_total": [
+      "ok",
+      "http_4xx",
+      "http_5xx",
+      "timeout",
+      "connect_error",
+      "breaker_open"
+    ]
+  },
+  "auto": {
+    "http_server_request_duration_seconds": {
+      "type": "histogram",
+      "from": "opentelemetry-instrumentation-fastapi (OTEL_SEMCONV_STABILITY_OPT_IN=http)"
+    },
+    "http_client_request_duration_seconds": {
+      "type": "histogram",
+      "from": "opentelemetry-instrumentation-httpx"
+    },
+    "db_client_connections_usage": {
+      "type": "gauge",
+      "from": "opentelemetry-instrumentation-sqlalchemy"
+    },
+    "process_cpu_time_seconds_total": {
+      "type": "counter",
+      "from": "opentelemetry-instrumentation-system-metrics (process.cpu.time)"
+    },
+    "process_memory_usage_bytes": {
+      "type": "gauge",
+      "from": "opentelemetry-instrumentation-system-metrics (process.memory.usage)"
+    }
+  },
+  "external": {
+    "postgres-exporter": [
+      "pg_up",
+      "pg_stat_activity_count",
+      "pg_settings_max_connections",
+      "pg_stat_database_numbackends",
+      "pg_stat_database_xact_commit",
+      "pg_stat_database_xact_rollback",
+      "pg_stat_database_deadlocks",
+      "pg_database_size_bytes"
+    ],
+    "redis-exporter": [
+      "redis_up",
+      "redis_memory_used_bytes",
+      "redis_memory_max_bytes",
+      "redis_connected_clients",
+      "redis_commands_processed_total",
+      "redis_aof_enabled",
+      "redis_aof_last_write_status",
+      "redis_aof_last_bgrewrite_status",
+      "redis_evicted_keys_total",
+      "redis_uptime_in_seconds",
+      "redis_stream_length",
+      "redis_stream_group_lag",
+      "redis_stream_group_messages_pending"
+    ],
+    "otel-collector": [
+      "otelcol_receiver_accepted_spans",
+      "otelcol_receiver_refused_spans",
+      "otelcol_receiver_accepted_metric_points",
+      "otelcol_receiver_refused_metric_points",
+      "otelcol_receiver_accepted_log_records",
+      "otelcol_receiver_refused_log_records",
+      "otelcol_exporter_sent_spans",
+      "otelcol_exporter_send_failed_spans",
+      "otelcol_exporter_sent_metric_points",
+      "otelcol_exporter_send_failed_metric_points",
+      "otelcol_exporter_sent_log_records",
+      "otelcol_exporter_send_failed_log_records"
+    ],
+    "go-process": [
+      "process_cpu_seconds_total",
+      "process_resident_memory_bytes",
+      "process_start_time_seconds"
+    ],
+    "prometheus": ["up", "ALERTS", "ALERTS_FOR_STATE", "scrape_duration_seconds"],
+    "kubernetes": [
+      "kube_pod_container_status_restarts_total",
+      "container_memory_working_set_bytes",
+      "container_cpu_usage_seconds_total"
+    ]
+  }
+}
