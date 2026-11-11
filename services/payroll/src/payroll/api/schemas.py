@@ -65,11 +65,12 @@ def _no_nul(v: str) -> str:
 NoNul = AfterValidator(_no_nul)
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200), NoNul]
 Email = Annotated[EmailStr, StringConstraints(max_length=320)]
-SalaryCents = Annotated[int, Field(ge=1, le=1_000_000_000)]
-RateCents = Annotated[int, Field(ge=1, le=100_000)]
+SalaryCents = Annotated[int, Field(ge=1, le=1_000_000_000, strict=True)]
+RateCents = Annotated[int, Field(ge=1, le=100_000, strict=True)]
 Routing = Annotated[str, StringConstraints(pattern=r"^[0-9]{9}$")]
 Account = Annotated[str, StringConstraints(pattern=r"^[0-9]{4,17}$")]
-HoursHundredths = Annotated[int, Field(ge=0, le=74_400)]
+# strict: JSON booleans must not coerce to 0/1 (Schemathesis ST201, F4a e2e run)
+HoursHundredths = Annotated[int, Field(ge=0, le=74_400, strict=True)]
 Limit = Annotated[int, Field(ge=1, le=100)]
 IdemKey = Annotated[str, StringConstraints(pattern=IDEM_KEY_PATTERN)]
 Schedule = Literal["biweekly", "monthly"]
@@ -94,8 +95,8 @@ class CompanySettingsIn(BaseModel):
     model_config = _REQUEST
 
     name: Name
-    tax_rate_bps: Annotated[int, Field(ge=0, le=5000)]
-    retirement_bps: Annotated[int, Field(ge=0, le=2000)]
+    tax_rate_bps: Annotated[int, Field(ge=0, le=5000, strict=True)]
+    retirement_bps: Annotated[int, Field(ge=0, le=2000, strict=True)]
     timezone: Annotated[str, StringConstraints(min_length=1, max_length=64), NoNul]
     biweekly_anchor: date
     require_dual_approval: bool
@@ -422,7 +423,9 @@ BankReference = Annotated[str, StringConstraints(min_length=1, max_length=64), N
 class ResultIn(BaseModel):
     model_config = _REQUEST
 
-    attempt: Annotated[int, Field(ge=1, le=32767)]  # payout_attempts.attempt is smallint (C63)
+    attempt: Annotated[
+        int, Field(ge=1, le=32767, strict=True)
+    ]  # payout_attempts.attempt is smallint (C63)
     outcome: Literal["settled", "rejected", "indeterminate", "poison"]
     reason: Reason | None = None
     bank_reference: BankReference | None = None

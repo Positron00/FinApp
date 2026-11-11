@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from payroll.api import schemas
 from payroll.api.schemas import (
     CompanySettingsIn,
     EmployeeCreate,
@@ -241,7 +242,7 @@ def test_hours_valid(hours: int) -> None:
         ({"entries": [{"employee_id": E1, "hours_hundredths": 1}, {"employee_id": E2, "hours_hundredths": 2}, {"employee_id": E1, "hours_hundredths": 3}]}, "entries", "duplicate_employee_id"),
         ({"entries": [{"employee_id": E1, "hours_hundredths": -1}]}, "entries.0.hours_hundredths", "greater_than_equal"),
         ({"entries": [{"employee_id": E1, "hours_hundredths": 74_401}]}, "entries.0.hours_hundredths", "less_than_equal"),
-        ({"entries": [{"employee_id": E1, "hours_hundredths": 1.5}]}, "entries.0.hours_hundredths", "int_from_float"),
+        ({"entries": [{"employee_id": E1, "hours_hundredths": 1.5}]}, "entries.0.hours_hundredths", "int_type"),  # strict ints
         ({"entries": [{"employee_id": "nope", "hours_hundredths": 1}]}, "entries.0.employee_id", "uuid_parsing"),
         ({"entries": [{"employee_id": E1, "hours_hundredths": 1, "rate": 2}]}, "entries.0.rate", "extra_forbidden"),
         ({"entries": [{"employee_id": E1, "hours_hundredths": 1}], "run": 1}, "run", "extra_forbidden"),
@@ -283,3 +284,17 @@ def test_resolve_invalid(body: dict[str, Any], issue: str) -> None:
     with pytest.raises(ValidationError) as err:
         ResolveIn.model_validate(body)
     assert issue in _issues(err.value)
+
+
+@pytest.mark.parametrize(
+    ("model", "payload"),
+    [
+        ("HoursIn", {"entries": [{"employee_id": str(uuid4()), "hours_hundredths": False}]}),
+        ("HoursIn", {"entries": [{"employee_id": str(uuid4()), "hours_hundredths": True}]}),
+        ("ResultIn", {"attempt": True, "outcome": "settled", "bank_reference": "BSR-1"}),
+    ],
+)
+def test_json_booleans_never_coerce_to_integers(model: str, payload: dict[str, object]) -> None:
+    """PAY-301, PAY-405, PAY-602: true/false is not an integer (Schemathesis ST201)."""
+    with pytest.raises(ValidationError):
+        getattr(schemas, model).model_validate(payload)

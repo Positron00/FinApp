@@ -6,6 +6,7 @@ admin DB re-check are covered by the integration suites.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Iterator
 
 import pytest
@@ -152,3 +153,18 @@ def test_livez(client: TestClient) -> None:
     """PAY-605: /livez needs no token and no dependency."""
     r = client.get("/livez")
     assert r.status_code == 200
+
+
+@pytest.mark.parametrize("path", ["/v1/users/invite", "/v1/users/me"])
+def test_patch_on_literal_user_paths_is_405(
+    client: TestClient, token_factory: TokenFactory, path: str
+) -> None:
+    """PAY-602, C65: PATCH /v1/users/{id} only matches a UUID, so a literal sibling path answers
+    405 with a complete Allow header rather than 422 (Schemathesis ST204)."""
+    token = token_factory.mint(
+        aud="identity", sub=str(uuid.uuid4()), cid=COMPANY_ID, roles=["admin"], name="Ann"
+    )
+    r = client.patch(path, json={}, headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 405
+    assert r.json()["error"]["code"] == "method_not_allowed"
+    assert "PATCH" not in r.headers["allow"]

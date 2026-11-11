@@ -67,7 +67,9 @@ async def users_list(
 
 
 @router.patch(
-    "/{id}",
+    # uuid convertor: literal siblings (/invite, /me) must not match this route, so an
+    # undeclared method on them gets 405, not 422 (Schemathesis ST204, F4a e2e run).
+    "/{id:uuid}",
     operation_id="users_update",
     response_model=UserOut,
     responses=errors(400, 403, 404, 409, 429),

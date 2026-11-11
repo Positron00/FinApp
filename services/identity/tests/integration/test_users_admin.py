@@ -103,7 +103,7 @@ async def test_admin_routes_need_a_db_admin(
         r = await h.patch_user(approver, other, {"status": "inactive"})
         assert (r.status_code, r.json()["error"]["code"]) == (403, "forbidden_role")
     routes = [e["route"] for e in caplog_json.events("auth.forbidden")]
-    assert routes == ["/v1/users", "/v1/users/{id}"]
+    assert routes == ["/v1/users", "/v1/users/{id:uuid}"]  # uuid convertor (ST204 fix)
 
 
 async def test_patch_roles_bumps_roles_version_and_audits(
