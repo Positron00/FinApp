@@ -178,7 +178,7 @@ scripts/ci/security.sh   # pip-audit, pnpm audit, gitleaks (GITLEAKS_BASE=<sha> 
 - [`docs/RUNBOOK.md`](docs/RUNBOOK.md): operating the stack, alerts and runbooks, common operations.
 - [`docs/plan/architecture-plan.md`](docs/plan/architecture-plan.md): the architecture plan.
 - [`docs/specs/payrun-0.1/`](docs/specs/payrun-0.1/README.md): requirements, designs, tasks and the
-  decision tables (R1–R37, C1–C78).
+  decision tables (R1–R37, C1–C79).
 - [`docs/adr/`](docs/adr/): ADRs 0001–0013.
 - [`docs/runbooks/`](docs/runbooks/): one runbook per alert.
 - [`SECURITY_DEPENDENCIES.md`](SECURITY_DEPENDENCIES.md): accepted dependency and image CVEs.

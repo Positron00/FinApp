@@ -108,6 +108,6 @@ Details and per-suite pytest commands: [docs/TESTING.md](docs/TESTING.md).
 ## Where the status lives
 
 - Task status: [docs/specs/payrun-0.1/tasks.md](docs/specs/payrun-0.1/tasks.md) (Status column).
-- Decisions and measurements: the C and R tables in the spec README (latest: C78).
+- Decisions and measurements: the C and R tables in the spec README (latest: C79).
 - Plan status line and dated checks: [docs/plan/architecture-plan.md](docs/plan/architecture-plan.md) §18.
 - Release notes: [CHANGELOG.md](CHANGELOG.md).

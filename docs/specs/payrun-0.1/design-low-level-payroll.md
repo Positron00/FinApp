@@ -1,6 +1,6 @@
 # Low-level design: payroll service
 
-Status: draft v6, 2026-11-11 (H3 four-eyes C73, relay refused rows C76, alignment review; F4a payout robustness; F3; F2 payroll setup; S5 review fixes, C63) · Sources: [architecture plan](../../plan/architecture-plan.md) v1.4 (2026-11-11; v1.2 accepted 2026-11-10), [requirements](requirements.md), [high-level design](design-high-level.md), the [spec README](README.md) "Spec resolutions" (R1–R37) and "Contract decisions" (C1–C78) tables, ADRs [0003](../../adr/0003-payout-flow.md), [0004](../../adr/0004-bank-details-at-rest.md), [0005](../../adr/0005-four-eyes-approval.md), [0006](../../adr/0006-money-and-rounding.md) · Event contracts: [`contracts/events/payout.requested.v1.json`](../../../contracts/events/payout.requested.v1.json), [`contracts/events/payout.requested.dlq.v1.json`](../../../contracts/events/payout.requested.dlq.v1.json) (written by payout-worker)
+Status: draft v6, 2026-11-11 (H3 four-eyes C73, relay refused rows C76, alignment review; F4a payout robustness; F3; F2 payroll setup; S5 review fixes, C63) · Sources: [architecture plan](../../plan/architecture-plan.md) v1.4 (2026-11-11; v1.2 accepted 2026-11-10), [requirements](requirements.md), [high-level design](design-high-level.md), the [spec README](README.md) "Spec resolutions" (R1–R37) and "Contract decisions" (C1–C79) tables, ADRs [0003](../../adr/0003-payout-flow.md), [0004](../../adr/0004-bank-details-at-rest.md), [0005](../../adr/0005-four-eyes-approval.md), [0006](../../adr/0006-money-and-rounding.md) · Event contracts: [`contracts/events/payout.requested.v1.json`](../../../contracts/events/payout.requested.v1.json), [`contracts/events/payout.requested.dlq.v1.json`](../../../contracts/events/payout.requested.dlq.v1.json) (written by payout-worker)
 
 This document is the contract between the payroll implementers, the payout-worker team (§4.6, §4.7, §5)
 and the web team (§4.2–§4.5). Precedence: the README C-table, then the R-table, then `requirements.md`,
@@ -1994,7 +1994,7 @@ PAY-403, PAY-404, PAY-408 and PAY-412 are owned by payout-worker and bank-stub. 
   - **Relay:** §5.2's `claim_unsent` SQL shows the refused-row filter, and the text says why refused rows are never re-claimed.
   - **Tests:** unit `test_dual_approval.py` (tie); integration `test_dual_approval.py` (`test_no_transfer_employee_edit_does_not_block`, `test_edit_waiting_on_an_approve_lock_is_not_vetted_by_it`), `test_resolve.py` (`test_redriver_may_retry_after_a_bank_rejection`); §9.2 cites `test_outbox.py::test_relay_never_reclaims_a_refused_row`.
 
-- 2026-11-11 (second alignment review, docs only): the sources line cites C1–C78; §4.7 describes the whole `PayoutLateSettlement` rule in words (C75, C77); §2.7's `resolved_by` note says retry checks only the current attempt's resolver; §9.2 and §9.5 point PAY-603 at the pycommon limiter tests (`test_rate_limit.py` was never written in payroll).
+- 2026-11-11 (second alignment review, docs only): the sources line cites C1–C79; §4.7 describes the whole `PayoutLateSettlement` rule in words (C75, C77); §2.7's `resolved_by` note says retry checks only the current attempt's resolver; §9.2 and §9.5 point PAY-603 at the pycommon limiter tests (`test_rate_limit.py` was never written in payroll).
 
 **Open:**
 
