@@ -68,11 +68,15 @@ class AuthLimits:
         self._clock = clock or SystemClock()
         self.login = RateLimiter(redis, prefix=PREFIX, component="login", clock=self._clock)
         self.accept = RateLimiter(redis, prefix=PREFIX, component="accept", clock=self._clock)
+        self.reset = RateLimiter(redis, prefix=PREFIX, component="reset", clock=self._clock)
         window = s.identity_login_window_s
         closed = FailMode.closed
         self.login_ip = Limit("login_ip", s.auth_login_limit_ip, window, closed)
         self.login_account = Limit("login_account", s.auth_login_limit_account, window, closed)
         self.accept_ip = Limit("accept_ip", s.auth_login_limit_ip, window, closed)
+        # Reset requests are limited like login (PAY-105): per IP and per account, no lock.
+        self.reset_ip = Limit("reset_ip", s.auth_login_limit_ip, window, closed)
+        self.reset_account = Limit("reset_account", s.auth_login_limit_account, window, closed)
 
     @staticmethod
     def lock_key(ek: str) -> str:
@@ -148,6 +152,13 @@ class AuthLimits:
     async def check_accept(self, ip_subject: str) -> int | None:
         """``accept_ip`` (R18); the ``Retry-After`` seconds when denied, else ``None``."""
         decision = await self.accept.hit(self.accept_ip, ip_subject)
+        return None if decision.allowed else decision.retry_after_s
+
+    async def check_reset(self, ip_subject: str, ek: str) -> int | None:
+        """``reset_ip`` then ``reset_account`` (§6.4); ``Retry-After`` when denied."""
+        decision = await self.reset.hit(self.reset_ip, ip_subject)
+        if decision.allowed:
+            decision = await self.reset.hit(self.reset_account, ek)
         return None if decision.allowed else decision.retry_after_s
 
 

@@ -21,7 +21,7 @@ from pycommon.logging import get_logger, log_event
 from pycommon.otel import context_from_traceparent, tracer
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from identity.db.repositories import ClaimedEmail, InviteRepo, IssuedFor, OutboxRepo, ResetTokenRepo
+from identity.db.repositories import ClaimedEmail, InviteRepo, IssuedFor, OutboxRepo, ResetRepo
 from identity.domain.email_schedule import is_exhausted, retry_delay_s
 from identity.domain.tokens import new_token
 from identity.email.smtp import EmailSender, error_label
@@ -99,7 +99,7 @@ class EmailRelay:
                     row.invite_id, digest, self._s.invite_ttl_h
                 )
             if row.template == "password_reset" and row.password_reset_id is not None:
-                return await ResetTokenRepo(session).issue_token(
+                return await ResetRepo(session).issue_token(
                     row.password_reset_id, digest, self._s.reset_ttl_h
                 )
         return None  # pragma: no cover  (ck_email_outbox_ref makes this unreachable)

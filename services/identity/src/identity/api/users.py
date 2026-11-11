@@ -1,18 +1,18 @@
-"""``GET /v1/users/me`` and ``POST /v1/users/invite`` (identity LLD §3.4; PAY-101, PAY-107).
-
-The admin list and PATCH arrive with F1.
-"""
+"""User routes (identity LLD §3.4; PAY-101, PAY-107, PAY-108). HTTP mapping only."""
 
 from __future__ import annotations
+
+from uuid import UUID
 
 from fastapi import APIRouter, status
 from pycommon.errors import Forbidden
 
 from identity.api.deps import AdminActor, ClientIp, Runtime, UserCaller
+from identity.api.pagination import Cursor, Limit
 from identity.api.responses import errors
-from identity.api.schemas import InviteUserIn, MeOut, UserOut
+from identity.api.schemas import InviteUserIn, MeOut, PatchUserIn, UserListOut, UserOut
 from identity.usecases.invites import InviteCommand, invite_user
-from identity.usecases.users import get_me
+from identity.usecases.users import UpdateCommand, get_me, list_users, update_user
 
 __all__ = ["router"]
 
@@ -51,3 +51,41 @@ async def users_invite(body: InviteUserIn, actor: AdminActor, rt: Runtime, ip: C
         client_ip=ip,
     )
     return await invite_user(rt, cmd)
+
+
+@router.get(
+    "",
+    operation_id="users_list",
+    response_model=UserListOut,
+    responses=errors(403, 429),
+    summary="Users in creation order (admin)",
+)
+async def users_list(
+    actor: AdminActor, rt: Runtime, limit: Limit = 50, cursor: Cursor = None
+) -> UserListOut:
+    return await list_users(rt, actor.company_id, cursor, limit)
+
+
+@router.patch(
+    "/{id}",
+    operation_id="users_update",
+    response_model=UserOut,
+    responses=errors(400, 403, 404, 409, 429),
+    summary="Change a user's roles or deactivate them (admin; not on yourself)",
+)
+async def users_update(
+    id: UUID,
+    body: PatchUserIn,
+    actor: AdminActor,
+    rt: Runtime,
+    ip: ClientIp,
+) -> UserOut:
+    cmd = UpdateCommand(
+        company_id=actor.company_id,
+        actor_user_id=actor.user_id,
+        user_id=id,
+        roles=None if body.roles is None else [str(r) for r in body.roles],
+        deactivate=body.status == "inactive",
+        client_ip=ip,
+    )
+    return await update_user(rt, cmd)

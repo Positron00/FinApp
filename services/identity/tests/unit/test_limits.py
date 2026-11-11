@@ -195,3 +195,22 @@ async def test_lock_with_unexpected_pttl_still_blocks() -> None:
     r.ttl_ms[AuthLimits.lock_key(EK)] = -1
     gate = await make_limits(r).check_login("ip", EK)
     assert (gate.scope, gate.retry_after_s) == ("login_locked", 1)
+
+
+async def test_reset_requests_are_limited_per_ip_and_per_account() -> None:
+    """PAY-105, PAY-603: reset requests are limited like login: reset_ip at
+    AUTH_LOGIN_LIMIT_IP and reset_account at AUTH_LOGIN_LIMIT_ACCOUNT, with Retry-After, and no
+    lock is ever started."""
+    r = FakeRedis()
+    settings = make_settings(auth_login_limit_ip=3, auth_login_limit_account=2)
+    limits = AuthLimits(r, settings, clock=FakeClock())  # type: ignore[arg-type]
+    assert await limits.check_reset("ip-1", EK) is None
+    assert await limits.check_reset("ip-2", EK) is None
+    retry = await limits.check_reset("ip-3", EK)  # the account's third request
+    assert retry is not None
+    assert 1 <= retry <= 900
+    other = "f" * 64
+    assert await limits.check_reset("ip-1", other) is None  # ip-1's second request
+    assert await limits.check_reset("ip-1", other + "x") is None  # its third
+    assert await limits.check_reset("ip-1", other + "y") is not None  # its fourth: reset_ip
+    assert not any(":lock:" in k for k in r.data)

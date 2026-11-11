@@ -15,11 +15,12 @@ from pycommon.app import AppContext, create_app
 from pycommon.settings import BaseServiceSettings, load_settings
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from identity.api import auth, invites, users
+from identity.api import audit, auth, invites, users
 from identity.domain.passwords import PasswordHasher
 from identity.email.relay import EmailRelay
 from identity.email.smtp import EmailSender, SmtpSender
 from identity.limits import AuthLimits
+from identity.maintenance import build_runner
 from identity.metrics import EmailGaugeSource, create_metrics, register_email_gauges
 from identity.paths import MIGRATIONS_DIR
 from identity.runtime import IdentityRuntime
@@ -59,8 +60,10 @@ def build_app(
     clock: Clock | None = None,
     sender: EmailSender | None = None,
     run_relay: bool = True,
+    run_maintenance: bool = True,
 ) -> FastAPI:
-    """The identity app. ``clock``, ``sender`` and ``run_relay`` are test seams."""
+    """The identity app. ``clock``, ``sender``, ``run_relay`` and ``run_maintenance`` are test
+    seams."""
     if not isinstance(settings, IdentitySettings):
         raise TypeError("build_app needs IdentitySettings")
     s = settings
@@ -96,6 +99,12 @@ def build_app(
         rt: IdentityRuntime = app.state.identity
         await rt.relay.run(stop)
 
+    async def maintenance(ctx: AppContext, stop: asyncio.Event) -> None:
+        """PAY-608: the §6.10 purges, one replica at a time (advisory lock)."""
+        if ctx.engine is None or ctx.sessions is None:  # pragma: no cover  (use_db is on)
+            raise RuntimeError("identity maintenance needs the DB")
+        await build_runner(s, ctx.engine, ctx.sessions, clk).run(stop)
+
     async def close_gauges(_ctx: AppContext, stop: asyncio.Event) -> None:
         """Dispose the gauge source's engine and thread on shutdown."""
         await stop.wait()
@@ -103,10 +112,14 @@ def build_app(
 
     app = create_app(
         s,
-        routers=[auth.router, invites.router, users.router],
+        routers=[auth.router, invites.router, users.router, audit.router],
         migrations_script_location=str(MIGRATIONS_DIR),
         startup_checks=IDENTITY_CHECKS,
-        background=[*([email_relay] if run_relay else []), close_gauges],
+        background=[
+            *([email_relay] if run_relay else []),
+            *([maintenance] if run_maintenance else []),
+            close_gauges,
+        ],
         on_startup=on_startup,
         instrument=instrument,
     )

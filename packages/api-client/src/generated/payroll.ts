@@ -4,6 +4,23 @@
  */
 
 export interface paths {
+    "/v1/audit-events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Audit Events */
+        get: operations["list_audit_events_v1_audit_events_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/company/settings": {
         parameters: {
             query?: never;
@@ -54,7 +71,8 @@ export interface paths {
         delete?: never;
         options?: never;
         head?: never;
-        patch?: never;
+        /** Update Employee */
+        patch: operations["update_employee_v1_employees__employee_id__patch"];
         trace?: never;
     };
     "/v1/internal/payouts/{payout_id}/instruction": {
@@ -120,7 +138,8 @@ export interface paths {
         get: operations["get_pay_run_v1_pay_runs__run_id__get"];
         put?: never;
         post?: never;
-        delete?: never;
+        /** Delete Pay Run */
+        delete: operations["delete_pay_run_v1_pay_runs__run_id__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -154,6 +173,23 @@ export interface paths {
         put?: never;
         /** Calculate Pay Run */
         post: operations["calculate_pay_run_v1_pay_runs__run_id__calculate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/pay-runs/{run_id}/hours": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Put Hours */
+        put: operations["put_hours_v1_pay_runs__run_id__hours_put"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -237,6 +273,40 @@ export interface components {
              * @enum {string}
              */
             status: "requested" | "indeterminate" | "needs_operator" | "settled" | "rejected";
+        };
+        /**
+         * AuditEventOut
+         * @description C5 ``PayrollAuditEvent``; ``details`` holds IDs, counts, codes and ``account_last4`` only.
+         */
+        AuditEventOut: {
+            /** Actor Id */
+            actor_id: string;
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /** Details */
+            details: {
+                [key: string]: unknown;
+            };
+            /**
+             * Entity Id
+             * Format: uuid
+             */
+            entity_id: string;
+            /**
+             * Entity Type
+             * @enum {string}
+             */
+            entity_type: "company_settings" | "employee" | "pay_run" | "payout";
+            /** Event */
+            event: string;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
         };
         /** CompanySettingsIn */
         CompanySettingsIn: {
@@ -360,6 +430,32 @@ export interface components {
              */
             updated_at: string;
         };
+        /**
+         * EmployeeUpdate
+         * @description PATCH body (PAY-203): any PAY-201 field, or ``status``. At least one field; an explicit
+         *     ``null`` is refused (omit the field instead). The merged pay basis is checked by the service
+         *     against the stored row (design §4.3).
+         */
+        EmployeeUpdate: {
+            /** Annual Salary Cents */
+            annual_salary_cents?: number | null;
+            /** Bank Account */
+            bank_account?: string | null;
+            /** Bank Routing */
+            bank_routing?: string | null;
+            /** Email */
+            email?: string | null;
+            /** Hourly Rate Cents */
+            hourly_rate_cents?: number | null;
+            /** Name */
+            name?: string | null;
+            /** Pay Type */
+            pay_type?: ("salaried" | "hourly") | null;
+            /** Schedule */
+            schedule?: ("biweekly" | "monthly") | null;
+            /** Status */
+            status?: ("active" | "inactive") | null;
+        };
         /** ErrorBody */
         ErrorBody: {
             error: components["schemas"]["ErrorDetail"];
@@ -374,6 +470,42 @@ export interface components {
             message: string;
             /** Request Id */
             request_id: string | null;
+        };
+        /** HoursEntry */
+        HoursEntry: {
+            /**
+             * Employee Id
+             * Format: uuid
+             */
+            employee_id: string;
+            /** Hours Hundredths */
+            hours_hundredths: number;
+        };
+        /**
+         * HoursIn
+         * @description PUT …/hours body (PAY-301): 1 to 500 entries with unique ``employee_id`` values.
+         */
+        HoursIn: {
+            /** Entries */
+            entries: components["schemas"]["HoursEntry"][];
+        };
+        /**
+         * HoursOut
+         * @description PUT …/hours response (C7): every hours row now stored for the run, by ``employee_id``.
+         */
+        HoursOut: {
+            /** Entries */
+            entries: components["schemas"]["HoursEntry"][];
+            /**
+             * Pay Run Id
+             * Format: uuid
+             */
+            pay_run_id: string;
+            /**
+             * Status
+             * @constant
+             */
+            status: "draft";
         };
         /** InstructionOut */
         InstructionOut: {
@@ -400,6 +532,13 @@ export interface components {
             requested_at: string;
             /** Routing */
             routing: string;
+        };
+        /** Page[AuditEventOut] */
+        Page_AuditEventOut_: {
+            /** Items */
+            items: components["schemas"]["AuditEventOut"][];
+            /** Next Cursor */
+            next_cursor: string | null;
         };
         /** Page[EmployeeOut] */
         Page_EmployeeOut_: {
@@ -692,6 +831,86 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_audit_events_v1_audit_events_get: {
+        parameters: {
+            query?: {
+                entity_type?: ("company_settings" | "employee" | "pay_run" | "payout") | null;
+                entity_id?: string | null;
+                event?: string | null;
+                cursor?: string | null;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_AuditEventOut_"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unprocessable Content */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Too Many Requests */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_company_settings_v1_company_settings_get: {
         parameters: {
             query?: never;
@@ -1094,6 +1313,113 @@ export interface operations {
             };
             /** @description Not Found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unprocessable Content */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Too Many Requests */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_employee_v1_employees__employee_id__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                employee_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EmployeeUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EmployeeOut"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Conflict */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1603,6 +1929,98 @@ export interface operations {
             };
         };
     };
+    delete_pay_run_v1_pay_runs__run_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unprocessable Content */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Too Many Requests */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     approve_pay_run_v1_pay_runs__run_id__approve_post: {
         parameters: {
             query?: never;
@@ -1726,6 +2144,113 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PayRunOut"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unprocessable Content */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Too Many Requests */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_hours_v1_pay_runs__run_id__hours_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HoursIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HoursOut"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             /** @description Unauthorized */
