@@ -22,20 +22,25 @@ async def test_missing_transfer_is_poison_without_post(stack: Stack) -> None:
     await _age_attempts(stack)
     await stack.worker()
 
-    async def blocked() -> bool:
+    # Wait on the worker's last write, not payroll's: step 7 (the poison report, which makes the
+    # attempt needs_operator) commits before step 8.1 (``finish`` → processed_events), so
+    # needs_operator alone can be observed before the processed event exists.
+    async def finished() -> bool:
         return (
             await stack.count(
-                "SELECT count(*) FROM payroll.payout_attempts WHERE status = 'needs_operator'"
+                "SELECT count(*) FROM payouts.processed_events WHERE outcome = 'poison'"
             )
             == 1
         )
 
-    await wait_for(blocked)
-    assert await stack.transfers() == 0
+    await wait_for(finished)
     assert (
-        await stack.count("SELECT count(*) FROM payouts.processed_events WHERE outcome = 'poison'")
+        await stack.count(
+            "SELECT count(*) FROM payroll.payout_attempts WHERE status = 'needs_operator'"
+        )
         == 1
     )
+    assert await stack.transfers() == 0
 
 
 async def test_existing_transfer_is_reported(stack: Stack) -> None:

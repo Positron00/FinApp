@@ -83,10 +83,11 @@ async def test_reclaimed_while_paused_after_the_bank_call(
         return [p["status"] for p in await stack.payouts(run["id"])] == ["paid"]
 
     await wait_for(paid)
+    # "paid" is payroll's state after step 7; the claimer's ``finish`` (step 8.1) and XACK follow.
+    await _acked(stack)
     second_result = await stack.db.fetchrow("SELECT status, deliveries FROM payouts.disbursements")
     assert second_result["status"] == "done"
     assert second_result["deliveries"] == 2
-    await _acked(stack)
     posts_before = await stack.count(
         "SELECT count(*) FROM payroll.idempotency_keys WHERE key LIKE '%:settled'"
     )

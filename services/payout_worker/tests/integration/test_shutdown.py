@@ -24,6 +24,7 @@ import httpx
 import pytest
 import redis.asyncio as aioredis
 from fastapi import FastAPI
+from payout_worker.settings import TERMINATION_GRACE_S, Settings
 from pycommon.db import new_id
 from pycommon.testing import JsonLogCapture, PgBootstrapped, RedisAcl
 
@@ -31,8 +32,19 @@ from tests.helpers import API_KEY, COMPANY_ID, TOKENS, envelope_dict
 from tests.integration.conftest import GROUP, STREAM, Stack, runtime, wait_for
 
 N = 16  # PAYOUT_CONCURRENCY's default: every slot holds a message
-GRACE_S = 75  # terminationGracePeriodSeconds (plan §2.2)
+GRACE_S = TERMINATION_GRACE_S  # terminationGracePeriodSeconds, 75 (plan §2.2)
 DEPLOYED_OTLP_TIMEOUT_S = 3  # OTEL_EXPORTER_OTLP_TIMEOUT in Compose and k8s (C67)
+# The real-process exit bound (PAY-408), derived rather than picked. Deployed: drain 60 s (the
+# default; no manifest overrides it) + close-and-flush ≤ 10 s (§3.3.7, enforced by Settings) must
+# fit the 75 s grace, which leaves 5 s of headroom. The test runs the same close-and-flush with a
+# 2 s drain, so it may take that same headroom as slack for a loaded machine (the elapsed time is
+# measured from the parent and includes its own polling): 2 + 10 + 5 = 17 s. A flush that broke
+# the deployed budget (C67 measured ~20 s with the SDK's 10 s OTLP timeout) still fails.
+TEST_DRAIN_S = 2  # PAYOUT_SHUTDOWN_DRAIN_S in _worker_env
+DEPLOYED_DRAIN_S: float = Settings.model_fields["payout_shutdown_drain_s"].default
+CLOSE_FLUSH_BUDGET_S = 10  # §3.3.7; Settings rejects drain + 10 > 75
+LOAD_SLACK_S = GRACE_S - (DEPLOYED_DRAIN_S + CLOSE_FLUSH_BUDGET_S)
+EXIT_BOUND_S = TEST_DRAIN_S + CLOSE_FLUSH_BUDGET_S + LOAD_SLACK_S
 
 
 class GatedBank(httpx.AsyncBaseTransport):
@@ -248,7 +260,7 @@ def _worker_env(
         "PYCOMMON_APP": "payout_worker.main:app",
         "PORT": str(port),
         "PAYOUT_CONSUMER_NAME": "sigterm",
-        "PAYOUT_SHUTDOWN_DRAIN_S": "2",
+        "PAYOUT_SHUTDOWN_DRAIN_S": str(TEST_DRAIN_S),
         "PAYOUT_XREAD_BLOCK_MS": "200",
         "PAYOUT_CLAIM_INTERVAL_S": "0.2",
         "PAYOUT_PAYROLL_BASE_URL": f"http://127.0.0.1:{fake_port}",
@@ -287,10 +299,11 @@ async def test_sigterm_in_a_real_process(
     then either finishes the held message (released within PAYOUT_SHUTDOWN_DRAIN_S: result
     posted, ACKed) or cancels it at the drain (left pending for another consumer). It exits
     (status 0, or SIGTERM re-raised by uvicorn after the graceful shutdown) well within the 75 s
-    grace period: drain 2 s + ≤ 10 s for close and flush. The OTLP endpoint is unreachable, so
-    the flush waits out OTEL_EXPORTER_OTLP_TIMEOUT per exporter; the third case uses the value
-    Compose and Kubernetes deploy (3 s, C67): three exporters flushed in turn still fit in the
-    10 s, so a 60 s drain + flush stays under the 75 s grace."""
+    grace period: drain 2 s + ≤ 10 s for close and flush + the deployed 5 s headroom as slack
+    (EXIT_BOUND_S, 17 s). The OTLP endpoint is unreachable, so the flush waits out
+    OTEL_EXPORTER_OTLP_TIMEOUT per exporter; the third case uses the value Compose and Kubernetes
+    deploy (3 s, C67): three exporters flushed in turn still fit in the 10 s, so a 60 s drain +
+    flush stays under the 75 s grace."""
     fake, fake_port = fakes
     port = _free_port()
     env = envelope_dict(event_id=new_id(), payout_id=str(new_id()))
@@ -346,7 +359,8 @@ async def test_sigterm_in_a_real_process(
     # status is "terminated by SIGTERM" (143 in a container), which Kubernetes treats as normal.
     assert proc.returncode in {0, -signal.SIGTERM}, log_path.read_text()[-2000:]
     assert "Application shutdown complete." in log_path.read_text()
-    assert elapsed < 2 + 10 < GRACE_S
+    assert LOAD_SLACK_S > 0
+    assert elapsed < EXIT_BOUND_S < GRACE_S, f"exit took {elapsed:.1f} s"
     done = events["worker.shutdown.completed"]
     assert (done["drained"], done["cancelled"]) == ((1, 0) if released else (0, 1))
     assert "service.stopped" in events
