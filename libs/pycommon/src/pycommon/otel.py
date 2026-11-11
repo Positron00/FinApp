@@ -257,8 +257,15 @@ def _instrument_sqlalchemy(
     inst = SQLAlchemyInstrumentor()
     if inst.is_instrumented_by_opentelemetry:
         inst.uninstrument()
+    # opentelemetry-instrumentation-sqlalchemy 0.66b1 declares sqlalchemy < 2.1 and otherwise
+    # instruments nothing. Its engine event hooks work on 2.1 (verified in S6 and by
+    # tests/integration/test_db_spans.py), so skip the version gate until a release supports 2.1.
     inst.instrument(
-        engine=engine.sync_engine, enable_commenter=False, tracer_provider=tp, meter_provider=mp
+        engine=engine.sync_engine,
+        enable_commenter=False,
+        tracer_provider=tp,
+        meter_provider=mp,
+        skip_dep_check=True,
     )
     return inst
 

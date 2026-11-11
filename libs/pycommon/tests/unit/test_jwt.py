@@ -262,7 +262,7 @@ def test_token_signer_mint_claims(tf: TokenFactory, clock: FakeClock) -> None:
     assert set(claims) == {"iss", "aud", "sub", "cid", "roles", "iat", "exp", "jti"}
     assert claims["exp"] - claims["iat"] == 30
     assert claims["iat"] == int(clock.now().timestamp())
-    assert uuid.UUID(claims["jti"]).version == 4
+    assert uuid.UUID(claims["jti"]).version == 7  # time-ordered (payout-worker LLD §3.6)
     assert claims["roles"] == ["a", "b"]
     full = jwt.decode(
         signer.mint(aud=AUD, sub=USER, cid=COMPANY_ID, name="N", sid="S"),

@@ -339,7 +339,7 @@ class TokenSigner:
             "roles": list(roles),
             "iat": iat,
             "exp": iat + ttl_s,
-            "jti": str(uuid.uuid4()),
+            "jti": str(uuid.uuid7()),
         }
         if name is not None:
             claims["name"] = name
