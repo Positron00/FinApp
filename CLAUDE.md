@@ -85,8 +85,9 @@ Details and per-suite pytest commands: [docs/TESTING.md](docs/TESTING.md).
   `minimumReleaseAge` only allow releases at least 14 days old.
 - **pnpm 10.34.9**, not 12: corepack 0.31 can't load pnpm 12's ES-module entry point.
 - **TypeScript 6.0.3**, not 7: typescript-eslint 8.72 requires TypeScript below 6.1.
-- **Node:** CI uses 24 (`.nvmrc`); `engines` allows ≥ 22 locally. Node 23 can't load undici 8 or
-  jsdom 30, so jsdom is pinned to 29.1.1.
+- **Node:** 24 in CI and locally (`.nvmrc`); `engines` is `^22.22.2 || ^24.15.0 || >=26` because
+  jsdom 30 and undici 8 crash on Node 23 (C79). `testcontainers` stays at 12.0.1 until its hold is
+  lifted (C79).
 - **Python 3.14** via uv (`uv python install`); uv 0.12.13 in CI.
 - **`rm -f .coverage .coverage.*` before coverage runs**: stale data skews `--cov-append`. The
   gate (90 pycommon, 85 services) applies to the combined unit + integration report (spec C64).
