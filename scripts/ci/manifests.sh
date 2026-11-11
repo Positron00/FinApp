@@ -63,6 +63,10 @@ for env in dev uat prod; do
 done
 
 group "k8s policy tests"
+# The tests load the pycommon.testing plugin: install every workspace member first, as
+# python.sh does (the root project installs nothing by itself; passed locally only because
+# the dev venv was already synced).
+uv sync --locked --all-packages
 K8S_RENDERED_DIR="$CI_ROOT/ci-logs/k8s" uv run pytest -p no:cacheprovider \
   tests/platform/test_k8s_policy.py tests/platform/test_sync_k8s_assets.py
 
