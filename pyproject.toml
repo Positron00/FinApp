@@ -49,7 +49,7 @@ select = ["E", "W", "F", "I", "B", "UP", "S", "ASYNC", "RUF", "SIM", "PT", "N", 
 ignore = ["PLR0913", "PLR2004"]
 
 [tool.ruff.lint.per-file-ignores]
-"**/tests/**" = ["S101", "S105", "S106", "PLR2004", "S311"]
+"**/tests/**" = ["S101", "S105", "S106", "PLR2004", "S311", "S603", "S607", "S608"]
 "scripts/**" = ["T20"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
@@ -78,3 +78,9 @@ parallel = true
 show_missing = true
 skip_covered = true
 exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "@overload"]
+
+[tool.pytest.ini_options]
+# Used by suites without their own config (tests/platform, tests/resilience).
+addopts = "--strict-markers"
+markers = ["integration: needs Docker (Testcontainers)", "smoke: PR fault smoke tests"]
+timeout = 180
