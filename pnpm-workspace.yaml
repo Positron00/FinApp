@@ -1,3 +1,6 @@
 packages:
   - "apps/*"
   - "packages/*"
+
+# Two-week rule: only install versions published at least 14 days ago (minutes).
+minimumReleaseAge: 20160

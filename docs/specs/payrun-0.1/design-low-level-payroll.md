@@ -9,7 +9,7 @@ records the change. Choices this design makes where the sources are silent are m
 the lead accepted them (R34).
 
 Conventions used throughout:
-- **IDs** are UUIDv7, generated in the application by `pycommon.ids.uuid7()`. The DB has no default for them.
+- **IDs** are UUIDv7, generated in the application by `pycommon.db.new_id()`. The DB has no default for them.
 - **Money** is `BIGINT` cents (Python `int`), **rates** are `INTEGER` basis points and **hours** are `INTEGER` hundredths. No `float` anywhere in `payroll.domain` (PAY-NFR-01).
 - **Time** is `timestamptz` in UTC. **Period dates** are `date` (plan §2.1).
 - **Actor IDs** (`*_by` columns, `audit_events.actor_id`) are `TEXT`. They hold the JWT `sub`: a user UUID for web tokens, `service:payout-worker` for the worker, or `system:maintenance` for the maintenance task.
