@@ -2779,12 +2779,14 @@ concurrency: { group: nightly, cancel-in-progress: false }
 |---|---|---|---|
 | `load` | 100 min (nominal ~55; measured 46 min in run 43040233170) | `nightly-load.sh` | full 30 req/s × 10 min, soak 5 req/s × 30 min with no latency drift, no memory growth and no consumer-lag growth (`soak_resources.py`), settlement p95 ≤ 60 s for 500 employees (PAY-NFR-05, 06) |
 | `resilience` | 60 min (measured 33 min in run 43040233170) | `nightly-resilience.sh` | every fault in plan §12.1, each with its HLD §4 log event and metric (PAY-NFR-02, 03) |
-| `e2e-repeat` | 120 min (3 × the PR `e2e` job's 40 min; not yet measured on a runner) | `nightly-e2e.sh` | the full e2e three times in a row (flakiness) |
+| `e2e-repeat` | 120 min (3 × the PR `e2e` job's 40 min; measured 28 min in run 43074520518) | `nightly-e2e.sh` | the full e2e three times in a row (flakiness) |
 | `schemathesis-deep` | 45 min (measured 8.5 min in run 43040233170) | `nightly-schemathesis.sh` | 500 examples per operation |
 | `audit` | 20 min (measured 2.5 min in run 43040233170) | `nightly-audit.sh` | pip-audit, pnpm audit and Trivy against fresh advisories |
 
-The measured durations are from the first nightly run on `release/0.1.0` (43040233170); every
-timeout keeps room for a slower runner, so none changed.
+The measured durations are from the nightly runs on `release/0.1.0` (43040233170; `e2e-repeat` from
+43074520518, the first run where it could start, C77). The first full pass of all five jobs is
+43074520518 (2026-11-11: load 47 min, resilience 35 min, e2e-repeat 28 min). Every timeout keeps
+room for a slower runner, so none changed.
 
 **Failure issues:** each job tees its script output to `ci-logs/<job>.log` and uploads it as the
 artifact `log-<job>` (`if: always()`); only these jobs hold `contents: read`. A separate job,

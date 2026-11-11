@@ -209,6 +209,8 @@ First full pass: nightly run [43040233170](https://github.com/Positron00/FinApp/
 
 The same run's `resilience` (13 tests, 33 min), `schemathesis-deep` and `audit` jobs passed. `e2e-repeat` could not start: the runner failed to resolve Ubuntu's apt mirror while installing Chromium's system packages (both nightly runs that day). That failure is infrastructure; see the job's issue.
 
+**First full nightly pass:** run [43074520518](https://github.com/Positron00/FinApp/actions/runs/43074520518) on `49c5658` (2026-11-11): every job green: `load` 47 min, `resilience` 35 min, `e2e-repeat` (the full e2e three times) 28 min, `schemathesis-deep` and `audit`. Before it, `e2e-repeat` was fixed twice: Chromium is installed without `--with-deps` (the runner's apt mirror failed DNS), and a J2 test hang on a cancelled response body (C77). The hang struck once in six CI runs, so three clean runs are good evidence, not proof; any recurrence opens a nightly-failure issue.
+
 The first nightly run (43037260723) found a real bug in the k6 scripts: the per-VU cookie jar leaked the approver's session into the load user's requests (403 then 401s). Fixed in `e3789dd` by giving every k6 request a throwaway jar.
 
 Follow-up: the bottleneck was not reached at 2.2× peak; a stepped ramp beyond 30 it/s would find the ceiling.
