@@ -136,7 +136,8 @@ def build_app(
 
     async def maintenance_task(ctx: AppContext, stop: asyncio.Event) -> None:
         if ctx.engine is not None and ctx.sessions is not None:
-            await build_runner(s, ctx.engine, ctx.sessions, clock).run(stop)
+            runner = build_runner(s, ctx.engine, ctx.sessions, clock, redis=ctx.redis)
+            await runner.run(stop)
 
     def health(_ctx: AppContext) -> Sequence[HealthCheck]:
         def consumer_alive() -> bool:

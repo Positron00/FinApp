@@ -52,7 +52,7 @@ class Settings(BaseServiceSettings):
     payout_claim_interval_s: Annotated[float, Field(gt=0)] = 10.0
     payout_shutdown_drain_s: Annotated[float, Field(ge=0)] = 60.0
     payout_lag_poll_s: Annotated[float, Field(gt=0)] = 15.0
-    payout_consumer_gc_idle_s: int = 3600  # read by prune_consumers (F4b, design §3.8)
+    payout_consumer_gc_idle_s: Annotated[int, Field(ge=1)] = 3600  # prune_consumers (§3.8, C47)
     payout_republish_after_s: int = 360  # read only by the startup check (R11)
     # payroll client (C46)
     payout_payroll_base_url: str = "http://payroll:8000"

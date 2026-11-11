@@ -29,6 +29,9 @@ x-py-env: &py-env
   RETENTION_BANK_DETAILS_DAYS: "30"
   IDEMPOTENCY_TTL_H: "24"
   OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+  # Python gRPC exporter reads SECONDS (default 10): bounds the shutdown flush when the Collector
+  # is unreachable, so payout-worker drain (60 s) + flush stays inside the 75 s grace (C67).
+  OTEL_EXPORTER_OTLP_TIMEOUT: "3"
   OTEL_EXPORTER_OTLP_PROTOCOL: grpc
   OTEL_TRACES_SAMPLER: parentbased_always_on # C23: every service and environment; no _ARG
   OTEL_METRIC_EXPORT_INTERVAL: "15000"
