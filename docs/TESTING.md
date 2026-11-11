@@ -52,7 +52,7 @@ uv run pytest tests/platform --ignore=tests/platform/test_seed.py -p no:cachepro
 
 `tests/platform` checks the deploy assets and scripts: bootstrap SQL grants, Redis ACLs, Compose,
 Kubernetes policy, dashboards against the metric catalogue, rule metadata, alert-sink,
-Toxiproxy config, `dev-env.sh`, `mint_token.py`, `sync-k8s-assets.sh` and `soak_resources.py`.
+Toxiproxy config, `dev-env.sh`, `mint_token.py`, `sync-k8s-assets.sh`, `soak_resources.py` and the resilience helpers (`test_resilience_helpers.py`).
 `test_seed.py` needs the running stack and is run by `e2e.sh` (`-m stack`).
 
 ## Web: lint, types, Vitest, int, build
@@ -113,7 +113,7 @@ damages seed data, so it comes after everything that reads it; spec C70):
    examples per operation, and a fresh internal JWT per request from
    `scripts/ci/schemathesis_auth.py` (bank-stub: its API key). Reports in `ci-logs/schemathesis/`.
 5. **Fault smoke:** `uv run pytest tests/resilience -m smoke` (slow DB and identity down).
-6. **Metric series:** `scripts/ci/check_metrics.sh` (18 required series in Prometheus).
+6. **Metric series:** `scripts/ci/check_metrics.sh` (27 required entries in Prometheus, names or full selectors; C77).
 
 A skipped seed test or fault smoke test fails the job. The stack is always torn down with
 `down -v`; on failure the Compose logs are in `ci-logs/compose.log`.
@@ -138,8 +138,8 @@ LOAD_SCENARIOS="settlement" FULL_HOLD=2m SOAK_DURATION=10m scripts/ci/nightly-lo
 ## Resilience (fault injection)
 
 `tests/resilience/` runs against the Compose stack with Toxiproxy (the `test` profile), one test
-per failure-table row (HLD §4): worker crash before and after the bank call, bank down then up,
-bank timeout after settling, bank-stub restart, payroll down, Redis down, Redis `FLUSHALL`, Redis
+per resilience-layer row of the failure table (plan §12.1, which mirrors HLD §4): worker crash
+before and after the bank call, bank down then up, bank timeout after settling, bank-stub restart, payroll down, Redis down, Redis `FLUSHALL`, Redis
 restart, Postgres down, slow DB, identity down and SMTP down.
 
 ```sh
@@ -154,7 +154,7 @@ Payout timing stays at production values (spec C53), so the bank-down, payroll-d
 
 | Gate                                  | Command                     | What it checks                                                     |
 | ------------------------------------- | --------------------------- | ------------------------------------------------------------------ |
-| Kubernetes and observability configs  | `scripts/ci/manifests.sh`   | `sync-k8s-assets.sh` copies are current; `kustomize build` of dev, uat and prod piped to **kubeconform** `-strict` (with the vendored ExternalSecret schemas); `test_k8s_policy.py`; **promtool** `check config`, `check rules`, `test rules` (Compose rules and `PodRestarts`); **amtool** `check-config`; `otelcol-contrib validate`; `docker compose config -q` |
+| Kubernetes and observability configs  | `scripts/ci/manifests.sh`   | `sync-k8s-assets.sh` copies are current; `kustomize build` of dev, uat and prod piped to **kubeconform** `-strict` (with the vendored ExternalSecret schemas); `test_k8s_policy.py`; **promtool** `check config`, `check rules`, `test rules` (Compose rules, the Queues panel expressions in `panels_test.yml`, and `PodRestarts`); **amtool** `check-config`; `otelcol-contrib validate`; `docker compose config -q` |
 | Images                                | `scripts/ci/images.sh`      | `.trivyignore` policy (reason, owner, unexpired, listed in `SECURITY_DEPENDENCIES.md`); `docker buildx bake` for linux/amd64; **Trivy** HIGH/CRITICAL per image |
 | Dependencies and secrets              | `scripts/ci/security.sh`    | `pip-audit --strict`; `pnpm audit --audit-level high`; **gitleaks** over `<base>..HEAD` (`GITLEAKS_BASE`) |
 
@@ -190,7 +190,7 @@ Measured locally on the development machine (an Apple-silicon Mac) with the Comp
 
 | What                                  | Result                                                                                       |
 | ------------------------------------- | -------------------------------------------------------------------------------------------- |
-| Full local e2e (`scripts/ci/e2e.sh`)  | Green: 27 Playwright tests, 8 seed tests, Schemathesis identity 1085, payroll 2159 and bank-stub 172 generated cases all passing, 18 of 18 metric series present (`check_metrics.sh` now requires 26, C77) |
+| Full local e2e (`scripts/ci/e2e.sh`)  | Green: 27 Playwright tests, 8 seed tests, Schemathesis identity 1085, payroll 2159 and bank-stub 172 generated cases all passing, 18 of 18 metric series present (`check_metrics.sh` now requires 27, C77) |
 | Settlement, 500-employee run          | p95 5.7 s (SLO ≤ 60 s; `load/settlement.js`)                                                 |
 | k6 smoke                              | p95 about 30 ms                                                                              |
 | Service startup                       | about 1.2 s per service from container start to ready (limit 20 s, PAY-NFR-15)               |
@@ -199,7 +199,7 @@ Measured locally on the development machine (an Apple-silicon Mac) with the Comp
 
 ### Nightly load and soak
 
-First full pass: nightly run [43040233170](https://github.com/Positron00/FinApp/actions/runs/43040233170) on `e3789dd` (2026-11-11), GitHub `ubuntu-latest` runner, 500 seeded employees. Results are in the `log-load` artifact (`load/results/*.json`, `ci-logs/load.log`).
+First passing nightly load, soak and settlement: nightly run [43040233170](https://github.com/Positron00/FinApp/actions/runs/43040233170) on `e3789dd` (2026-11-11), GitHub `ubuntu-latest` runner, 500 seeded employees. Results are in the `log-load` artifact (`load/results/*.json`, `ci-logs/load.log`).
 
 | Scenario | Load | Result | Threshold |
 | --- | --- | --- | --- |
@@ -207,7 +207,7 @@ First full pass: nightly run [43040233170](https://github.com/Positron00/FinApp/
 | `soak` | 30 min | p95 24 ms, no drift (24.9 → 23.9 ms); RSS slope ≤ +0.2%; consumer lag 0 | drift, RSS slope ≤ 5%, lag not growing |
 | `settlement` | 5 runs × 500 employees | p95 16.6 s approval → final | p95 ≤ 60 s |
 
-The same run's `resilience` (13 tests, 33 min), `schemathesis-deep` and `audit` jobs passed. `e2e-repeat` could not start: the runner failed to resolve Ubuntu's apt mirror while installing Chromium's system packages (both nightly runs that day). That failure is infrastructure; see the job's issue.
+The same run's `resilience` (13 tests, 33 min), `schemathesis-deep` and `audit` jobs passed. `e2e-repeat` could not start: the runner failed to resolve Ubuntu's apt mirror while installing Chromium's system packages (all three nightly attempts that day: run 43037260723 and both attempts of 43040233170). That failure is infrastructure; see the job's issue.
 
 **First full nightly pass:** run [43074520518](https://github.com/Positron00/FinApp/actions/runs/43074520518) on `49c5658` (2026-11-11): every job green: `load` 47 min, `resilience` 35 min, `e2e-repeat` (the full e2e three times) 28 min, `schemathesis-deep` and `audit`. Before it, `e2e-repeat` was fixed twice: Chromium is installed without `--with-deps` (the runner's apt mirror failed DNS), and a J2 test hang on a cancelled response body (C77). The hang struck once in six CI runs, so three clean runs are good evidence, not proof; any recurrence opens a nightly-failure issue.
 

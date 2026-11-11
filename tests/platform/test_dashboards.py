@@ -270,6 +270,47 @@ def test_histogram_panels_show_exemplars() -> None:
     assert not off, "histogram queries without exemplars:\n" + "\n".join(off)
 
 
+PANELS_TEST = OBS / "prometheus" / "tests" / "panels_test.yml"
+DRILLS = ROOT / "scripts" / "ci" / "alert_drills.sh"
+# (panel title, refId) -> the counter it counts; each one's expression is a promtool case
+COUNTER_PANELS = {
+    ("Dead-lettered messages", "A"): "queue_messages_total",
+    ("Late settlements (possible double payment)", "A"): "payroll_late_settlements_total",
+    ("Identity emails", "B"): "identity_emails_failed_total",
+}
+DRILLED_COUNTERS = ("queue_messages_total", "payroll_late_settlements_total")
+
+
+def promtool_counter_exprs() -> dict[str, str]:
+    """Counter -> the expression ``panels_test.yml`` checks for it (one per counter)."""
+    out: dict[str, str] = {}
+    for case in yaml.safe_load(PANELS_TEST.read_text())["tests"]:
+        for t in case.get("promql_expr_test", []):
+            names = metric_names(t["expr"])
+            assert len(names) == 1, f"one counter per panel expression: {t['expr']}"
+            (name,) = names
+            assert out.setdefault(name, t["expr"]) == t["expr"], f"two expressions for {name}"
+    return out
+
+
+def test_queues_counter_panels_and_drills_use_the_promtool_tested_expressions() -> None:
+    """PAY-NFR-10, 11 (C75, C77): the Queues counter panels and the drill checks count new series
+    and increases across data gaps, exactly as ``panels_test.yml`` proves."""
+    tested = promtool_counter_exprs()
+    assert set(tested) == set(COUNTER_PANELS.values())
+    queues = dashboards()["queues.json"]
+    found = {
+        (p["title"], t["refId"]): t["expr"]
+        for p in panels(queues["panels"])
+        for t in p.get("targets", [])
+    }
+    for key, counter in COUNTER_PANELS.items():
+        assert found.get(key) == tested[counter], f"queues.json {key}"
+    drills = DRILLS.read_text(encoding="utf-8")
+    for counter in DRILLED_COUNTERS:
+        assert f"'({tested[counter]}) > 0'" in drills, f"alert_drills.sh check for {counter}"
+
+
 def test_journeys_has_one_row_per_journey() -> None:
     rows = [p["title"] for p in dashboards()["journeys.json"]["panels"] if p["type"] == "row"]
     assert [r.split()[0] for r in rows] == ["SLO", "J1", "J2", "J3", "J4", "J5"]

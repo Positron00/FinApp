@@ -308,19 +308,42 @@ approved_run() {
 }
 
 # ---------------------------------------------------------------- drills
+# dlq_arms -> logs which PayoutDLQ arms hold now (C75, C77). Always 0: a plain increase() page is a
+# WARNING, not a failure, since the worker's export timing decides which arm sees the DLQ.
+dlq_arms() {
+  local x='queue_messages_total{outcome="dlq"}' held=() a
+  local before="max_over_time(${x}[1h] offset 15m)"
+  prom_has "increase(${x}[15m]) > 0" && held+=(increase)
+  prom_has "${x} > 0 unless ${before}" && held+=(new-series)
+  prom_has "${x} - ${before} > 0" && held+=(gap)
+  log "PayoutDLQ arms holding now: ${held[*]:-none}"
+  if ((${#held[@]} == 0)); then
+    log "WARNING: no PayoutDLQ arm holds now (delivered after the 15 m window?)"
+    return 0
+  fi
+  for a in "${held[@]}"; do
+    [[ "$a" == increase ]] || return 0
+  done
+  log "WARNING: only plain increase() held: the worker exported 0 before dead-lettering, so this" \
+    "drill did not exercise the new-series arm"
+}
+
 drill_PayoutDLQ() {
   local entry ok=1
   # The entry goes in while payout-worker is stopped; the restarted worker (a new process, so a new
-  # series) dead-letters it within its first export interval. Its first exported sample is then
-  # already 1, so every drill exercises the C75 new-series arm, the case the first drill missed.
+  # series) dead-letters it, usually within its first export interval. Its first exported sample is
+  # then already 1, so the drill exercises the C75 new-series arm, the case the first drill missed.
+  # Export timing decides it: if the worker exports its pre-initialised 0 first, plain increase()
+  # pages instead, which is logged as a warning (dlq_arms).
   service_stop payout-worker
   entry="$(redis_cli payroll REDIS_PAYROLL_PASSWORD XADD stream:payout.requested '*' \
-    event_id "drill-$(date +%s)" type payout.requested envelope 'alert-drill: not json')" || return 1
+    event_id "drill-$(date +%s)" type payout.requested envelope 'alert-drill: not json')" ||
+    { service_up payout-worker; return 1; }
   log "poison entry $entry added to stream:payout.requested (payout-worker stopped)"
   service_up payout-worker || return 1
   log "payout-worker started"
-  delivered PayoutDLQ "$DRILL_TIMEOUT_S" &&
-    check_query "Queues: dead-lettered in 15 m" '(sum(increase(queue_messages_total{outcome="dlq"}[15m]) and max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m)) or vector(0)) + (sum(queue_messages_total{outcome="dlq"} unless max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m)) or vector(0)) > 0' &&
+  delivered PayoutDLQ "$DRILL_TIMEOUT_S" && dlq_arms &&
+    check_query "Queues: dead-lettered in 15 m" '(sum(clamp_min(last_over_time(queue_messages_total{outcome="dlq"}[15m]) - max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m), 0) or (last_over_time(queue_messages_total{outcome="dlq"}[15m]) unless max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m))) or vector(0)) > 0' &&
     check_query "Queues: DLQ length" 'max(queue_dlq_messages) > 0' && ok=0
   # reset: drop the drill's DLQ entry (matched by source_id) as the admin user
   redis_cli default REDIS_ADMIN_PASSWORD --json XRANGE stream:payout.requested.dlq - + |
@@ -365,7 +388,7 @@ drill_PayoutLateSettlement() {
   payroll_api result "$payout" "$attempt" settled "DRILL-$(date +%s)" >/dev/null || return 1
   log "payout $payout attempt $attempt: rejected, then settled (late settlement)"
   delivered PayoutLateSettlement "$DRILL_TIMEOUT_S" &&
-    check_query "Queues: late settlements in 15 m" '(sum(increase(payroll_late_settlements_total[15m]) and max_over_time(payroll_late_settlements_total[1h] offset 15m)) or vector(0)) + (sum(payroll_late_settlements_total unless max_over_time(payroll_late_settlements_total[1h] offset 15m)) or vector(0)) > 0' && ok=0
+    check_query "Queues: late settlements in 15 m" '(sum(clamp_min(last_over_time(payroll_late_settlements_total[15m]) - max_over_time(payroll_late_settlements_total[1h] offset 15m), 0) or (last_over_time(payroll_late_settlements_total[15m]) unless max_over_time(payroll_late_settlements_total[1h] offset 15m))) or vector(0)) > 0' && ok=0
   log "the cause in Loki: {service_name=\"payroll\"} | event=\"payout.late_settlement\" | payout_id=\"$payout\""
   service_up payout-worker || ok=1
   wait_until "$DRILL_RECOVERY_WAIT_S" "run $rid final" run_final "$rid" || log "WARNING: run $rid not final yet"

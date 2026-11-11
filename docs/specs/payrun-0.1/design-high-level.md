@@ -1,6 +1,6 @@
 # High-level design: PayRun 0.1.0
 
-Source: [architecture plan](../../plan/architecture-plan.md) v1.2 (accepted 2026-11-10). Requirements: [requirements.md](requirements.md).
+Source: [architecture plan](../../plan/architecture-plan.md) v1.4 (2026-11-11; v1.2 accepted 2026-11-10). Requirements: [requirements.md](requirements.md).
 
 ## 1. Components
 
@@ -108,29 +108,31 @@ log events, metrics and alerts, and adds test layers. Every alerted row has a ru
 |---|---|---|---|---|---|
 | Worker crash before the bank call | XAUTOCLAIM | Redelivered, paid once | `queue.message.processed` / `queue_messages_total` | — | PAY-403, NFR-02 |
 | Worker crash after the bank call | XAUTOCLAIM | Same key; bank returns the original | `bank.transfer.submitted` / `payouts_bank_transfers_total` | — | PAY-403, 412, NFR-02 |
-| Bank timeout after settling | Client timeout | Retry with the same key, or indeterminate → re-publish | `payout.indeterminate` / `payroll_payouts_republished_total` | `PayoutsStuck` | PAY-404, 407 |
-| Bank down | Breaker | Attempts indeterminate; run processing (awaiting bank) | `external.breaker.opened` / `circuit_breaker_state` | `BankBreakerOpen`, `PayoutSettlementSlow` | PAY-404, 407, NFR-03 |
-| Bank non-business 4xx | Classification | No answer → indeterminate | `bank.transfer.no_answer` / `external_requests_total` | `BankErrorRateHigh` | PAY-404 |
+| Bank timeout after settling | Client timeout | Retry with the same key, or indeterminate → re-publish | `payout.indeterminate` / `payroll_payouts_republished_total` | `PayoutsStuck` if prolonged | PAY-404, 407 |
+| Bank down | Breaker | Attempts indeterminate; run processing (awaiting bank) | `external.breaker.opened`, `payout.indeterminate` / `circuit_breaker_state{target="bank"}` | `BankBreakerOpen`, `PayoutSettlementSlow` | PAY-404, 407, NFR-03 |
+| Bank non-business 4xx | Classification | No answer → indeterminate | `bank.transfer.no_answer` / `external_requests_total{outcome}` | `BankErrorRateHigh` | PAY-404 |
 | bank-stub restart | — | Persistent ledger; ≤ 1 settled transfer | `bank_stub.transfer.replayed` / `payouts_bank_transfers_total{outcome="settled"}` | — | PAY-412, NFR-02 |
-| Old attempt redelivered after a retry | Instruction 409 | ACK with no bank call | `payout.attempt_not_current` | — | PAY-403, 411 |
+| Old attempt redelivered after a retry | Instruction 409 | ACK with no bank call | `payout.attempt_not_current` / `queue_messages_total{outcome}` | — | PAY-403, 411 |
 | Two consumers on one message | — | Unique disbursement plus bank key | — | — | PAY-403, NFR-02 |
-| Re-publish racing a live consumer | — | Same key; second result 200 with the stored outcome | `payout.republished` | — | PAY-405, 407 |
-| `indeterminate` after `settled` (and the reverse) | — | No change / applies | `payout.result_recorded` | — | PAY-405 |
-| Late definite answer for a `needs_operator` attempt | Result endpoint | `settled`/`rejected` applies (the bank's answer wins); `indeterminate`/`poison` → 200, no change (R7, C42) | `payout.result_recorded` | — | PAY-405, 502 |
+| Re-publish racing a live consumer | — | Same key; second result 200 with the stored outcome | `payout.republished` / `payroll_payouts_republished_total` | — | PAY-405, 407 |
+| `indeterminate` after `settled` (and the reverse) | — | No change / applies | `payout.result_recorded` / `payroll_payouts_total` | — | PAY-405 |
+| Late definite answer for a `needs_operator` attempt | Result endpoint | `settled`/`rejected` applies (the bank's answer wins); `indeterminate`/`poison` → 200, no change (R7, C42) | `payout.result_recorded` / `payroll_payouts_total` | — | PAY-405, 502 |
 | payroll down during processing | Worker client errors | Pending → DLQ; re-publish after recovery | `queue.message.failed` / `queue_messages_total{outcome="dlq"}` | `PayoutDLQ`, `PayoutsStuck` | PAY-407, 408 |
 | Poison message | Schema, amount or payout_not_found check | DLQ at once; `needs_operator`; operator resolves (PAY-502) | `payout.needs_operator` / `payroll_attempts_needs_operator` | `PayoutDLQ`, `PayoutNeedsOperator` | PAY-409 |
-| Key window expired | Attempt age | GET only; 404 → needs_operator; only `mark_rejected` after a bank-statement check (redrive refused, C73) | `payout.key_window_expired` | `PayoutNeedsOperator` | PAY-410 |
+| Poison message looping through re-publish | Re-publish count (`PAYOUT_REPUBLISH_MAX`) | Attempt `needs_operator`; re-publish stops; UI shows "blocked" | `payout.needs_operator` / `payroll_attempts_needs_operator` | `PayoutNeedsOperator` | PAY-407, 409 |
+| Key window expired | Attempt age | GET only; 404 → needs_operator; the operator can only `mark_rejected` after a bank-statement check (redrive refused, 422 `redrive_not_allowed`; C73) | `payout.key_window_expired` / `payroll_attempts_needs_operator` | `PayoutNeedsOperator` | PAY-410 |
 | Redis down | Client errors | Session 503; limiter rules; outbox holds | `ratelimit.backend_error` / `rate_limiter_errors_total`, `outbox_unsent` | `OutboxStuck`, `RateLimiterErrors` | PAY-603, 402 |
-| Redis data loss / NOGROUP | NOGROUP error | Recreate the group; re-publish | `queue.group.recreated`, `payout.republished` | `PayoutsStuck` | PAY-407, 408 |
+| Redis data loss (FLUSHALL) mid-run | `last_published_at` age (PAY-407) | Re-publish redrives non-final attempts; the run completes | `payout.republished` / `payroll_payouts_republished_total` | `PayoutsStuck` if prolonged | PAY-407 |
+| Consumer group lost (NOGROUP after FLUSHALL) | NOGROUP error | The worker recreates the group from `0` with MKSTREAM; re-publish redrives | `queue.group.recreated`, `payout.republished` / `payroll_payouts_republished_total` | `PayoutsStuck` if prolonged | PAY-407, 408 |
 | Outbox relay crash | Unsent age | Another replica or the restart sends | `outbox.relay.error` / `outbox_oldest_age_seconds` | `OutboxStuck` | PAY-402 |
 | Late `settled` answer for a rejected or superseded attempt (possible double payment) | Result check | Response unchanged; audit `payout.late_settlement` once per attempt; operator checks the bank and recalls | `payout.late_settlement` (error) / `payroll_late_settlements_total` | `PayoutLateSettlement` (page) | PAY-NFR-02 |
 | Relay refuses an envelope (`EnvelopeInvalidError`) | Unsent age | The row is never claimed again and stays unsent; re-publish moves the attempt to `needs_operator` / `envelope_invalid`; the operator resolves the attempt, then deletes that one row as `payroll_migrator` (runbook OutboxStuck, C76) | `outbox.relay.error`, `payout.needs_operator` / `outbox_oldest_age_seconds` | `OutboxStuck`, `PayoutNeedsOperator` | PAY-NFR-03 |
 | Slow DB (2 s) | Statement timeout (slow query); asyncpg `command_timeout` and the per-unit DB budget `DB_STATEMENT_TIMEOUT_MS/1000 + DB_POOL_TIMEOUT_S` (slow link) | 503 `db_timeout` within the 4 s budget | `http.request` / `http_server_request_duration_seconds` | `BffAvailabilityFastBurn` | PAY-605, NFR-04 |
 | Postgres down | `/readyz` | 503 `db_unavailable` fast; recovers | `db.unavailable` / `http_server_request_duration_seconds` | `BffAvailabilityFastBurn` | PAY-605 |
-| identity down | BFF client | 503 `service_unavailable`; breaker | `bff.upstream_error` / `circuit_breaker_state` | `BffAvailabilityFastBurn` | PAY-602 |
+| identity down | BFF client | 503 `service_unavailable`; breaker | `bff.upstream_error` / `circuit_breaker_state{target="identity"}` | `BffAvailabilityFastBurn` | PAY-602 |
 | SMTP down | Relay errors | Queued; failed after 10 attempts | `email.send_failed` / `identity_emails_pending`, `identity_emails_failed_total` | `EmailOutboxStuck` | PAY-110 |
 | Redis restart (PAY-NFR-15) | — | AOF reload; the stream and consumer group survive; no re-publish needed | Redis log "DB loaded from append only file" / `redis_start_time_seconds` | — | PAY-NFR-15 |
-| Concurrent approve | Row lock | One wins, the other gets 409 | `payrun.approved` | — | PAY-400 |
+| Concurrent approve | Row lock | One wins, the other gets 409 | `payrun.approved` / `payroll_pay_runs_total` | — | PAY-400 |
 | Demoted user | Re-check | Session ended (401) within 60 s | `auth.session.revoked` | — | PAY-107 |
 | JWT skew | Verify | 5 s leeway; else 401 | `auth.token.rejected` | — | PAY-600 |
 

@@ -9,6 +9,7 @@ calculate the run on Tuesday, and approve it alone.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from typing import Any
 
@@ -16,12 +17,13 @@ import pytest
 from pycommon.testing import PgBootstrapped
 
 from tests.helpers import employee_body
-from tests.integration.conftest import PAYROLL_ADMIN, Api, admin_connect
+from tests.integration.conftest import APPROVER, PAYROLL_ADMIN, Api, admin_connect
 
 pytestmark = pytest.mark.integration
 
 ALICE = "0193a000-0000-7000-8000-0000000000a5"
 ALICE_ACCOUNT = "999988887777"
+_REJECTED = {"attempt": 1, "outcome": "rejected", "reason": "account_closed"}
 
 
 def _alice(api: Api) -> dict[str, str]:
@@ -254,14 +256,27 @@ async def test_no_transfer_employee_edit_does_not_block(api: Api, db: Any) -> No
 
 
 async def _until_a_patch_waits_on_the_row_lock(db: Any) -> None:
+    await _until_waiting_on_a_row_lock(db, "%payroll.employees%FOR UPDATE%", "the PATCH")
+
+
+async def _until_waiting_on_a_row_lock(db: Any, query_like: str, who: str) -> None:
     for _ in range(1000):
         if await db.fetchval(
             "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
-            "AND query ILIKE '%payroll.employees%FOR UPDATE%'"
+            "AND query ILIKE $1",
+            query_like,
         ):
             return
         await asyncio.sleep(0.01)
-    raise AssertionError("the PATCH never waited on the employee lock")
+    raise AssertionError(f"{who} never waited on a row lock ({query_like})")
+
+
+async def _cancel(task: asyncio.Task[Any] | None) -> None:
+    """Cancel a request task a failed assertion left running, bounded."""
+    if task is not None and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+            await asyncio.wait_for(task, 5)
 
 
 async def test_edit_waiting_on_an_approve_lock_is_not_vetted_by_it(
@@ -275,6 +290,7 @@ async def test_edit_waiting_on_an_approve_lock_is_not_vetted_by_it(
     now(), the PATCH's transaction start was earlier than approve #2's, so it counted as vetted.)"""
     emp = await _employee(api, 0)
     jan = await _run(api, "2026-01-01")
+    patch: asyncio.Task[Any] | None = None
     holder = await admin_connect(migrated)  # stands in for approve #1
     try:
         tx = holder.transaction()
@@ -291,9 +307,10 @@ async def test_edit_waiting_on_an_approve_lock_is_not_vetted_by_it(
         assert r.status_code == 200, r.text
         assert not patch.done()
         await tx.commit()
+        assert (await asyncio.wait_for(patch, 10)).status_code == 200
     finally:
         await holder.close()
-    assert (await patch).status_code == 200
+        await _cancel(patch)
     snap = await db.fetchrow(
         "SELECT a.account_last4, a.requested_at, e.bank_updated_at FROM payroll.payout_attempts a "
         "JOIN payroll.payouts p ON p.id = a.payout_id JOIN payroll.employees e "
@@ -305,3 +322,103 @@ async def test_edit_waiting_on_an_approve_lock_is_not_vetted_by_it(
     feb = await _run(api, "2026-02-01")
     r = await api.approve(feb, headers=_alice(api))
     assert _err(r) == (403, "approver_must_differ", {"rule": "bank_editor", "employee_ids": [emp]})
+
+
+async def _failed_payout(api: Api, emp: str) -> tuple[str, str]:
+    """January for ``emp``, approved by Grace; the bank rejects attempt 1 → (run id, payout id)."""
+    jan = await _run(api, "2026-01-01")
+    assert (await api.approve(jan)).status_code == 200
+    [p] = await api.payouts(jan)
+    assert (await api.result(p["id"], _REJECTED)).json()["outcome"] == "rejected"
+    return jan, str(p["id"])
+
+
+async def _attempt(db: Any, payout_id: str, attempt: int) -> Any:
+    return await db.fetchrow(
+        "SELECT a.account_last4, a.requested_by, a.requested_at, e.bank_updated_at "
+        "FROM payroll.payout_attempts a JOIN payroll.payouts p ON p.id = a.payout_id "
+        "JOIN payroll.employees e ON e.id = p.employee_id "
+        "WHERE a.payout_id = $1 AND a.attempt = $2",
+        payout_id,
+        attempt,
+    )
+
+
+async def test_edit_waiting_on_a_retry_lock_is_not_vetted_by_it(
+    api: Api, db: Any, migrated: PgBootstrapped
+) -> None:
+    """PAY-500, C73, the retry twin of the approve race: a lock holder (another approve or retry)
+    holds the employee FOR SHARE; Alice's PATCH waits for FOR UPDATE; Grace's retry takes FOR
+    SHARE too and snapshots the OLD details as attempt 2; then the PATCH commits. The edit is later
+    than attempt 2's requested_at, so it stays unvetted: when the bank rejects attempt 2, Alice's
+    own retry → 403 bank_editor."""
+    emp = await _employee(api, 0)
+    jan, payout = await _failed_payout(api, emp)
+    patch: asyncio.Task[Any] | None = None
+    holder = await admin_connect(migrated)
+    try:
+        tx = holder.transaction()
+        await tx.start()
+        await holder.execute("SELECT 1 FROM payroll.employees WHERE id = $1 FOR SHARE", emp)
+        patch = asyncio.create_task(
+            api.client.patch(
+                f"/v1/employees/{emp}", json={"bank_account": ALICE_ACCOUNT}, headers=_alice(api)
+            )
+        )
+        await _until_a_patch_waits_on_the_row_lock(db)
+        async with asyncio.timeout(10):
+            r = await api.retry(jan, payout)  # Grace: FOR SHARE is granted past the waiting PATCH
+        assert r.status_code == 200, r.text
+        assert r.json()["current_attempt"] == 2
+        assert not patch.done()
+        await tx.commit()
+        assert (await asyncio.wait_for(patch, 10)).status_code == 200
+    finally:
+        await holder.close()
+        await _cancel(patch)
+    snap = await _attempt(db, payout, 2)
+    assert (snap["account_last4"], snap["requested_by"]) == ("6789", APPROVER)  # the old details
+    assert snap["bank_updated_at"] > snap["requested_at"]
+    rejected = {**_REJECTED, "attempt": 2}
+    assert (await api.result(payout, rejected)).json()["outcome"] == "rejected"
+    r = await api.retry(jan, payout, headers=_alice(api))
+    assert _err(r) == (403, "approver_must_differ", {"rule": "bank_editor", "employee_ids": [emp]})
+
+
+async def test_edit_committed_while_a_retry_waits_is_vetted_by_it(
+    api: Api, db: Any, migrated: PgBootstrapped
+) -> None:
+    """PAY-500, C73, the other side of the retry race: Grace's retry starts and waits for the
+    run's FOR UPDATE (held here); Alice's PATCH, which never locks pay_runs, commits meanwhile;
+    the retry then snapshots Alice's NEW details as attempt 2 (all within the 1 s lock_timeout).
+    Its requested_at is clock_timestamp() read after the employee lock, so it is later than the
+    edit: Grace released those details, and Alice's own retry after the bank rejects attempt 2 is
+    allowed. (With now(), requested_at was the retry's transaction start, before the edit, so the
+    details Grace released counted as unvetted and Alice was refused.)"""
+    emp = await _employee(api, 0)
+    jan, payout = await _failed_payout(api, emp)
+    retry: asyncio.Task[Any] | None = None
+    holder = await admin_connect(migrated)
+    try:
+        tx = holder.transaction()
+        await tx.start()
+        await holder.execute("SELECT 1 FROM payroll.pay_runs WHERE id = $1 FOR UPDATE", jan)
+        retry = asyncio.create_task(api.retry(jan, payout))  # Grace
+        # pg_stat_activity keeps the first 1 kB of a query, so the run SELECT's FOR UPDATE is cut
+        # off; it is the only statement that waits on a lock here.
+        await _until_waiting_on_a_row_lock(db, "SELECT payroll.pay_runs.id%", "the retry")
+        await _redirect_bank(api, emp, _alice(api))
+        assert not retry.done()
+        await tx.commit()
+        r = await asyncio.wait_for(retry, 10)
+        assert r.status_code == 200, r.text
+    finally:
+        await holder.close()
+        await _cancel(retry)
+    snap = await _attempt(db, payout, 2)
+    assert (snap["account_last4"], snap["requested_by"]) == ("7777", APPROVER)  # Alice's details
+    assert snap["requested_at"] > snap["bank_updated_at"]
+    rejected = {**_REJECTED, "attempt": 2}
+    assert (await api.result(payout, rejected)).json()["outcome"] == "rejected"
+    r = await api.retry(jan, payout, headers=_alice(api))
+    assert r.status_code == 200, r.text

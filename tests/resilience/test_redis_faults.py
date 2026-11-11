@@ -1,5 +1,6 @@
-"""Redis down and Redis data loss (HLD §4 rows "Redis down" and "Redis data loss / NOGROUP";
-plan §12.1; testing.md §8; PAY-106, PAY-402, PAY-407, PAY-408, PAY-603, PAY-NFR-03).
+"""Redis down and Redis data loss (HLD §4 rows "Redis down", "Redis data loss (FLUSHALL) mid-run"
+and "Consumer group lost (NOGROUP after FLUSHALL)"; plan §12.1; testing.md §8; PAY-106, PAY-402,
+PAY-407, PAY-408, PAY-603, PAY-NFR-03).
 
 - Redis down: Toxiproxy's ``redis`` proxy carries every runtime Redis connection (web, identity,
   payroll, worker). With it disabled a signed-in request gets 503 (never "no session", never
@@ -95,10 +96,11 @@ def test_redis_down_fails_closed_holds_the_outbox_and_recovers(
 def test_redis_flushall_mid_run_recreates_the_group_and_republish_completes(
     stack: Stack, containers: Containers, payroll: Payroll
 ) -> None:
-    """PAY-407, PAY-408, PAY-NFR-03, HLD §4 "Redis data loss / NOGROUP": the published messages
-    are lost (all but the one already handed to the blocked, paused reader); the worker
-    recreates its group (queue.group.recreated) and payroll's re-publish redrives every
-    attempt, so the run is paid once."""
+    """PAY-407, PAY-408, PAY-NFR-03, HLD §4 "Redis data loss (FLUSHALL) mid-run" and "Consumer
+    group lost (NOGROUP after FLUSHALL)": the published messages are lost (all but the one
+    already handed to the blocked, paused reader); the worker recreates its group
+    (queue.group.recreated) and payroll's re-publish redrives every attempt, so the run is paid
+    once."""
     t0 = datetime.now(UTC)
     republished = stack.prom(REPUBLISHED)
     run = payroll.calculated_run()

@@ -49,16 +49,33 @@ end to end. Decisions are recorded in the spec README
   `.env.example`.
 - Counter alerts (`PayoutDLQ`, `PayoutLateSettlement`, `EmailOutboxStuck`) and their dashboard
   panels also fire on a counter series that first appears above 0, such as a dead letter inside a
-  restarted worker's first export interval (C75, found by the live PayoutDLQ drill). All six
-  paging alerts pass their drills.
+  restarted worker's first export interval (C75, found by the live PayoutDLQ drill). The check
+  also looks back over the hour before the window (2 h for `EmailOutboxStuck`), so an old series
+  behind a data gap doesn't page, and increases during a gap still page (C77). All six paging
+  alerts pass their drills.
+- The outbox relay never re-claims an envelope it refused (`EnvelopeInvalidError`): the row stays
+  unsent as evidence, so `OutboxStuck` keeps seeing it, and re-publish moves the attempt to
+  `needs_operator` (C76).
+- Web replicas export distinct series (`service.instance.id` is a random UUID per process), and
+  the Collector runs one replica in every overlay with `Recreate` rollouts, so tail sampling sees whole traces (C77).
+- `scripts/ci/check_metrics.sh` requires 27 entries, including full selectors for pre-initialised series (C77).
+
+### Fixed
+
+- The J2 employees e2e hang: a response cancelled while loading left Playwright's
+  `response.text()` pending forever, so the spec now records `/api` bodies on `requestfinished`
+  (C77).
+- CI installs Chromium without `--with-deps`, because that step ran apt and the runner's Ubuntu
+  mirror failed DNS, so `e2e-repeat` never started (C77).
 
 ### Security
 
 - Dual approval tightened (C73, amending ADR 0005): with it on, the approver must differ from the
-  calculator, the run's creator, anyone who entered hours on the run, and the editor of any bank
-  change not yet vetted by a dual-approved payout; retry uses the same window; whoever marks an
-  attempt rejected can't retry that payout; redrive of an expired-key attempt is refused; payroll
-  audit events are append-only for the runtime role; denied approves and retries are audited.
+  calculator, the run's creator, the last editor of any hours row on the run, and the editor of a
+  not-yet-vetted bank change for any employee who gets a transfer (net > 0); retry refuses that
+  unvetted bank editor and the operator who marked the current attempt rejected; redrive of an
+  expired-key attempt is refused; payroll audit events are append-only for the runtime role;
+  denied approves and retries are audited.
 - Identity hardening (C74): a confirmed password reset or an accepted invite clears the account's
   login lockout, so an attacker can't keep an account (even the only admin) locked out; reset
   requests are padded to a 50 ms floor, so a known and an unknown email take the same time.

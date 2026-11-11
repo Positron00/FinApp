@@ -1,6 +1,6 @@
 # Tasks: PayRun 0.1.0
 
-Status (2026-11-11): skeleton done (CI green on main). On `release/0.1.0`: F1–F6, H1, H2 and H3 done; R1 in progress (docs written; PR next). First full nightly pass: run 43074520518 on `49c5658`.
+Status (2026-11-11): skeleton done (CI green on main). On `release/0.1.0`: F1–F6, H1, H2, H3 and R1 done: PR #11 (`release/0.1.0` → `main`) is open with all 12 checks green at `eebcc2c`; a final docs review is in progress. First full nightly pass: run 43074520518 on `49c5658`.
 Feature, hardening and release tasks (F*, H*, R1) run on `release/0.1.0`.
 
 **Rules for every task:**
@@ -75,7 +75,7 @@ The skeleton journey: sign in as the seeded owner → create a monthly run for s
 
 | ID | Task | Covers | Depends | Parallel with | Done when | Est. | Status |
 |---|---|---|---|---|---|---|---|
-| R1 | Docs (README, ARCHITECTURE, RUNBOOK, TESTING, API reference, `.env.example`), `CLAUDE.md`, checkpoint and memory, version 0.1.0, CHANGELOG, one PR, green CI | PAY-NFR-12 | H3 | — | PR open against `main` with green checks | 4 h | in progress (2026-11-11; docs, CLAUDE.md, CHANGELOG committed; alignment review fixes C76–C77; nightly passes; PR open) |
+| R1 | Docs (README, ARCHITECTURE, RUNBOOK, TESTING, API reference, `.env.example`), `CLAUDE.md`, checkpoint and memory, version 0.1.0, CHANGELOG, one PR, green CI | PAY-NFR-12 | H3 | — | PR open against `main` with green checks | 4 h | done (2026-11-11): PR #11 open against `main`, all 12 checks green at `eebcc2c`; docs, CLAUDE.md and CHANGELOG committed; alignment review fixes C76–C77; first full nightly pass 43074520518. A final docs review is in progress |
 
 ## Coverage
 

@@ -4,7 +4,7 @@
 |---|---|
 | **Severity** | page (money may be stuck) |
 | **Service** | payout-worker |
-| **Alert** | `increase(queue_messages_total{outcome="dlq"}[15m]) > 0 or (queue_messages_total{outcome="dlq"} > 0 unless max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m))` (`deploy/observability/prometheus/rules/alerts.yml`) |
+| **Alert** | `increase(queue_messages_total{outcome="dlq"}[15m]) > 0 or (queue_messages_total{outcome="dlq"} > 0 unless max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m)) or (queue_messages_total{outcome="dlq"} - max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m) > 0)` (`deploy/observability/prometheus/rules/alerts.yml`) |
 | **Requirement** | PAY-408, PAY-409, PAY-NFR-11; DLQ entry contract `contracts/events/payout.requested.dlq.v1.json` (C21) |
 | **Dashboard** | Queues and workers, `http://127.0.0.1:4101/d/payrun-queues` |
 
@@ -15,7 +15,7 @@ The worker moved at least one message from `stream:payout.requested` to `stream:
 - **at once** when it is poison (`error_kind = invalid`): schema-invalid (`schema_invalid`), the payout does not exist (`payout_not_found`), or the instruction's amount, currency or IDs differ from the event (`amount_mismatch`). When the IDs are readable the worker first reports the attempt as poison, which moves it to `needs_operator` (PayoutNeedsOperator follows);
 - **after `PAYOUT_MAX_DELIVERIES` (5) deliveries** when payroll keeps failing (`error_kind = payroll`) or the worker hits an internal error (`internal`). Those attempts stay `requested`, and payroll re-publishes them after `PAYOUT_REPUBLISH_AFTER_S` (360 s).
 
-The counter is pre-initialised at 0 (C21), but a dead letter inside a restarted worker's first export interval still reaches Prometheus as a series that starts at 1, which `increase()` reads as 0. The rule's second arm (C75) pages on a series above 0 that had no sample in the hour before the 15-minute window, so the first dead letter after a restart pages too. Looking back an hour, not at one instant, keeps an old series that only lost samples for a while (a Prometheus or Collector restart, or `metric_expiration` dropping a stalled exporter) from paging. The alert clears 15 minutes after the last dead letter (for a new series, 15 minutes after it first appeared).
+The counter is pre-initialised at 0 (C21), but a dead letter inside a restarted worker's first export interval still reaches Prometheus as a series that starts at 1, which `increase()` reads as 0. The rule's second arm (C75) pages on a series above 0 that had no sample in the hour before the 15-minute window, so the first dead letter after a restart pages too. Looking back an hour, not at one instant, keeps an old series that only lost samples for a while (a Prometheus or Collector restart, or `metric_expiration` dropping a stalled exporter) from paging. The third arm (C77) pages when such an old series **rose during** the gap: `increase()` then sees only the post-gap samples, so the rule compares the current value with the highest one in the hour before the window, and `$value` is the rise. A gap longer than an hour makes an old series look new, so it may page with its full value: check the count below. The alert clears 15 minutes after the last dead letter (for a new series, 15 minutes after it first appeared; after a gap, 15 minutes after the series came back).
 
 ## Impact
 
@@ -23,10 +23,10 @@ The payout in the message is not being paid until payroll re-publishes it or an 
 
 ## First checks
 
-1. **How many, and why** (Queues dashboard, "Dead-lettered messages"). The increase of series that already existed, plus the whole value of new ones (a restarted worker's series that starts above 0; `increase()` alone reads it as 0):
+1. **How many, and why** (Queues dashboard, "Dead-lettered messages"). Per series, the rise over the window for series that already existed (across a data gap too), plus the whole value of new ones (a restarted worker's series that starts above 0; `increase()` alone reads it as 0):
 
    ```promql
-   sum by (stream) ((increase(queue_messages_total{outcome="dlq"}[15m]) and max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m)) or (queue_messages_total{outcome="dlq"} unless max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m)))
+   sum by (stream) (clamp_min(last_over_time(queue_messages_total{outcome="dlq"}[15m]) - max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m), 0) or (last_over_time(queue_messages_total{outcome="dlq"}[15m]) unless max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m)))
    ```
 
    ```promql
@@ -77,7 +77,7 @@ The payout in the message is not being paid until payroll re-publishes it or an 
 - No new dead letters: the dashboard's 15-minute count returns to 0 and the alert resolves.
 
   ```promql
-  (sum(increase(queue_messages_total{outcome="dlq"}[15m]) and max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m)) or vector(0)) + (sum(queue_messages_total{outcome="dlq"} unless max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m)) or vector(0))
+  sum(clamp_min(last_over_time(queue_messages_total{outcome="dlq"}[15m]) - max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m), 0) or (last_over_time(queue_messages_total{outcome="dlq"}[15m]) unless max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m))) or vector(0)
   ```
 
 - The affected payouts reach `paid` or `failed` (or are resolved), and `payroll_attempts_needs_operator` returns to 0.

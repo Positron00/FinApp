@@ -165,9 +165,13 @@ tests:
       - alertname: PayoutDLQ
         eval_time: 5m
         exp_alerts: []
-  - name: PayoutDLQ fires on a series that first appears at 1, and clears after 15 minutes (C75)
+  - name: PayoutDLQ fires on a series that first appears at 1, and clears 15 minutes after its first sample (C75)
     # A restarted worker dead-letters a redelivered poison message before its first export: the
     # first sample Prometheus sees is 1, which increase() reads as 0 (found by the live drill).
+    # Boundary: the first sample is at 3m. `max_over_time(X[1h] offset 15m)` looks at (t-75m,
+    # t-15m], closed on the right, so it first finds that sample at t = 18m. No `for`, 30 s
+    # evaluations: firing at 17m30s (the last evaluation before), gone at 18m. With `offset 10m`
+    # the arm would end at 13m, with `offset 15m30s` at 18m30s; both fail here.
     interval: 1m
     input_series:
       - series: 'queue_messages_total{service_name="payout-worker", stream="b", outcome="dlq"}'
@@ -187,7 +191,20 @@ tests:
               runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutDLQ.md"
               dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
       - alertname: PayoutDLQ
-        eval_time: 25m
+        eval_time: 17m30s
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              service_name: payout-worker
+              stream: b
+              outcome: dlq
+            exp_annotations:
+              summary: "Payout messages were dead-lettered in the last 15 minutes"
+              description: "1 message(s) moved to b.dlq. Money may be stuck: follow the DLQ replay steps."
+              runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutDLQ.md"
+              dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
+      - alertname: PayoutDLQ
+        eval_time: 18m
         exp_alerts: []
   - name: PayoutDLQ stays quiet on an old series after a 10-minute data gap (C75)
     # An old counter at 3 loses 10 minutes of samples (a Prometheus or Collector restart, or
@@ -205,6 +222,48 @@ tests:
         exp_alerts: []
       - alertname: PayoutDLQ
         eval_time: 55m
+        exp_alerts: []
+  - name: PayoutDLQ fires when an old series rose during a 20-minute data gap (C77)
+    # The series at 3 loses its samples from 31m to 50m while the worker dead-letters twice, and
+    # returns at 5 from 51m. increase([15m]) sees only post-gap samples (0), and the new-series arm
+    # is suppressed (the series has samples in (t-75m, t-15m]); `X - max_over_time(X[1h] offset
+    # 15m)` = 5 - 3 = 2 pages from the first post-gap sample until 15 minutes later (66m).
+    interval: 1m
+    input_series:
+      - series: 'queue_messages_total{service_name="payout-worker", stream="d", outcome="dlq"}'
+        values: "3x30 _x20 5x30"
+    alert_rule_test:
+      - alertname: PayoutDLQ
+        eval_time: 45m
+        exp_alerts: []
+      - alertname: PayoutDLQ
+        eval_time: 51m
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              service_name: payout-worker
+              stream: d
+              outcome: dlq
+            exp_annotations:
+              summary: "Payout messages were dead-lettered in the last 15 minutes"
+              description: "2 message(s) moved to d.dlq. Money may be stuck: follow the DLQ replay steps."
+              runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutDLQ.md"
+              dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
+      - alertname: PayoutDLQ
+        eval_time: 65m30s
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              service_name: payout-worker
+              stream: d
+              outcome: dlq
+            exp_annotations:
+              summary: "Payout messages were dead-lettered in the last 15 minutes"
+              description: "2 message(s) moved to d.dlq. Money may be stuck: follow the DLQ replay steps."
+              runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutDLQ.md"
+              dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
+      - alertname: PayoutDLQ
+        eval_time: 66m
         exp_alerts: []
 
   # ------------------------------------------------------------------ PayoutNeedsOperator (page)
@@ -254,6 +313,8 @@ tests:
               runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutLateSettlement.md"
               dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
   - name: PayoutLateSettlement pages on a series that first appears at 1 (restarted payroll, C75)
+    # Boundary: the first sample is at 2m, which (t-75m, t-15m] first holds at t = 17m: firing at
+    # 16m30s, gone at 17m (no `for`, 30 s evaluations).
     interval: 1m
     input_series:
       - series: 'payroll_late_settlements_total{service_name="payroll", instance="new"}'
@@ -272,7 +333,19 @@ tests:
               runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutLateSettlement.md"
               dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
       - alertname: PayoutLateSettlement
-        eval_time: 25m
+        eval_time: 16m30s
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              service_name: payroll
+              instance: new
+            exp_annotations:
+              summary: "The bank settled a payout attempt that payroll had already rejected or replaced"
+              description: "1 late settled answer(s) in the last 15 minutes: an employee may have been paid twice. Find the payout.late_settlement audit row, check the bank for every attempt's key, then recall or record."
+              runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutLateSettlement.md"
+              dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
+      - alertname: PayoutLateSettlement
+        eval_time: 17m
         exp_alerts: []
   - name: PayoutLateSettlement stays quiet while the counter is flat, and clears after 15 minutes
     interval: 1m
@@ -297,6 +370,27 @@ tests:
         exp_alerts: []
       - alertname: PayoutLateSettlement
         eval_time: 55m
+        exp_alerts: []
+  - name: PayoutLateSettlement pages when an old series rose during a 20-minute data gap (C77)
+    interval: 1m
+    input_series:
+      - series: 'payroll_late_settlements_total{service_name="payroll", instance="gap"}'
+        values: "3x30 _x20 5x30"
+    alert_rule_test:
+      - alertname: PayoutLateSettlement
+        eval_time: 51m
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              service_name: payroll
+              instance: gap
+            exp_annotations:
+              summary: "The bank settled a payout attempt that payroll had already rejected or replaced"
+              description: "2 late settled answer(s) in the last 15 minutes: an employee may have been paid twice. Find the payout.late_settlement audit row, check the bank for every attempt's key, then recall or record."
+              runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutLateSettlement.md"
+              dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
+      - alertname: PayoutLateSettlement
+        eval_time: 66m
         exp_alerts: []
 
   # ------------------------------------------------------------------ PayoutsStuck (page)
@@ -411,6 +505,8 @@ tests:
   - name: EmailOutboxStuck fires on a failure series that first appears at 1, and clears after the window (C75)
     # A restarted identity counts a permanent failure before its first export: increase() reads the
     # series as 0; the new-series arm is pending from 2 minutes and fires at 7 (for: 5m).
+    # Boundary: (t-3h, t-1h] first holds the 2m sample at t = 62m, so the alert fires at 61m30s
+    # and is gone at 62m. With `offset 55m` it would end at 57m, with `offset 1h0m30s` at 62m30s.
     interval: 1m
     input_series:
       - series: 'identity_email_oldest_pending_age_seconds{service_name="identity"}'
@@ -431,7 +527,16 @@ tests:
               runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/EmailOutboxStuck.md"
               dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
       - alertname: EmailOutboxStuck
-        eval_time: 125m
+        eval_time: 61m30s
+        exp_alerts:
+          - exp_labels: { severity: warning, service_name: identity }
+            exp_annotations:
+              summary: "Identity emails are stuck or failing"
+              description: "The oldest pending email is old, or emails failed permanently in the last hour (1). Check SMTP connectivity and identity logs."
+              runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/EmailOutboxStuck.md"
+              dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
+      - alertname: EmailOutboxStuck
+        eval_time: 62m
         exp_alerts: []
   - name: EmailOutboxStuck stays quiet on an old failure series after a 20-minute data gap (C75)
     # The window is 1 h, so the old `unless X offset 1h` arm read the series as new while the
@@ -450,6 +555,33 @@ tests:
         exp_alerts: []
       - alertname: EmailOutboxStuck
         eval_time: 110m
+        exp_alerts: []
+  - name: EmailOutboxStuck fires when an old failure series rose during a 70-minute data gap (C77)
+    # The gap is longer than the 1 h window, so increase([1h]) sees only post-gap samples (0) from
+    # 101m; the 30m sample is still in (t-3h, t-1h], so the new-series arm is suppressed. The gap
+    # arm (5 - 3 = 2) is pending from 101m and fires at 106m (for: 5m), until the post-gap samples
+    # enter (t-3h, t-1h] at 161m.
+    interval: 1m
+    input_series:
+      - series: 'identity_email_oldest_pending_age_seconds{service_name="identity"}'
+        values: "0x200"
+      - series: 'identity_emails_failed_total{service_name="identity", instance="gap"}'
+        values: "3x30 _x70 5x100"
+    alert_rule_test:
+      - alertname: EmailOutboxStuck
+        eval_time: 105m
+        exp_alerts: []
+      - alertname: EmailOutboxStuck
+        eval_time: 106m
+        exp_alerts:
+          - exp_labels: { severity: warning, service_name: identity }
+            exp_annotations:
+              summary: "Identity emails are stuck or failing"
+              description: "The oldest pending email is old, or emails failed permanently in the last hour (2). Check SMTP connectivity and identity logs."
+              runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/EmailOutboxStuck.md"
+              dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
+      - alertname: EmailOutboxStuck
+        eval_time: 161m
         exp_alerts: []
 
   # ------------------------------------------------------------------ RateLimiterErrors (warning)
@@ -628,6 +760,50 @@ tests:
     alert_rule_test:
       - alertname: SigninFailuresSpike
         eval_time: 16m
+        exp_alerts: []
+  - name: SigninFailuresSpike adds an old replica's increase to a restarted replica's new series (C77)
+    # Two replicas during a rollout. Replica a (running since 0m) counts 30 failures from 30m to
+    # 45m: increase() 30. Replica b's new process exports its first sample at 40m, already at 30
+    # (failures before its first export): no sample in (t-75m, t-15m], so it counts in full. At 45m
+    # the sum is 60; neither part alone is above 50, so `increase > 50 or new > 50` would miss it.
+    interval: 1m
+    input_series:
+      - series: 'auth_signins_total{service_name="identity", instance="a", outcome="failure"}'
+        values: "0x30 2+2x14 30x10"
+      - series: 'auth_signins_total{service_name="identity", instance="b", outcome="failure"}'
+        values: "_x40 30x15"
+    alert_rule_test:
+      - alertname: SigninFailuresSpike
+        eval_time: 39m
+        exp_alerts: []
+      - alertname: SigninFailuresSpike
+        eval_time: 45m
+        exp_alerts:
+          - exp_labels: { severity: warning, service_name: identity }
+            exp_annotations:
+              summary: "Many failed sign-ins in the last 15 minutes"
+              description: "60 failed sign-ins in 15 minutes. Check the auth audit log for a credential-stuffing pattern."
+              runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/SigninFailuresSpike.md"
+              dashboard_url: "http://127.0.0.1:4101/d/payrun-service-overview"
+  - name: SigninFailuresSpike pages on a new series first exported above 50, and stays quiet at 40 (C77)
+    interval: 1m
+    input_series:
+      - series: 'auth_signins_total{service_name="identity", instance="c", outcome="failure"}'
+        values: "_ _ 60x20"
+      - series: 'auth_signins_total{service_name="identity", instance="d", outcome="failure"}'
+        values: "_x30 40x20"
+    alert_rule_test:
+      - alertname: SigninFailuresSpike
+        eval_time: 5m
+        exp_alerts:
+          - exp_labels: { severity: warning, service_name: identity }
+            exp_annotations:
+              summary: "Many failed sign-ins in the last 15 minutes"
+              description: "60 failed sign-ins in 15 minutes. Check the auth audit log for a credential-stuffing pattern."
+              runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/SigninFailuresSpike.md"
+              dashboard_url: "http://127.0.0.1:4101/d/payrun-service-overview"
+      - alertname: SigninFailuresSpike
+        eval_time: 40m
         exp_alerts: []
 
   # ------------------------------------------------------------------ RedisMemoryHigh (warning)

@@ -11,8 +11,9 @@ Each test also checks its HLD §4 row's log event and metric. "Bank timeout afte
 ``payout.indeterminate`` / ``payroll_payouts_republished_total``: that is the branch where the
 timeouts outlast the delivery budget, which the bank-down test drives (the timeout test covers the
 other branch, a retry with the same key, and checks the bank-call timeouts and the replay).
-"bank-stub restart" names no event or metric: the test checks the bank's replay of the stored
-transfer (``bank_stub.transfer.replayed``) and the worker's settled count.
+"bank-stub restart" names ``bank_stub.transfer.replayed`` / ``payouts_bank_transfers_total{outcome=
+"settled"}``: the test checks the bank's replay of each stored transfer and the worker's settled
+count.
 """
 
 from __future__ import annotations

@@ -14,9 +14,14 @@ from collections.abc import Iterator
 
 import httpx
 import pytest
-from _stack import REPO_ROOT, Bff, Containers, Payroll, Stack, Toxiproxy
+from _stack import REPO_ROOT, TIMING_SOURCE, Bff, Containers, Payroll, Stack, Toxiproxy
 
 from scripts.mint_token import load_env
+
+
+def pytest_report_header() -> str:
+    """Says where the payout timings and BREAKER_FAILURES came from (_stack.read_compose_config)."""
+    return f"resilience timings: {TIMING_SOURCE}"
 
 
 @pytest.fixture(scope="session")

@@ -19,18 +19,39 @@ import { rowWith } from "./helpers/ui";
  * On `requestfinished`, not `response`: a response whose loading is cancelled (the page navigates
  * while a fetch is in flight) can leave `response.text()` pending forever, which hung this test
  * in the second of three nightly runs (2026-11-11). A cancelled response never reached the app's
- * code, so the masking check (NFR-08) loses nothing.
+ * code, so the masking check (NFR-08) loses nothing. Each read is also bounded (BODY_READ_MS), and
+ * records whether it succeeded: the test requires every /api/employees mutation's body to have been
+ * read, so an unreadable body can't pass the masking check by contributing "".
  */
-function recordApiBodies(page: Page): Promise<string>[] {
-  const bodies: Promise<string>[] = [];
+const BODY_READ_MS = 5_000;
+
+interface ApiBody {
+  url: string;
+  method: string;
+  text: string;
+  ok: boolean;
+}
+
+function readBody(req: Request): Promise<ApiBody> {
+  const base = { url: req.url(), method: req.method() };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<ApiBody>((resolve) => {
+    timer = setTimeout(() => resolve({ ...base, text: "", ok: false }), BODY_READ_MS);
+  });
+  const read = req
+    .response()
+    .then((r: Response | null) =>
+      r ? r.text().then((text) => ({ ...base, text, ok: true })) : { ...base, text: "", ok: false },
+    )
+    .catch(() => ({ ...base, text: "", ok: false }));
+  return Promise.race([read, timeout]).finally(() => clearTimeout(timer));
+}
+
+function recordApiBodies(page: Page): Promise<ApiBody>[] {
+  const bodies: Promise<ApiBody>[] = [];
   page.on("requestfinished", (req: Request) => {
     if (!new URL(req.url()).pathname.startsWith("/api/")) return;
-    bodies.push(
-      req
-        .response()
-        .then((r: Response | null) => (r ? r.text() : ""))
-        .catch(() => ""),
-    );
+    bodies.push(readBody(req));
   });
   return bodies;
 }
@@ -174,8 +195,19 @@ test.describe("@journeys J2 employees", () => {
     });
 
     await test.step("no /api response ever carried a full account number (NFR-08)", async () => {
-      const texts = await Promise.all(bodies);
-      expect(texts.length).toBeGreaterThan(0);
+      const read = await Promise.all(bodies);
+      expect(read.length).toBeGreaterThan(0);
+      // Every employee add, edit, bank change, deactivate and reactivate must have been read:
+      // an unread body would make the masking check below pass vacuously.
+      const mutations = read.filter(
+        (b) => b.method !== "GET" && new URL(b.url).pathname.startsWith("/api/employees"),
+      );
+      expect(mutations.length).toBeGreaterThan(0);
+      expect(
+        mutations.filter((b) => !b.ok).map((b) => `${b.method} ${b.url}`),
+        "/api/employees mutation bodies that could not be read",
+      ).toEqual([]);
+      const texts = read.map((b) => b.text);
       for (const n of [salaried.account, hourly.account, newAccount]) {
         expect(texts.filter((t) => t.includes(n))).toEqual([]);
       }

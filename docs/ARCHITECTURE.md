@@ -185,11 +185,11 @@ reads all three; **Alertmanager** routes `severity=page` alerts to the page rece
   `PayoutLateSettlement` (spec C71).
 - **Dual approval ([ADR 0005](adr/0005-four-eyes-approval.md), amended by spec C73):** a company
   setting, on by default and snapshotted onto the run at calculate. With it on, the approver must
-  differ from the calculator, the run's creator, anyone who entered hours on the run, and the
-  editor of any bank change not yet vetted (a change is vetted once a payout for that employee
-  was released under dual approval by someone else). Retry uses the same window, and whoever
-  marked an attempt rejected can't retry that payout. Violations are 403 `approver_must_differ`
-  and audited.
+  differ from the run's creator, its calculator, the last editor of any hours row on the run, and
+  the editor of a not-yet-vetted bank change for any employee who gets a transfer (net > 0); a
+  change is vetted once a payout for that employee was released under dual approval by someone
+  else. A retry refuses that unvetted bank editor and the operator who marked the current attempt
+  rejected. Violations are 403 `approver_must_differ` and audited.
 - **Bank details** are encrypted at rest with key IDs; the API shows only the last four digits
   ([ADR 0004](adr/0004-bank-details-at-rest.md)).
 - **Secrets:** `.env` in dev and CI, External Secrets in Kubernetes ([ADR 0008](adr/0008-secrets.md)).

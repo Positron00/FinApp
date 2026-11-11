@@ -4,13 +4,13 @@
 |---|---|
 | **Severity** | warning (ticket) |
 | **Service** | identity (email outbox and relay) |
-| **Alert** | `max(identity_email_oldest_pending_age_seconds) > 900 or sum(increase(identity_emails_failed_total[1h])) > 0 or sum(identity_emails_failed_total > 0 unless max_over_time(identity_emails_failed_total[2h] offset 1h)) > 0` for 5 m (`deploy/observability/prometheus/rules/alerts.yml`) |
+| **Alert** | `max(identity_email_oldest_pending_age_seconds) > 900 or sum(increase(identity_emails_failed_total[1h])) > 0 or sum(identity_emails_failed_total > 0 unless max_over_time(identity_emails_failed_total[2h] offset 1h)) > 0 or sum(identity_emails_failed_total - max_over_time(identity_emails_failed_total[2h] offset 1h) > 0) > 0` for 5 m (`deploy/observability/prometheus/rules/alerts.yml`) |
 | **Requirement** | PAY-101, PAY-105 (invite and reset emails), PAY-110 (email delivery); R25, C20 |
 | **Dashboard** | Queues and workers ("Identity emails"), `http://127.0.0.1:4101/d/payrun-queues`; Service overview (`service` = identity) for the SMTP calls |
 
 ## What it means
 
-Either the oldest pending invite or reset email has waited more than 15 minutes, or at least one email failed permanently in the last hour (it reached `EMAIL_MAX_ATTEMPTS`, 10, and its row became `failed`). The last arm (C75) counts a failure series that is above 0 but had no sample in the two hours before that hour: a restarted identity whose first metric export already counts a failure, which `increase()` reads as 0. Invites still return 201 when SMTP is down: the email waits in `identity.email_outbox` and the relay retries with backoff.
+Either the oldest pending invite or reset email has waited more than 15 minutes, or at least one email failed permanently in the last hour (it reached `EMAIL_MAX_ATTEMPTS`, 10, and its row became `failed`). The last arm (C75) counts a failure series that is above 0 but had no sample in the two hours before that hour: a restarted identity whose first metric export already counts a failure, which `increase()` reads as 0. The gap arm (C77) counts an old series that rose during a data gap longer than the hour (`increase()` then sees only the post-gap samples): the current value minus the highest one in the two hours before that hour. A gap longer than two hours makes an old series look new, so its full value counts. Invites still return 201 when SMTP is down: the email waits in `identity.email_outbox` and the relay retries with backoff.
 
 ## Impact
 
@@ -25,7 +25,7 @@ Invitees and users who asked for a password reset get no email. They cannot acce
    ```
 
    ```promql
-   (sum(increase(identity_emails_failed_total[1h]) and max_over_time(identity_emails_failed_total[2h] offset 1h)) or vector(0)) + (sum(identity_emails_failed_total unless max_over_time(identity_emails_failed_total[2h] offset 1h)) or vector(0))
+   sum(clamp_min(last_over_time(identity_emails_failed_total[1h]) - max_over_time(identity_emails_failed_total[2h] offset 1h), 0) or (last_over_time(identity_emails_failed_total[1h]) unless max_over_time(identity_emails_failed_total[2h] offset 1h))) or vector(0)
    ```
 
    The second query is the dashboard's failures in the last hour: the increase of older series plus the whole value of new ones.
@@ -73,7 +73,7 @@ Invitees and users who asked for a password reset get no email. They cannot acce
   max(identity_emails_pending)
   ```
 
-- The failure half clears once no email has failed for an hour and every failure series has existed for more than an hour (a new series counts until its first sample is an hour old); the failures query above then returns 0 and the alert resolves (R25).
+- The failure half clears once no email has failed for an hour and every failure series has existed for more than an hour (a new series counts until its first sample is an hour old; a series back from a data gap until it has been back for an hour); the failures query above then returns 0 and the alert resolves (R25).
 - `email.sent` lines reappear:
 
   ```logql

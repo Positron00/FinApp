@@ -77,7 +77,7 @@ group "promtool"
 docker run --rm -v "$CI_ROOT/deploy/observability/prometheus:/etc/prometheus:ro" \
   --entrypoint promtool "$PROMETHEUS_IMAGE" check config /etc/prometheus/prometheus.yml
 prom /deploy/observability/prometheus check rules rules/recording.yml rules/alerts.yml
-prom /deploy/observability/prometheus test rules tests/alerts_test.yml tests/slo_test.yml
+prom /deploy/observability/prometheus test rules tests/alerts_test.yml tests/slo_test.yml tests/panels_test.yml
 prom /deploy/k8s/observability check rules alerts-kubernetes.yml
 prom /deploy/k8s/observability test rules alerts-kubernetes_test.yml
 

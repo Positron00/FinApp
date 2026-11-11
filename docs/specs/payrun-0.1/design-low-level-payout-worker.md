@@ -1,6 +1,6 @@
 # Low-level design: payout-worker
 
-Status: draft 2026-11-10, aligned with the README Spec resolutions (R) and Contract decisions (C) tables · Sources: [spec README](README.md) (R- and C-tables), [architecture plan](../../plan/architecture-plan.md) v1.2 (§2.1, §2.2, §4, §5 J4, §6, §9, §11, §12.1), [ADR 0003](../../adr/0003-payout-flow.md), [ADR 0001](../../adr/0001-service-map.md), [ADR 0007](../../adr/0007-data-stores.md), [ADR 0011](../../adr/0011-egress.md), [requirements](requirements.md) (PAY-402–412, PAY-600, PAY-605–608, PAY-NFR-02/03/07/09/10/11), [high-level design](design-high-level.md), [payroll low-level design](design-low-level-payroll.md) (§4.6, §4.7, §5: the internal endpoints and the event), [platform low-level design](design-low-level-platform.md) (pycommon, env, ACLs).
+Status: draft 2026-11-10, last changed 2026-11-11, aligned with the README Spec resolutions (R) and Contract decisions (C) tables · Sources: [spec README](README.md) (R- and C-tables), [architecture plan](../../plan/architecture-plan.md) v1.4 (§2.1, §2.2, §4, §5 J4, §6, §9, §11, §12.1), [ADR 0003](../../adr/0003-payout-flow.md), [ADR 0001](../../adr/0001-service-map.md), [ADR 0007](../../adr/0007-data-stores.md), [ADR 0011](../../adr/0011-egress.md), [requirements](requirements.md) (PAY-402–412, PAY-600, PAY-605–608, PAY-NFR-02/03/07/09/10/11), [high-level design](design-high-level.md), [payroll low-level design](design-low-level-payroll.md) (§4.6, §4.7, §5: the internal endpoints and the event), [platform low-level design](design-low-level-platform.md) (pycommon, env, ACLs).
 
 The worker consumes `payout.requested` v1 from `stream:payout.requested` (group `payout-worker`).
 On every delivery it fetches the instruction from payroll, calls the bank with
@@ -642,7 +642,7 @@ header (PAY-NFR-07); the instruction is `SecretStr`, and the redactor masks `acc
 
 | Metric | Type | Labels (values) | When | Requirement |
 |---|---|---|---|---|
-| `queue_messages_total` | counter | `stream`=`stream:payout.requested`, `group`=`payout-worker`, `outcome` (exactly `ok`, `retry`, `dlq`; C21) | Per handled message (§3.3.4); **pre-initialised** with `add(0)` for each of the three outcomes in `on_startup`, before the first read, so the first DLQ after a restart is a visible 0 → 1 increase | PAY-403, 408, PAY-NFR-11; alert `PayoutDLQ` |
+| `queue_messages_total` | counter | `stream`=`stream:payout.requested`, `group`=`payout-worker`, `outcome` (exactly `ok`, `retry`, `dlq`; C21) | Per handled message (§3.3.4); **pre-initialised** with `add(0)` for each of the three outcomes in `on_startup`, before the first read. That doesn't cover a DLQ inside the first export interval after a restart: the series still reaches Prometheus starting at 1, which `increase()` reads as no increase. `PayoutDLQ`'s extra arms catch it: a series above 0 with no sample in the hour before the 15-minute window, or a value above the last value before the window (C75, C77) | PAY-403, 408, PAY-NFR-11; alert `PayoutDLQ` |
 | `queue_processing_seconds` | histogram (0.01–60 s) | `stream`, `group` | Per handled message | PAY-NFR-10 |
 | `queue_consumer_lag` | gauge (unit `{entry}`) | `stream`, `group` | Poller (XINFO GROUPS `lag`) | `ConsumerLagGrowing` |
 | `queue_dlq_messages` | gauge (unit `{entry}`) | `stream`=`stream:payout.requested.dlq` | Poller (XINFO STREAM `length`) | PAY-408 |
@@ -754,7 +754,7 @@ The stateful payout model (`test_payout_model.py`, PAY-NFR-02) is owned by payro
 | PAY-NFR-07 | §2.3, §3.2 (DLQ `error`), §5 | `test_models.py`, `test_dlq.py`, `test_no_secrets_in_logs.py` |
 | PAY-NFR-09 | §5.3 | `test_trace_context.py` (plus e2e `trace.spec.ts`) |
 | PAY-NFR-10 | §5.2 | `test_metrics.py` |
-| PAY-NFR-11 (`PayoutDLQ` sees the first DLQ) | §5.2 | `test_metrics.py`, `test_budget.py`, `test_dlq.py` (integration) |
+| PAY-NFR-11 (`PayoutDLQ` sees the first DLQ) | §5.2 | `test_metrics.py`, `test_budget.py`, `test_dlq.py` (integration); promtool cases in `deploy/observability/prometheus/tests/alerts_test.yml` for a series that first appears at 1 and for a data gap (C75, C77) |
 
 ## Change log
 
@@ -767,5 +767,7 @@ The stateful payout model (`test_payout_model.py`, PAY-NFR-02) is owned by payro
 - 2026-11-11 (release review fixes): `prune_consumers` returns 0 only for NOGROUP / `no such key` and re-raises anything else (a missing `+xinfo` grant raised `NoPermissionError`, a `ResponseError` subclass, and was silently treated as nothing to prune); unit cases for both, and an integration case for the real missing-stream and missing-group errors. §3.3.7 records the flush-budget resolution (C67: `OTEL_EXPORTER_OTLP_TIMEOUT=3` in Compose and Kubernetes); `test_shutdown.py` adds a real-process case at 3 s. `test_no_secrets_in_logs.py` matches amounts as whole numbers (cents or units) instead of substrings, so it can't fail by chance on a timestamp or ID.
 
 - 2026-11-11 (flake fixes, tests only): `test_key_window.py::test_missing_transfer_is_poison_without_post` raced the handler's own ordering. Step 7 (the poison report, which makes payroll's attempt `needs_operator`) commits before step 8.1 (`finish` writes `processed_events`). The test waited on `needs_operator` and then read `processed_events` at once, and failed with `0 == 1` in 8 of 30 runs. It now waits on the worker's last write. `test_budget.py` and `test_two_consumers.py` had the same latent race (a payroll state, then the disbursement read as `done`), so they now wait for the XACK first. The `external.request.failed reason=404` line is pycommon's normal per-attempt warning for any non-2xx: the GET returned a clean 404 `transfer_not_found` and the message was poisoned on delivery 1. The real-process SIGTERM bound in `test_shutdown.py` is now derived instead of fixed at 12 s: test drain 2 s + the 10 s close-and-flush budget + the 5 s left by the deployed 60 + 10 inside 75, which gives 17 s. A deployed flush over budget (C67's ~20 s) still fails it. No product change.
+
+- 2026-11-11 (alignment review, C75, C77): §5.2 no longer claims the pre-initialisation makes the first DLQ after a restart a visible 0 → 1 increase. A DLQ inside the first export interval still arrives as a series starting at 1, and the `PayoutDLQ` rule's extra arms catch it. §7 names the promtool new-series and gap cases. Docs only.
 
 Resolved after the change log entries: C46 (`PAYOUT_PAYROLL_*` keys), C47 (`COMPANY_ID` for every service, `PAYOUT_CONSUMER_GC_IDLE_S`, startup reason `not_deployable`). Nothing is open.

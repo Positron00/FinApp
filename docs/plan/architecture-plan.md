@@ -474,11 +474,11 @@ There are no real third-party APIs. **bank-stub** stands in for a payment proces
 | BFF availability (J1–J5 routes) | 99.5% of requests not 5xx, monthly ([ADR 0012](../adr/0012-slos.md)) |
 | BFF latency | p95 < 300 ms for reads and simple writes; p95 < 1.5 s for calculate and approve on a 500-employee run |
 | Payout settlement | p95 ≤ 60 s from approval to all payouts final, for 500 employees |
-| Capacity | 20 req/s peak at the BFF; the nightly test runs 30 req/s (peak × 1.5) for 10 minutes |
+| Capacity | 20 req/s peak at the BFF; the nightly test runs 30 journey iterations/s (~44 req/s, 2.2× peak) for 10 minutes |
 | Recovery | RPO 5 min (managed Postgres point-in-time recovery in prod); RTO 1 h. Redis AOF means queued payouts survive a restart |
 | Startup | Each service ready within 20 s after its migrations |
 
-**Measured capacity (first nightly pass, 2026-11-11, run 43040233170 on a GitHub `ubuntu-latest` runner, Compose stack, 500 employees).** Every scenario met its SLO with 0 failed requests and 0 failed checks:
+**Measured capacity (first passing nightly load, soak and settlement, 2026-11-11, run 43040233170 on a GitHub `ubuntu-latest` runner, Compose stack, 500 employees).** Every scenario met its SLO with 0 failed requests and 0 failed checks:
 
 | Scenario | Load | Result |
 | --- | --- | --- |
@@ -503,6 +503,7 @@ Loki → Grafana, plus Alertmanager. The BFF records the journey SLI with an exp
   - `payroll_attempts_needs_operator` (gauge);
   - `payroll_payouts_stuck` (gauge: attempts non-final for more than 10 min, computed per replica at metric collection);
   - `payroll_payouts_republished_total`;
+  - `payroll_late_settlements_total` (counter, pre-initialised at 0: a late `settled` for a rejected or superseded attempt, a possible double payment; spec C71);
   - `rate_limiter_errors_total{component}` and `rate_limited_total{scope}` (pycommon's limiter; services report their own denials and Redis errors through it, spec C63);
   - `payouts_bank_transfers_total{outcome, reason}`;
   - `auth_signins_total{outcome}` with `outcome` ∈ `success`, `failure`, `rate_limited` (spec C19);
@@ -511,7 +512,7 @@ Loki → Grafana, plus Alertmanager. The BFF records the journey SLI with an exp
   - `external_requests_total{provider, operation, outcome}` with `provider` ∈ `bank`, `payroll`, `smtp` (spec R35) and `outcome` ∈ `ok`, `client_error`, `rate_limited`, `server_error`, `timeout`, `connect_error`, `breaker_open` (spec C55); `circuit_breaker_state{target}`.
 - **Queue metrics:** `queue_messages_total{stream, group, outcome}` with `outcome` ∈ `ok`, `retry`, `dlq`, pre-initialised at 0 (spec C21); `queue_processing_seconds`, `queue_consumer_lag`, `queue_dlq_messages`; `outbox_unsent`, `outbox_oldest_age_seconds`. The authoritative name and label list is platform LLD §5 plus the service LLDs (PAY-NFR-10).
 - **Naming:** gauges never use unit `1`, which the Collector's Prometheus exporter would turn into a `_ratio` suffix (spec C63).
-- **Log events of note:** `payrun.created`, `payrun.calculated`, `payrun.approved`, `payrun.completed`, `payout.result_recorded`, `payout.retry_requested`, `payout.attempt_not_current`, `payout.indeterminate`, `payout.republished`, `bank.transfer.submitted`, `bank.transfer.rejected`, `auth.signin.failed`, `auth.lockout`, `email.send_failed`. Amounts and names never appear in logs, only IDs and counts.
+- **Log events of note:** `payrun.created`, `payrun.calculated`, `payrun.approved`, `payrun.completed`, `payout.result_recorded`, `payout.retry_requested`, `payout.attempt_not_current`, `payout.indeterminate`, `payout.republished`, `payout.late_settlement` (error; spec C71), `bank.transfer.submitted`, `bank.transfer.rejected`, `auth.signin.failed`, `auth.lockout`, `email.send_failed`. Amounts and names never appear in logs, only IDs and counts.
 - **Dashboards:** Service overview, Journeys (J1–J5), Queues and workers, Bank (stub) dependency, Platform.
 - **Alerts:**
 
@@ -520,18 +521,18 @@ Loki → Grafana, plus Alertmanager. The BFF records the journey SLI with an exp
   | `BffAvailabilityFastBurn` | page | paging receiver |
   | `BffAvailabilitySlowBurn` | ticket | ticket receiver |
   | `PayoutSettlementSlow` (`max(payroll_runs_processing_oldest_age_seconds) > 60` for 2 m) | page | paging receiver |
-  | `PayoutDLQ` (`increase(queue_messages_total{outcome="dlq"}[15m]) > 0`, or a series above 0 with no sample in the hour before the window, C75, C77) | page (money stuck) | paging receiver |
+  | `PayoutDLQ` (`increase(queue_messages_total{outcome="dlq"}[15m]) > 0`, or a series above 0 with no sample in the hour before the window, or a value above the highest value in the hour before the window (an old series that rose during a data gap; C77), C75, C77) | page (money stuck) | paging receiver |
   | `PayoutNeedsOperator` (`max(payroll_attempts_needs_operator) > 0`) | page | paging receiver |
-  | `PayoutLateSettlement` (`increase(payroll_late_settlements_total[15m]) > 0`, or a series above 0 with no sample in the hour before the window (C75, C77); a late `settled` for a rejected or superseded attempt, possible double payment) | page | paging receiver |
+  | `PayoutLateSettlement` (`increase(payroll_late_settlements_total[15m]) > 0`, or a series above 0 with no sample in the hour before the window, or a value above the highest value in the hour before the window (an old series that rose during a data gap; C77) (C75, C77); a late `settled` for a rejected or superseded attempt, possible double payment) | page | paging receiver |
   | `PayoutsStuck` (`max(payroll_payouts_stuck) > 0` for 10 m) | page | paging receiver |
   | `PayoutStreamNearMaxlen` (length > 80% of MAXLEN) | warning | ticket receiver |
-  | `EmailOutboxStuck` (oldest pending > 15 m, or `increase(identity_emails_failed_total[1h]) > 0`, or a failure series above 0 with no sample in the two hours before the window, C75, C77) | warning | ticket receiver |
+  | `EmailOutboxStuck` (oldest pending > 15 m, or `increase(identity_emails_failed_total[1h]) > 0`, or a failure series above 0 with no sample in the two hours before the window, or a value above the highest value in the two hours before the window (C77), C75, C77) | warning | ticket receiver |
   | `RateLimiterErrors` (> 0 for 5 m) | warning | ticket receiver |
   | `OutboxStuck` (oldest > 60 s) | warning | ticket receiver |
   | `ConsumerLagGrowing` | warning | ticket receiver |
   | `BankBreakerOpen` (5 m) | warning | ticket receiver |
   | `BankErrorRateHigh` (> 5%, excluding business rejections) | warning | ticket receiver |
-  | `SigninFailuresSpike` | warning | ticket receiver |
+  | `SigninFailuresSpike` (failed sign-ins in 15 m, summed per series: `increase()` of series seen before the window plus the full value of new ones, > 50; C77) | warning | ticket receiver |
   | `RedisMemoryHigh` (> 80%) | warning | ticket receiver |
   | `PodRestarts` (Kubernetes only: needs kube-state-metrics) | warning | ticket receiver |
   | `CollectorDropping` | warning | ticket receiver |
@@ -583,31 +584,31 @@ the alert's `runbook_url`.
 | Worker crash after the bank call, before the result | Redelivered, same key, bank returns the original transfer, paid once | integration + resilience | `bank.transfer.submitted` | `payouts_bank_transfers_total` | — |
 | Bank timeout after it actually settled | Retry with the same key returns settled; or `indeterminate`, then re-publish, then settled | integration + resilience (Toxiproxy `timeout` on the response path) | `payout.indeterminate` | `payroll_payouts_republished_total` | `PayoutsStuck` if prolonged |
 | Bank down | Breaker opens; attempts `indeterminate`; run `processing` (awaiting bank); recovers when the bank returns | resilience | `external.breaker.opened`, `payout.indeterminate` | `circuit_breaker_state{target="bank"}` | `BankBreakerOpen`, `PayoutSettlementSlow` |
+| Bank 4xx other than a business rejection (401, 409, 422) | Counted as "no answer" → `indeterminate`, never `failed` | unit | `bank.transfer.no_answer` | `external_requests_total{outcome}` | `BankErrorRateHigh` |
 | bank-stub restart mid-run | Persistent ledger keeps idempotency; ≤ 1 settled transfer per payout | resilience | `bank_stub.transfer.replayed` | `payouts_bank_transfers_total{outcome="settled"}` | — |
 | Redelivered old attempt after a retry | Instruction 409 `attempt_not_current`; no bank call; ACK | integration | `payout.attempt_not_current` | `queue_messages_total{outcome}` | — |
 | Two consumers on one message (XAUTOCLAIM while the first is alive) | Unique disbursement plus bank key: one transfer | integration | — | — | — |
-| payroll down during processing | Pending, then DLQ after the budget; re-publish redrives after recovery | resilience | `queue.message.failed` | `queue_messages_total{outcome="dlq"}` | `PayoutDLQ`, `PayoutsStuck` |
-| Redis down | Session 503; login limiter fails closed, session limiter open; outbox holds rows; `/readyz` fails | resilience | `ratelimit.backend_error` | `rate_limiter_errors_total`, `outbox_unsent` | `OutboxStuck`, `RateLimiterErrors` |
-| Redis data loss (FLUSHALL) mid-run | Re-publish redrives non-final attempts; the run completes | resilience | `payout.republished` | `payroll_payouts_republished_total` | `PayoutsStuck` if prolonged |
-| Slow DB (2 s latency) | Requests time out at budget with 503 `db_timeout` | resilience (PR fault smoke) | `http.request` | `http_server_request_duration_seconds` | `BffAvailabilityFastBurn` |
-| Poison message (schema-invalid, amount mismatch, `payout_not_found`) | DLQ at once; `needs_operator` where the payout is known; operator resolves (PAY-502) | integration | `payout.needs_operator` | `payroll_attempts_needs_operator` | `PayoutDLQ`, `PayoutNeedsOperator` |
-| Key window expired (attempt older than `BANK_KEY_SAFE_WINDOW_S`) | GET by key only, never a new POST; not found → `needs_operator` | integration | `payout.key_window_expired` | `payroll_attempts_needs_operator` | `PayoutNeedsOperator` |
-| SMTP down | Email queued; invite returns 201; failed after 10 attempts | integration + resilience | `email.send_failed` | `identity_emails_pending` | `EmailOutboxStuck` |
-| Redis restart (PAY-NFR-15) | AOF reload; the stream and consumer group survive; no re-publish needed | resilience (`test_redis_restart.py`) | Redis log "DB loaded from append only file" | `redis_start_time_seconds` | — |
 | Re-publish racing a live consumer | Fresh `event_id`; both deliveries pass the instruction check; same bank key, so one transfer; the second result gets 200 with the stored outcome | integration | `payout.republished` | `payroll_payouts_republished_total` | — |
 | `indeterminate` posted after `settled` (or the reverse) | After `settled`: no change, 200. After `indeterminate`: `settled` applies | integration | `payout.result_recorded` | `payroll_payouts_total` | — |
 | Late definite answer for a `needs_operator` attempt | `settled`/`rejected` applies (the bank's answer wins); `indeterminate`/`poison` → 200, no change (spec R7, C42) | integration | `payout.result_recorded` | `payroll_payouts_total` | — |
+| payroll down during processing | Pending, then DLQ after the budget; re-publish redrives after recovery | resilience | `queue.message.failed` | `queue_messages_total{outcome="dlq"}` | `PayoutDLQ`, `PayoutsStuck` |
+| Poison message (schema-invalid, amount mismatch, `payout_not_found`) | DLQ at once; `needs_operator` where the payout is known; operator resolves (PAY-502) | integration | `payout.needs_operator` | `payroll_attempts_needs_operator` | `PayoutDLQ`, `PayoutNeedsOperator` |
 | Poison message looping through re-publish | Attempt `needs_operator`; re-publish stops; UI shows "blocked" | integration | `payout.needs_operator` | `payroll_attempts_needs_operator` | `PayoutNeedsOperator` |
+| Key window expired (attempt older than `BANK_KEY_SAFE_WINDOW_S`) | GET by key only, never a new POST; not found → `needs_operator`; the operator can only `mark_rejected` after a bank-statement check (redrive refused, 422 `redrive_not_allowed`; C73) | integration | `payout.key_window_expired` | `payroll_attempts_needs_operator` | `PayoutNeedsOperator` |
+| Redis down | Session 503; login limiter fails closed, session limiter open; outbox holds rows; `/readyz` fails | resilience | `ratelimit.backend_error` | `rate_limiter_errors_total`, `outbox_unsent` | `OutboxStuck`, `RateLimiterErrors` |
+| Redis data loss (FLUSHALL) mid-run | Re-publish redrives non-final attempts; the run completes | resilience | `payout.republished` | `payroll_payouts_republished_total` | `PayoutsStuck` if prolonged |
 | Consumer group lost (NOGROUP after FLUSHALL) | The worker recreates the group from `0` with MKSTREAM; re-publish redrives | integration + resilience | `queue.group.recreated`, `payout.republished` | `payroll_payouts_republished_total` | `PayoutsStuck` if prolonged |
+| Outbox relay crash | Unsent rows stay; another replica's relay (SKIP LOCKED) or the restart sends them | integration (`libs/pycommon/tests/integration/test_relay_loop.py::test_relay_crash_mid_batch_another_relay_sends_each_row_once`, C77) | `outbox.relay.error` | `outbox_oldest_age_seconds` | `OutboxStuck` |
 | Late `settled` answer for a rejected or superseded attempt (possible double payment) | Response unchanged; audit `payout.late_settlement` once per attempt; the operator checks the bank and recalls (C71) | integration (`test_resolve.py`, late-settlement cases) | `payout.late_settlement` (error) | `payroll_late_settlements_total` | `PayoutLateSettlement` (page) |
 | Relay refuses an envelope (`EnvelopeInvalidError`) | The row stays unsent and is never re-claimed; re-publish moves the attempt to `needs_operator` / `envelope_invalid`; the operator resolves it, then removes the row (C76) | integration (`test_outbox.py`) | `outbox.relay.error`, `payout.needs_operator` | `outbox_oldest_age_seconds` | `OutboxStuck`, `PayoutNeedsOperator` |
-| Outbox relay crash | Unsent rows stay; another replica's relay (SKIP LOCKED) or the restart sends them | integration (`test_relay_loop.py`, C77) | `outbox.relay.error` | `outbox_oldest_age_seconds` | `OutboxStuck` |
+| Slow DB (2 s latency) | Requests time out at budget with 503 `db_timeout` | resilience (PR fault smoke) | `http.request` | `http_server_request_duration_seconds` | `BffAvailabilityFastBurn` |
 | Postgres down or failing over | `/readyz` fails; 503 `db_unavailable` fast; recovery without stuck pool connections | resilience | `db.unavailable` | `http_server_request_duration_seconds` | `BffAvailabilityFastBurn` |
 | identity down at login | BFF 503 `service_unavailable`; breaker; other journeys still work for signed-in users | resilience (PR fault smoke) | `bff.upstream_error` | `circuit_breaker_state{target="identity"}` | `BffAvailabilityFastBurn` |
-| JWT clock skew | 5 s leeway accepted; skew beyond the 60 s exp gives 401 `invalid_token` | unit | `auth.token.rejected` | — | — |
-| Bank 4xx other than a business rejection (401, 409, 422) | Counted as "no answer" → `indeterminate`, never `failed` | unit | `bank.transfer.no_answer` | `external_requests_total{outcome}` | `BankErrorRateHigh` |
+| SMTP down | Email queued; invite returns 201; failed after 10 attempts | integration + resilience | `email.send_failed` | `identity_emails_pending`, `identity_emails_failed_total` | `EmailOutboxStuck` |
+| Redis restart (PAY-NFR-15) | AOF reload; the stream and consumer group survive; no re-publish needed | resilience (`test_redis_restart.py`) | Redis log "DB loaded from append only file" | `redis_start_time_seconds` | — |
 | Concurrent approve (two clicks or two approvers) | Exactly one succeeds; the other gets 409 | integration | `payrun.approved` | `payroll_pay_runs_total` | — |
 | Demoted user keeps a session | Session ended (401) at the next re-check, within `SESSION_ROLE_RECHECK_S` | integration (web) + e2e | `auth.session.revoked` | — | — |
+| JWT clock skew | 5 s leeway accepted; skew beyond the 60 s exp gives 401 `invalid_token` | unit | `auth.token.rejected` | — | — |
 
 **Nightly:** full load and soak, the full resilience suite, e2e three times, deep Schemathesis, and fresh audits.
 
@@ -702,5 +703,6 @@ The layout follows `architecture.md` §2:
 | 2026-11-11 | Step 5 release review (F1–F6; four checklist-C reviews) | 3 breaking, ~40 minor | All fixed; spec C71 (late-settlement detection, PayoutLateSettlement) |
 | 2026-11-11 | H3 independent security review | 0 critical/high; 2 medium (four-eyes bypass via earlier bank edits; mark-rejected-then-retry double payment after key expiry), 4 low (payroll audit not append-only, attacker lockout, reset timing, denials not audited) | C73, C74; ADR 0005 amended |
 | 2026-11-11 | H2 live alert drills | PayoutDLQ didn't page (a counter series that starts above 0 reads as no increase) | C75 |
-| 2026-11-11 | First nightly runs | k6 cookie jar leaked the approver's session into the load user's requests; e2e-repeat blocked by the runner's apt mirror | k6 throwaway jars (`e3789dd`); Chromium installed without `--with-deps` (C77) |
+| 2026-11-11 | First nightly runs and the first PR #11 CI | k6 cookie jar leaked the approver's session into the load user's requests; e2e-repeat blocked by the runner's apt mirror; once it ran, J2 employees hung on a cancelled response body (run 43065346151); the first full nightly pass was run 43074520518; the first PR #11 CI failure was `test_soak_resources` on Linux (pytest's `tmp_path` is 0700, which the promtool container's default user, nobody, can't read; Docker Desktop on macOS hid it) | k6 throwaway jars (`e3789dd`); Chromium installed without `--with-deps` (C77); `/api` bodies recorded on `requestfinished` (`49c5658`, C77); promtool run as the caller (`eebcc2c`) |
 | 2026-11-11 | Alignment review of code, specs and plan since `c3ae71b` (three independent reviewers: services; platform and tests; docs and web) | Services 14 (vetted timing used transaction start; no-transfer edits blocked approvers; untraced relay rule; runbook gaps; reset floor skipped error paths); platform 20 (nightly issue had no log; web replicas collided in metrics; two Collector replicas; C75 arm false-paged after data gaps; missing check_metrics series, promtool cases and resilience metric checks); docs 19 (stale status lines, requirements, LLD bodies, runbook queries, test-profile limits undocumented) | All held fully or partly and were fixed except: Redis crash-kill variant (not added; AOF everysec loss is covered by re-publish); salary and rate edits outside four-eyes (accepted risk, C73 follow-up); CollectorDropping same-labelset limit (documented). C73, C74 additions; C76, C77 |
+| 2026-11-11 | Second alignment review (code and tests; documents), after the first full nightly pass | Code and tests: 15 findings; documents: 24 findings. The most severe: a C77 false negative, where a counter that increased during a metrics gap (Prometheus restart, Collector outage) didn't page, because the C77 second arm only covers a series with no sample before the window | A third arm in the counter alerts (a value above the last value before the window), a restarted-process arm in SigninFailuresSpike; HLD §4 and §12.1 reconciled row by row; four-eyes wording, requirement acceptance, status lines and test references corrected |

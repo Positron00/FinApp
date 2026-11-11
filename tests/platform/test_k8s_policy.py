@@ -311,9 +311,16 @@ def test_prod_payout_worker_has_zero_replicas(rendered: dict[str, list[Obj]]) ->
 
 @pytest.mark.parametrize("env", ENVS)
 def test_collector_is_a_single_replica_gateway(rendered: dict[str, list[Obj]], env: str) -> None:
-    """Platform LLD §8.1: one Collector per environment, so every span of a trace reaches the same
-    tail sampler (prod) and each series has one exporter."""
-    assert _named(rendered[env], "Deployment", "otel-collector")["spec"]["replicas"] == 1
+    """PAY-NFR-10 (C77), platform LLD §8.1: one Collector per environment, so every span of a trace
+    reaches the same tail sampler (prod) and each series has one exporter. Rollouts recreate the pod
+    (a RollingUpdate surge would run two gateways at once), and the PDB still lets a drain evict it.
+    """
+    dep = _named(rendered[env], "Deployment", "otel-collector")
+    assert dep["spec"]["replicas"] == 1
+    assert dep["spec"]["strategy"] == {"type": "Recreate"}
+    pdb = _named(rendered[env], "PodDisruptionBudget", "otel-collector")["spec"]
+    assert pdb.get("maxUnavailable") == 1
+    assert "minAvailable" not in pdb
 
 
 def test_prod_bank_base_url_is_a_placeholder(rendered: dict[str, list[Obj]]) -> None:

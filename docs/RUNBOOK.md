@@ -238,12 +238,14 @@ scripts/ci/alert_drills.sh                         # all six paging alerts, one 
 scripts/ci/alert_drills.sh PayoutDLQ PayoutNeedsOperator   # a subset
 ```
 
-It causes PayoutDLQ (a poison stream entry), PayoutNeedsOperator and PayoutLateSettlement (worker
-stopped, forced results via `mint_token`), PayoutSettlementSlow (bank proxy disabled),
-PayoutsStuck (worker stopped; about 22 minutes by design) and BffAvailabilityFastBurn (identity
-stopped). Every fault is undone on exit. Timeouts are tunable with `DRILL_TIMEOUT_S`,
-`DRILL_STUCK_TIMEOUT_S`, `DRILL_QUIET_WAIT_S`, `DRILL_RECOVERY_WAIT_S`, `DRILL_POLL_S` and
-`DRILL_LOAD_WORKERS`. The 2026-11-11 results are in spec C75.
+It causes PayoutDLQ (the worker stopped, a poison stream entry added, then the worker started, so
+the dead letter lands in the new process's first export interval and the alert's new-series path
+is exercised; C77), PayoutNeedsOperator and PayoutLateSettlement (worker stopped, forced results
+via `mint_token`), PayoutSettlementSlow (bank proxy disabled), PayoutsStuck (worker stopped; about
+22 minutes by design) and BffAvailabilityFastBurn (identity stopped). Every fault is undone on
+exit. Timeouts are tunable with `DRILL_TIMEOUT_S`, `DRILL_STUCK_TIMEOUT_S`, `DRILL_QUIET_WAIT_S`,
+`DRILL_RECOVERY_WAIT_S`, `DRILL_POLL_S` and `DRILL_LOAD_WORKERS`. The 2026-11-11 results are in
+spec C75 and C77 (the DLQ drill on the new-series path paged in 43 s).
 
 To see what alert-sink received: `curl -fsS http://127.0.0.1:4135/page` (or `/ticket`);
 `curl -X DELETE http://127.0.0.1:4135/all` clears it.

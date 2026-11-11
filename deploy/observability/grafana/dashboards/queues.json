@@ -281,7 +281,7 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "(sum(increase(queue_messages_total{outcome=\"dlq\"}[15m]) and max_over_time(queue_messages_total{outcome=\"dlq\"}[1h] offset 15m)) or vector(0)) + (sum(queue_messages_total{outcome=\"dlq\"} unless max_over_time(queue_messages_total{outcome=\"dlq\"}[1h] offset 15m)) or vector(0))",
+          "expr": "sum(clamp_min(last_over_time(queue_messages_total{outcome=\"dlq\"}[15m]) - max_over_time(queue_messages_total{outcome=\"dlq\"}[1h] offset 15m), 0) or (last_over_time(queue_messages_total{outcome=\"dlq\"}[15m]) unless max_over_time(queue_messages_total{outcome=\"dlq\"}[1h] offset 15m))) or vector(0)",
           "legendFormat": "dlq in last 15 m (PayoutDLQ)",
           "range": true,
           "exemplar": false
@@ -596,7 +596,7 @@
             "uid": "prometheus"
           },
           "refId": "B",
-          "expr": "(sum(increase(identity_emails_failed_total[1h]) and max_over_time(identity_emails_failed_total[2h] offset 1h)) or vector(0)) + (sum(identity_emails_failed_total unless max_over_time(identity_emails_failed_total[2h] offset 1h)) or vector(0))",
+          "expr": "sum(clamp_min(last_over_time(identity_emails_failed_total[1h]) - max_over_time(identity_emails_failed_total[2h] offset 1h), 0) or (last_over_time(identity_emails_failed_total[1h]) unless max_over_time(identity_emails_failed_total[2h] offset 1h))) or vector(0)",
           "legendFormat": "failed in last 1 h (C20)",
           "range": true,
           "exemplar": false
@@ -934,7 +934,7 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "(sum(increase(payroll_late_settlements_total[15m]) and max_over_time(payroll_late_settlements_total[1h] offset 15m)) or vector(0)) + (sum(payroll_late_settlements_total unless max_over_time(payroll_late_settlements_total[1h] offset 15m)) or vector(0))",
+          "expr": "sum(clamp_min(last_over_time(payroll_late_settlements_total[15m]) - max_over_time(payroll_late_settlements_total[1h] offset 15m), 0) or (last_over_time(payroll_late_settlements_total[15m]) unless max_over_time(payroll_late_settlements_total[1h] offset 15m))) or vector(0)",
           "legendFormat": "late settlements in last 15 m",
           "range": true,
           "exemplar": false

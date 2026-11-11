@@ -36,12 +36,18 @@ groups:
           runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutSettlementSlow.md"
           dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
       - alert: PayoutDLQ
-        # The `unless max_over_time(… offset)` arm (C75) catches a series whose first exported
-        # sample is already > 0 (a DLQ within a restarted worker's first export interval), which
-        # increase() reads as 0. It looks for the series over the hour before the window, not at
-        # one instant, so an old series behind a data gap (Prometheus or Collector restart,
-        # metric_expiration) is not mistaken for a new one.
-        expr: 'increase(queue_messages_total{outcome="dlq"}[15m]) > 0 or (queue_messages_total{outcome="dlq"} > 0 unless max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m))'
+        # Three arms (C75, C77):
+        # 1. increase() over the window;
+        # 2. `unless max_over_time(… offset)`: a series whose first exported sample is already > 0
+        #    (a DLQ within a restarted worker's first export interval), which increase() reads as 0.
+        #    It looks for the series over the hour before the window, not at one instant, so an old
+        #    series behind a data gap (Prometheus or Collector restart, metric_expiration) is not
+        #    mistaken for a new one;
+        # 3. `X - max_over_time(… offset) > 0`: an old series that rose during a data gap longer
+        #    than the window, where increase() sees only the post-gap samples (each process has its
+        #    own service.instance.id, so a series never resets).
+        # Limit: a gap longer than the 1 h lookback makes an old series look new (arm 2 pages).
+        expr: 'increase(queue_messages_total{outcome="dlq"}[15m]) > 0 or (queue_messages_total{outcome="dlq"} > 0 unless max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m)) or (queue_messages_total{outcome="dlq"} - max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m) > 0)'
         labels: { severity: page, service_name: payout-worker }
         annotations:
           summary: "Payout messages were dead-lettered in the last 15 minutes"
@@ -58,9 +64,10 @@ groups:
           runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutNeedsOperator.md"
           dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
       - alert: PayoutLateSettlement
-        # C75: the second arm pages when a restarted payroll's first exported sample is already > 0
-        # (a series with no sample in the hour before the window; a data gap is not a new series).
-        expr: "increase(payroll_late_settlements_total[15m]) > 0 or (payroll_late_settlements_total > 0 unless max_over_time(payroll_late_settlements_total[1h] offset 15m))"
+        # The same three arms as PayoutDLQ (C75, C77): increase(); a series whose first exported
+        # sample is already > 0 (a restarted payroll), with no sample in the hour before the window;
+        # an old series that rose during a data gap longer than the window.
+        expr: "increase(payroll_late_settlements_total[15m]) > 0 or (payroll_late_settlements_total > 0 unless max_over_time(payroll_late_settlements_total[1h] offset 15m)) or (payroll_late_settlements_total - max_over_time(payroll_late_settlements_total[1h] offset 15m) > 0)"
         labels: { severity: page, service_name: payroll }
         annotations:
           summary: "The bank settled a payout attempt that payroll had already rejected or replaced"
@@ -86,8 +93,11 @@ groups:
           runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/PayoutStreamNearMaxlen.md"
           dashboard_url: "http://127.0.0.1:4101/d/payrun-queues"
       - alert: EmailOutboxStuck
-        # C75: the last arm counts a failure series with no sample in the 2 h before the window.
-        expr: "max(identity_email_oldest_pending_age_seconds) > 900 or sum(increase(identity_emails_failed_total[1h])) > 0 or sum(identity_emails_failed_total > 0 unless max_over_time(identity_emails_failed_total[2h] offset 1h)) > 0"
+        # The counter arms are PayoutDLQ's on a 1 h window (C75, C77): increase(); a failure series
+        # with no sample in the 2 h before the window; an old series that rose during a data gap
+        # longer than the window. Limit: a gap longer than the 2 h lookback makes an old series
+        # look new.
+        expr: "max(identity_email_oldest_pending_age_seconds) > 900 or sum(increase(identity_emails_failed_total[1h])) > 0 or sum(identity_emails_failed_total > 0 unless max_over_time(identity_emails_failed_total[2h] offset 1h)) > 0 or sum(identity_emails_failed_total - max_over_time(identity_emails_failed_total[2h] offset 1h) > 0) > 0"
         for: 5m
         labels: { severity: warning, service_name: identity }
         annotations:
@@ -141,7 +151,11 @@ groups:
           runbook_url: "https://github.com/Positron00/FinApp/blob/main/docs/runbooks/BankErrorRateHigh.md"
           dashboard_url: "http://127.0.0.1:4101/d/payrun-bank"
       - alert: SigninFailuresSpike
-        expr: 'sum(increase(auth_signins_total{outcome="failure"}[15m])) > 50'
+        # Failed sign-ins in 15 minutes, summed per series (C77): increase() for a series that had a
+        # sample in the hour before the window, the full value for one that didn't (a restarted
+        # identity whose first exported sample already counts failures; C75). A restart splits the
+        # failures between an old and a new series, so both count towards the one threshold.
+        expr: 'sum((increase(auth_signins_total{outcome="failure"}[15m]) and max_over_time(auth_signins_total{outcome="failure"}[1h] offset 15m)) or (auth_signins_total{outcome="failure"} unless max_over_time(auth_signins_total{outcome="failure"}[1h] offset 15m))) > 50'
         labels: { severity: warning, service_name: identity }
         annotations:
           summary: "Many failed sign-ins in the last 15 minutes"

@@ -1,7 +1,7 @@
 # Requirements: PayRun 0.1.0
 
 Each requirement has an ID, a statement, acceptance criteria and a check. All are "must" unless
-marked "should". The source is the [architecture plan](../../plan/architecture-plan.md) (v1.3;
+marked "should". The source is the [architecture plan](../../plan/architecture-plan.md) (v1.4;
 v1.2 accepted 2026-11-10); plan sections are cited as "plan §n". Each limit and default lives in
 exactly one requirement; others refer to it by ID.
 
@@ -49,13 +49,14 @@ exactly one requirement; others refer to it by ID.
   - An expired, used or unknown token returns 400 `invite_invalid`.
   - A password shorter than 12 characters returns 422 `password_too_weak`.
   - The token never appears in a query string, log or span (PAY-NFR-07).
+  - An accepted invite clears the account's login lockout (PAY-104): the lock, its level and the current window's failure count (C74; integration `test_lockout.py::test_invite_accept_clears_a_lockout_on_the_pending_email`).
 - Check: unit, integration, e2e.
 
 **PAY-104 Sign in (must).** `POST /api/auth/login {email, password}` makes the BFF call identity `POST /v1/auth/login`. On success the BFF creates a session.
 - Acceptance:
   - A wrong password or unknown email returns 401 `invalid_credentials`, with the same response shape. argon2 always runs, so the median latency of unknown-email and wrong-password logins differs by no more than 20% (integration `test_login_timing`).
   - An inactive user gets the same 401.
-  - The limits are `AUTH_LOGIN_LIMIT_ACCOUNT` (5 **failed** attempts / 15 min; a successful sign-in doesn't count) and `AUTH_LOGIN_LIMIT_IP` (20 attempts of any outcome / 15 min) (C63). Past them the response is 429 `rate_limited` with `Retry-After`, and the account locks with exponential backoff (1 min doubling to 60 min).
+  - The limits are `AUTH_LOGIN_LIMIT_ACCOUNT` (5 **failed** attempts / 15 min; a successful sign-in doesn't count) and `AUTH_LOGIN_LIMIT_IP` (20 attempts of any outcome / 15 min) (C63). Past them the response is 429 `rate_limited` with `Retry-After`, and the account locks with exponential backoff (1 min doubling to 60 min). A confirmed password reset (PAY-105) or an accepted invite (PAY-103) clears the account's lockout (C74).
   - Audit `auth.signin.succeeded` or `auth.signin.failed`, with `ip_hash` (PAY-NFR-08).
 - Check: unit, integration (identity: `test_lockout_production_values`), e2e.
 
@@ -229,8 +230,8 @@ The run snapshots `tax_bps`, `retirement_bps` and `require_dual_approval`, sets 
 - Check: unit, integration `test_approve_concurrency.py`.
 
 **PAY-401 Dual approval (must).** When the run's `require_dual_approval` snapshot is true, the approver must differ from `calculated_by`, from the run's creator, from the last editor of any hours row on the run, and from `bank_updated_by` of every employee who gets a transfer in the run (payslip net > 0) whose bank details haven't been *vetted* since they changed. A change is vetted once a payout attempt for that employee, in a run with dual approval on, took a snapshot of those details and was requested by someone other than the editor; an employee never paid that way has every change unvetted. Both times come from the database clock read after the employee row lock, so a snapshot that didn't see an edit is always earlier than it; a tie counts as unvetted (C73). When the company setting is turned off, runs already calculated keep their snapshot.
-- Acceptance: 403 `approver_must_differ`.
-- Check: unit, integration, e2e (two users).
+- Acceptance: 403 `approver_must_differ`; a denied approve writes audit `payrun.approve_denied` (the rule and the actor) in its own transaction after the rollback (C73).
+- Check: unit, integration (`test_dual_approval.py`), e2e (two users).
 
 **PAY-402 Outbox and stream (must).**
 - payroll writes events to `payroll.outbox` in the same transaction as the state change.
@@ -339,13 +340,13 @@ It writes a new outbox row with a fresh `event_id`, increments `publish_count` a
 - it requires the payout to be `failed` (current attempt `rejected`);
 - it requires `current_attempt` < `PAYOUT_MAX_ATTEMPTS` (5, including the first);
 - it requires the employee to be active with bank details;
-- under dual approval, it requires the retrier ≠ the employee's `bank_updated_by` while that change is unvetted (PAY-401), and ≠ the operator who marked the current attempt rejected (C73). The resolver rule applies only to `operator_rejected`: an operator who redrove an attempt that the bank then rejected may retry it;
+- under dual approval, it requires the retrier ≠ the employee's `bank_updated_by` while that change is unvetted (PAY-401), and ≠ the operator who marked the **current** attempt rejected (its `resolved_by` when its `failure_reason` is `operator_rejected`; C73). The resolver rule applies only to `operator_rejected`: an operator who redrove an attempt that the bank then rejected may retry it, and the rule looks only at the current attempt, not at earlier ones;
 - it creates attempt n+1 with a new bank snapshot, sets the payout to `requested`, writes the outbox row, and recomputes the run status (back to `processing`).
 - Acceptance:
   - 409 `payout_not_retryable` (including indeterminate and needs_operator attempts).
   - 409 `retry_limit_reached`.
   - 409 `employee_bank_details_missing`.
-  - 403 `approver_must_differ`.
+  - 403 `approver_must_differ`; a denied retry writes audit `payout.retry_denied` in its own transaction after the rollback (C73).
   - Audit `payout.retry_requested`.
 - Check: unit, integration, e2e `recover.spec.ts`.
 
@@ -356,7 +357,7 @@ It writes a new outbox row with a fresh `event_id`, increments `publish_count` a
 **PAY-502 Operator resolution (must).** `POST /v1/pay-runs/{id}/payouts/{payout_id}/resolve {action, note}` (approver; `note` is 1–500 characters) applies only to a payout whose current attempt is `needs_operator`:
 - `redrive` sets the attempt back to `requested`, sets `publish_count` to 1 (with `republish_seq` 0 and `last_published_at` now), and writes a new outbox row. Use it after the cause is fixed, for example payroll is back or the DLQ has been inspected.
 - `mark_rejected` sets the attempt to `rejected` (`failure_reason = "operator_rejected"`) and the payout to `failed`, so the normal retry (PAY-500) opens. It's refused with 409 `resolve_too_early` (and `Retry-After`) until `PAYOUT_MARK_REJECTED_MIN_WAIT_S` (120 s) after the attempt entered `needs_operator`. That's longer than the worker's bound on in-flight bank POSTs (`HANDLER_DEADLINE_S`, 35 s), so no earlier POST can still settle (C48). The runbook `PayoutNeedsOperator.md` requires checking the bank first (`GET /v1/transfers/{key}` shows no settled transfer).
-- Either action recomputes the run status. Audit `payout.operator_resolved`, with the action and the note's length (not its text).
+- Either action recomputes the run status and records the operator as the attempt's `resolved_by` (C73). Audit `payout.operator_resolved`, with the action and the note's length (not its text).
 - Acceptance:
   - 409 `payout_not_blocked` when the attempt isn't `needs_operator`;
   - 409 `resolve_too_early` with `Retry-After` for `mark_rejected` within `PAYOUT_MARK_REJECTED_MIN_WAIT_S` of entering `needs_operator`; `redrive` succeeds at once;
@@ -421,8 +422,9 @@ When Redis is unavailable, login, reset and invite-accept fail closed (503 `serv
 - Check: pycommon unit `test_startup_checks.py`, integration (`test_readyz`).
 
 **PAY-606 Data ownership (must).** The schemas are `identity`, `payroll`, `payouts` and `bank_stub`, each with a migrator role and a runtime role. Neither role has rights in another schema. Bootstrap SQL in `deploy/compose/init/` is shared by Compose, Testcontainers and the Kubernetes Job.
-- Acceptance: a runtime role querying another schema gets `permission denied`.
-- Check: integration `test_grants.py` per service.
+- The audit tables (`identity.audit_log`, `payroll.audit_events`) are append-only for the runtime roles: INSERT and SELECT, never UPDATE, DELETE or TRUNCATE (C50, C73).
+- Acceptance: a runtime role querying another schema gets `permission denied`; `identity_app` and `payroll_app` can't change or remove an audit row.
+- Check: integration `test_grants.py` per service (identity and payroll also assert the append-only audit table).
 
 **PAY-607 Redis ACLs (must).** Each service connects as its own ACL user (plan §6). Acceptance: web can't XADD to `stream:payout.requested`. Check: integration.
 

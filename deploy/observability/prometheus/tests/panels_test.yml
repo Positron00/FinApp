@@ -1,0 +1,100 @@
+# promtool test rules tests/panels_test.yml (platform LLD §8.8; PAY-NFR-10, 11; C75, C77). Run from
+# this folder. The Queues counter panels (dead-lettered, late settlements, email failures) and the
+# alert_drills.sh checks count, per series, the rise over the window: last value in the window minus
+# the highest value in the lookback before it (an old series, across a data gap too), or the full
+# last value for a series with no sample in the lookback (a new series, e.g. a restarted process
+# whose first export is already above 0). The `or` is inside sum(), so new and old series add up.
+# tests/platform/test_dashboards.py checks that the panels and drills use exactly these expressions.
+rule_files: []
+evaluation_interval: 30s
+tests:
+  - name: dead-lettered in 15 m - new, old, stopped and gap series all count (C75, C77)
+    interval: 1m
+    input_series:
+      # pre-initialised at 0, one DLQ at 3m
+      - series: 'queue_messages_total{service_name="payout-worker", instance="pre", stream="s", outcome="dlq"}'
+        values: "0 0 0 1x40"
+      # restarted worker: first sample already 1
+      - series: 'queue_messages_total{service_name="payout-worker", instance="new", stream="s", outcome="dlq"}'
+        values: "_ _ _ 1x40"
+      # old series at 3, 20-minute gap, back at 5
+      - series: 'queue_messages_total{service_name="payout-worker", instance="gap", stream="s", outcome="dlq"}'
+        values: "3x30 _x20 5x30"
+      # a worker that dead-letters at 20m and stops at 23m
+      - series: 'queue_messages_total{service_name="payout-worker", instance="stopped", stream="s", outcome="dlq"}'
+        values: "0x20 1x3"
+      # retries never count
+      - series: 'queue_messages_total{service_name="payout-worker", instance="pre", stream="s", outcome="retry"}'
+        values: "0+1x80"
+    promql_expr_test:
+      # pre 1 + new 1 (both have no sample before 5m - 15m) + gap 3 (no sample in (-70m, -10m])
+      - expr: &dlq 'sum(clamp_min(last_over_time(queue_messages_total{outcome="dlq"}[15m]) - max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m), 0) or (last_over_time(queue_messages_total{outcome="dlq"}[15m]) unless max_over_time(queue_messages_total{outcome="dlq"}[1h] offset 15m))) or vector(0)'
+        eval_time: 5m
+        exp_samples: [{ labels: "{}", value: 5 }]
+      # pre and new are old and flat; stopped is new: 0x15
+      - expr: *dlq
+        eval_time: 18m
+        exp_samples: [{ labels: "{}", value: 0 }]
+      # stopped: last 1 in (15m, 30m], 0 in the lookback, after its series went stale (X alone is empty)
+      - expr: *dlq
+        eval_time: 30m
+        exp_samples: [{ labels: "{}", value: 1 }]
+      # gap: 5 - 3 from the first post-gap sample
+      - expr: *dlq
+        eval_time: 51m
+        exp_samples: [{ labels: "{}", value: 2 }]
+      - expr: *dlq
+        eval_time: 66m
+        exp_samples: [{ labels: "{}", value: 0 }]
+  - name: dead-lettered in 15 m is 0 with no dlq series (vector(0)), and on an old series behind a quiet gap
+    interval: 1m
+    input_series:
+      - series: 'queue_messages_total{service_name="payout-worker", stream="s", outcome="retry"}'
+        values: "0+1x80"
+    promql_expr_test:
+      - expr: *dlq
+        eval_time: 20m
+        exp_samples: [{ labels: "{}", value: 0 }]
+  - name: dead-lettered in 15 m stays 0 on an old series behind a 10-minute gap with no increase
+    interval: 1m
+    input_series:
+      - series: 'queue_messages_total{service_name="payout-worker", stream="s", outcome="dlq"}'
+        values: "3x30 _x10 3x30"
+    promql_expr_test:
+      - expr: *dlq
+        eval_time: 52m
+        exp_samples: [{ labels: "{}", value: 0 }]
+  - name: late settlements in 15 m - a new series and a gap series add up (C75, C77)
+    interval: 1m
+    input_series:
+      - series: 'payroll_late_settlements_total{service_name="payroll", instance="new"}'
+        values: "_x50 1x30"
+      - series: 'payroll_late_settlements_total{service_name="payroll", instance="gap"}'
+        values: "3x30 _x20 5x30"
+    promql_expr_test:
+      - expr: &late "sum(clamp_min(last_over_time(payroll_late_settlements_total[15m]) - max_over_time(payroll_late_settlements_total[1h] offset 15m), 0) or (last_over_time(payroll_late_settlements_total[15m]) unless max_over_time(payroll_late_settlements_total[1h] offset 15m))) or vector(0)"
+        eval_time: 40m
+        exp_samples: [{ labels: "{}", value: 0 }]
+      - expr: *late
+        eval_time: 55m
+        exp_samples: [{ labels: "{}", value: 3 }]
+      - expr: *late
+        eval_time: 70m
+        exp_samples: [{ labels: "{}", value: 0 }]
+  - name: email failures in 1 h - a new series and a 70-minute gap series add up (C75, C77)
+    interval: 1m
+    input_series:
+      - series: 'identity_emails_failed_total{service_name="identity", instance="new"}'
+        values: "_x100 1x100"
+      - series: 'identity_emails_failed_total{service_name="identity", instance="gap"}'
+        values: "3x30 _x70 5x100"
+    promql_expr_test:
+      - expr: &email "sum(clamp_min(last_over_time(identity_emails_failed_total[1h]) - max_over_time(identity_emails_failed_total[2h] offset 1h), 0) or (last_over_time(identity_emails_failed_total[1h]) unless max_over_time(identity_emails_failed_total[2h] offset 1h))) or vector(0)"
+        eval_time: 90m
+        exp_samples: [{ labels: "{}", value: 0 }]
+      - expr: *email
+        eval_time: 110m
+        exp_samples: [{ labels: "{}", value: 3 }]
+      - expr: *email
+        eval_time: 165m
+        exp_samples: [{ labels: "{}", value: 0 }]

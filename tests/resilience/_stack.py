@@ -8,6 +8,8 @@ sleeps for a fixed time to let a fault "settle".
 from __future__ import annotations
 
 import json
+import logging
+import re
 import subprocess
 import sys
 import time
@@ -34,9 +36,12 @@ COMPOSE_ARGS: Final = (
     "-f", str(REPO_ROOT / "deploy/compose/compose.test.yaml"),
     "--profile", "core", "--profile", "obs", "--profile", "test",
 )  # fmt: skip
-# Payout timing stays at production values in the test profile (C53). The defaults below are
-# Compose's `x-payout-timing` values; when the Compose config can be read (it needs .env, as the
-# stack does) the waits use the values it resolves for payroll and payout-worker instead.
+WEB_CONFIG_TS: Final = REPO_ROOT / "apps" / "web" / "src" / "lib" / "config.ts"
+_log = logging.getLogger("resilience")
+# Payout timing stays at production values in the test profile (C53). The waits use the values
+# `docker compose config` resolves for payroll and payout-worker (it needs .env, as the stack does);
+# a key missing from a config that was read is an error. The defaults below (Compose's
+# `x-payout-timing` values) are used only when Compose itself is unavailable.
 TIMING_DEFAULTS: Final = {
     "payout-worker": {
         "PAYOUT_CLAIM_MIN_IDLE_MS": 60000, "PAYOUT_MAX_DELIVERIES": 5, "BANK_TOTAL_DEADLINE_S": 15,
@@ -45,29 +50,65 @@ TIMING_DEFAULTS: Final = {
 }  # fmt: skip
 
 
-def compose_timing(config: Mapping[str, Any] | None = None) -> dict[str, int]:
-    """The payout timing keys from ``docker compose config --format json`` (or ``config``), per
-    TIMING_DEFAULTS. Only those keys are read: the services' environments also hold secrets. A key
-    the config does not resolve keeps its default."""
+def read_compose_config() -> tuple[dict[str, Any] | None, str]:
+    """``docker compose config --format json`` and a description of the source; ``None`` when
+    Compose can't produce it (no docker, no .env, a timeout). Output that isn't JSON raises."""
+    try:
+        out = subprocess.run(
+            [*COMPOSE_ARGS, "config", "--format", "json"],
+            capture_output=True, text=True, check=True, timeout=60, cwd=REPO_ROOT,
+        ).stdout  # fmt: skip
+    except (OSError, subprocess.SubprocessError) as exc:
+        source = f"defaults in tests/resilience/_stack.py (docker compose config failed: {exc})"
+        _log.warning("resilience timings: %s", source)
+        return None, source
+    config: dict[str, Any] = json.loads(out)
+    _log.info("resilience timings: docker compose config")
+    return config, "docker compose config"
+
+
+def _service_env(config: Mapping[str, Any], service: str) -> Mapping[str, Any]:
+    spec: Mapping[str, Any] = config.get("services", {}).get(service) or {}
+    env: Mapping[str, Any] = spec.get("environment") or {}
+    return env
+
+
+def compose_timing(config: Mapping[str, Any] | None) -> dict[str, int]:
+    """The payout timing keys of TIMING_DEFAULTS from a ``docker compose config`` (only those keys
+    are read: the services' environments also hold secrets). ``None`` (Compose unavailable) gives
+    the defaults; a config that lacks any key raises ``LookupError``."""
     if config is None:
-        try:
-            out = subprocess.run(
-                [*COMPOSE_ARGS, "config", "--format", "json"],
-                capture_output=True, text=True, check=True, timeout=60, cwd=REPO_ROOT,
-            ).stdout  # fmt: skip
-            config = json.loads(out)
-        except OSError, subprocess.SubprocessError, ValueError:
-            config = {}
-    services = config.get("services", {})
+        return {k: v for defaults in TIMING_DEFAULTS.values() for k, v in defaults.items()}
     timing: dict[str, int] = {}
+    missing: list[str] = []
     for service, defaults in TIMING_DEFAULTS.items():
-        env = services.get(service, {}).get("environment") or {}
-        for key, default in defaults.items():
-            timing[key] = int(env.get(key, default))
+        env = _service_env(config, service)
+        for key in defaults:
+            if key in env:
+                timing[key] = int(env[key])
+            else:
+                missing.append(f"{service}.{key}")
+    if missing:
+        raise LookupError(f"docker compose config does not set {', '.join(missing)}")
     return timing
 
 
-_TIMING: Final = compose_timing()
+def web_breaker_failures(config: Mapping[str, Any] | None) -> int:
+    """The web's BREAKER_FAILURES: Compose's value for ``web`` when it sets one, else the default
+    in ``apps/web/src/lib/config.ts`` (the BFF -> identity breaker is the web's, not pycommon's)."""
+    if config is not None:
+        env = _service_env(config, "web")
+        if "BREAKER_FAILURES" in env:
+            return int(env["BREAKER_FAILURES"])
+    found = re.search(r"\bBREAKER_FAILURES: int\((\d+)", WEB_CONFIG_TS.read_text(encoding="utf-8"))
+    if not found:
+        raise LookupError(f"no BREAKER_FAILURES default in {WEB_CONFIG_TS}")
+    return int(found.group(1))
+
+
+_CONFIG, TIMING_SOURCE = read_compose_config()
+_TIMING: Final = compose_timing(_CONFIG)
+BREAKER_FAILURES: Final = web_breaker_failures(_CONFIG)
 # The worker reclaims a message after CLAIM_IDLE_S idle and dead-letters it at MAX_DELIVERIES;
 # each delivery's bank call has BANK_DEADLINE_S; payroll re-publishes REPUBLISH_AFTER_S after the
 # last publish, on its MAINTENANCE_S tick. These bound the waits below.
@@ -465,6 +506,23 @@ def settled_count(stack: Stack, ids: Sequence[str]) -> int:
 def log_events(text: str, event: str) -> int:
     """Occurrences of a structured log event in ``docker compose logs`` output."""
     return text.count(f'"event": "{event}"') + text.count(f'"event":"{event}"')
+
+
+def log_records(text: str, event: str) -> list[dict[str, Any]]:
+    """The JSON records of a structured log event in ``docker compose logs`` output (each line is
+    ``<container> | {json}``); lines that aren't JSON are skipped."""
+    records: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        start = line.find("{")
+        if start < 0:
+            continue
+        try:
+            record = json.loads(line[start:])
+        except ValueError:
+            continue
+        if isinstance(record, dict) and record.get("event") == event:
+            records.append(record)
+    return records
 
 
 # ------------------------------------------------------------------------------------- BFF

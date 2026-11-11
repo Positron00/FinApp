@@ -1,6 +1,6 @@
 # Low-level design: identity
 
-Source: [architecture plan](../../plan/architecture-plan.md) v1.2 (accepted 2026-11-10), [ADR 0002](../../adr/0002-sign-in-and-roles.md), [requirements](requirements.md), [high-level design](design-high-level.md), and the spec [README](README.md) "Spec resolutions" (R#) and "Contract decisions" (C#) tables, which this body already follows.
+Source: [architecture plan](../../plan/architecture-plan.md) v1.4 (2026-11-11; v1.2 accepted 2026-11-10), [ADR 0002](../../adr/0002-sign-in-and-roles.md), [requirements](requirements.md), [high-level design](design-high-level.md), and the spec [README](README.md) "Spec resolutions" (R#) and "Contract decisions" (C#) tables, which this body already follows.
 Scope: the `identity` service (`services/identity`, Python package `identity`): users, credentials, invites, password resets, roles, auth audit, the email outbox and relay, the bootstrap CLI and maintenance.
 Out of scope here: BFF sessions and cookies (PAY-106, PAY-107: web LLD), shared pycommon code (settings, JWT verification, error handlers, logging, resilient client and `Guard`, `RateLimiter`, startup checks, maintenance runner: platform LLD §3), and the bootstrap SQL in `deploy/compose/init/`.
 
@@ -579,7 +579,7 @@ Names as in plan §11 and `observability.md` §5; labels bounded.
 
 | Metric | Type | Labels | When | Requirement |
 |---|---|---|---|---|
-| `auth_signins_total` | counter | `outcome`: `success`, `failure`, `rate_limited` | Every login response (401 → `failure`, 429 → `rate_limited`) | PAY-104, PAY-NFR-10 |
+| `auth_signins_total` | counter | `outcome`: `success`, `failure`, `rate_limited` | Every login response (401 → `failure`, 429 → `rate_limited`). All three outcomes are pre-initialised with `add(0)` at start, so they export 0 from the start (C77) | PAY-104, PAY-NFR-10 |
 | `rate_limited_total` | counter (pycommon) | `scope`: the `Limit.scope` values `login_ip`, `reset_ip`, `reset_account`, `accept_ip`, `caller` (counted by pycommon's limiter), plus `login_account` (the failed-attempt gate refused, §6.4) and `login_locked` (refused while the account is locked), which identity records through the login limiter's `record_denied(scope)`; identity has no counter of its own (C63) | Every 429 from identity | PAY-603 |
 | `rate_limiter_errors_total` | counter (pycommon) | `component`: `login`, `reset`, `accept`, and pycommon's caller limiter | Every limiter or lock-command Redis error; lock-command errors go through the login limiter's `record_error(exc, fail_mode=closed)`, which also writes the throttled `ratelimit.backend_error` log | PAY-603 |
 | `identity_emails_pending` | observable gauge, collection-time (unit `{email}`) | — | Count of `status = 'pending'` | PAY-110 |
@@ -593,7 +593,7 @@ Names as in plan §11 and `observability.md` §5; labels bounded.
 
 The two email gauges are computed by **every replica** at metric collection (R26, C63) through pycommon `observable_gauge`. The callback runs one query (`SELECT count(*), COALESCE(EXTRACT(EPOCH FROM now() - min(created_at)), 0) FROM identity.email_outbox WHERE status = 'pending'`) through `EmailGaugeSource`, which owns a private event loop on its own thread and a one-connection asyncpg engine (identity has no sync driver). The callback can therefore run on the exporter's thread or on a thread that is itself running an event loop. One result serves both gauges of a collection (reused for 1 s). The wait is bounded by `IDENTITY_GAUGE_QUERY_TIMEOUT_MS` (connect and statement timeout). A failed or timed-out query reports nothing for that cycle (pycommon logs `metrics.gauge_query_failed`). The source starts lazily at the first collection and is disposed on shutdown. pycommon keeps one callback per gauge name and meter provider, so a second app in the same process replaces the first. Alert rules use `max()` across replicas.
 
-**`EmailOutboxStuck`** (platform rules; R25) fires on `max(identity_email_oldest_pending_age_seconds) > 900 or increase(identity_emails_failed_total[1h]) > 0`, so it clears an hour after the last failure. Alerts, promtool tests and dashboards use `auth_signins_total{outcome="failure"}` (C19). The Step 6 email drill reads the alert from alert-sink on host port 4135 (`ALERT_SINK_PORT`, test override; R31).
+**`EmailOutboxStuck`** (platform rules; R25, C75, C77) fires when the oldest pending email is older than 15 minutes, or `identity_emails_failed_total` increased in the last hour, or a failure series is above 0 with no sample in the two hours before that hour (a restarted identity whose first export already counts a failure), or it is above its last value before that hour (failures during a metrics gap). An old failure series that reappears after a data gap doesn't fire, and the alert clears an hour after the last failure. The expression lives only in `deploy/observability/prometheus/rules/alerts.yml`. It is checked by promtool cases in `alerts_test.yml`; not drilled (a ticket alert). Alerts, promtool tests and dashboards use `auth_signins_total{outcome="failure"}` (C19).
 
 ### 5.3 Spans worth adding manually
 

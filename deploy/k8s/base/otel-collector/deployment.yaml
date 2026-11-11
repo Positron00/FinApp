@@ -7,7 +7,10 @@ metadata:
 spec:
   replicas: 1 # one gateway in every overlay (platform LLD §8.1); see the overlay replicas lists
   revisionHistoryLimit: 5
-  strategy: { type: RollingUpdate, rollingUpdate: { maxUnavailable: 0, maxSurge: 1 } }
+  # Recreate, not RollingUpdate: a surge pod would briefly run a second gateway, splitting traces
+  # between two tail samplers and exporting a second copy of every series (C77). A rollout stops
+  # the old pod first; the SDKs retry their OTLP exports meanwhile (platform LLD §8.1).
+  strategy: { type: Recreate }
   selector:
     matchLabels: { app.kubernetes.io/name: otel-collector }
   template:

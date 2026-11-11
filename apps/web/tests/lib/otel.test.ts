@@ -65,7 +65,7 @@ describe("startNode", () => {
   // Two web replicas must not export identical series (the BFF SLIs sum over them): each process
   // gets its own service.instance.id, a random UUID like the Python services' SDK default, and
   // never HOSTNAME (the image sets HOSTNAME=0.0.0.0, the same in every replica).
-  it("sets a per-process service.instance.id", async () => {
+  it("sets a per-process service.instance.id (PAY-NFR-10, C77)", async () => {
     const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
     const first = (await start({ HOSTNAME: "0.0.0.0" })).attributes["service.instance.id"];
     expect(first).toMatch(uuid);

@@ -281,6 +281,7 @@
       "redis_aof_last_bgrewrite_status",
       "redis_evicted_keys_total",
       "redis_uptime_in_seconds",
+      "redis_start_time_seconds",
       "redis_stream_length",
       "redis_stream_group_lag",
       "redis_stream_group_messages_pending"

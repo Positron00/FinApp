@@ -3,7 +3,8 @@
 
 Expected: sign-in through the BFF gets 503 ``service_unavailable`` in the PAY-602 error format,
 the BFF logs ``bff.upstream_error`` and its identity breaker opens (``circuit_breaker_state`` 2
-after BREAKER_FAILURES = 5 failed calls); a user who is already signed in keeps working (their
+after the web's BREAKER_FAILURES failed calls, read from the Compose config or the web's
+default; _stack.web_breaker_failures); a user who is already signed in keeps working (their
 session lives in Redis and payroll answers); sign-in works again once identity is back.
 """
 
@@ -12,10 +13,18 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
-from _stack import METRIC_WAIT_S, Bff, Containers, Stack, error_code, log_events, wait_until
+from _stack import (
+    BREAKER_FAILURES,
+    METRIC_WAIT_S,
+    Bff,
+    Containers,
+    Stack,
+    error_code,
+    log_events,
+    wait_until,
+)
 
 RECOVERY_S = 60.0
-BREAKER_FAILURES = 5  # the web's BREAKER_FAILURES default
 BREAKER = 'circuit_breaker_state{service_name="web", target="identity"}'
 
 

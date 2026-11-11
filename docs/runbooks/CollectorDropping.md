@@ -25,6 +25,10 @@ Gaps in traces, logs or metrics. Dashboards may show holes and alerts based on m
    ```
 
    ```promql
+   sum by (exporter) (rate({__name__=~"otelcol_exporter_send_failed_metric_points(_total)?"}[5m]))
+   ```
+
+   ```promql
    sum by (exporter) (rate({__name__=~"otelcol_exporter_send_failed_log_records(_total)?"}[5m]))
    ```
 
