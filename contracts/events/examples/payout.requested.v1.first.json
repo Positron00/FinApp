@@ -1,0 +1,17 @@
+{
+  "event_id": "0193f1d2-6c4a-7b1e-9a3f-2c5d8e9f0a1b",
+  "type": "payout.requested",
+  "version": 1,
+  "occurred_at": "2026-11-10T14:03:07.123Z",
+  "producer": "payroll",
+  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+  "data": {
+    "payout_id": "0193f1d2-6c4a-7000-8000-000000000001",
+    "pay_run_id": "0193f1d2-6c4a-7000-8000-000000000002",
+    "company_id": "0193a000-0000-7000-8000-000000000001",
+    "attempt": 1,
+    "amount_cents": 412345,
+    "currency": "USD",
+    "republish_seq": 0
+  }
+}
