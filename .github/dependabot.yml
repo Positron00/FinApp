@@ -27,7 +27,45 @@ updates:
     cooldown: { default-days: 14 }
     open-pull-requests-limit: 10
     groups:
+      # The OpenTelemetry JS stack only works at matching versions, and @vercel/otel pins its peer
+      # ranges, so every update to these arrives as one PR (C79). Listed first: the first match wins.
+      opentelemetry: { patterns: ["@opentelemetry/*", "@vercel/otel"] }
       js-minor-patch: { update-types: [minor, patch] }
+    # Holds (C79). Lift each one when its reason no longer applies, then let Dependabot propose it.
+    ignore:
+      # @vercel/otel 2.1.3 peers: resources, sdk-metrics, sdk-trace-base <3.0.0; api <2.0.0;
+      # sdk-logs, api-logs, instrumentation <0.300.0. Lift with a @vercel/otel release that
+      # supports OpenTelemetry JS 3.x, as one upgrade tested by the @trace e2e.
+      - dependency-name: "@opentelemetry/resources"
+        versions: [">=3.0.0"]
+      - dependency-name: "@opentelemetry/sdk-metrics"
+        versions: [">=3.0.0"]
+      - dependency-name: "@opentelemetry/sdk-trace-base"
+        versions: [">=3.0.0"]
+      - dependency-name: "@opentelemetry/api"
+        versions: [">=2.0.0"]
+      - dependency-name: "@opentelemetry/sdk-logs"
+        versions: [">=0.300.0"]
+      - dependency-name: "@opentelemetry/api-logs"
+        versions: [">=0.300.0"]
+      - dependency-name: "@opentelemetry/instrumentation"
+        versions: [">=0.300.0"]
+      - dependency-name: "@opentelemetry/exporter-logs-otlp-http"
+        versions: [">=0.300.0"]
+      - dependency-name: "@opentelemetry/exporter-metrics-otlp-http"
+        versions: [">=0.300.0"]
+      - dependency-name: "@opentelemetry/instrumentation-ioredis" # 0.72 needs instrumentation 0.300
+        versions: [">=0.72.0"]
+      # typescript-eslint supports TypeScript <6.1. Lift when it supports 7.
+      - dependency-name: "typescript"
+        versions: [">=7.0.0"]
+      # Types follow the runtime: Node 24 (.nvmrc, CI). Lift when the runtime moves.
+      - dependency-name: "@types/node"
+        versions: [">=25.0.0"]
+      # Later releases bring undici 8, which crashes on the Node 23 used for local development.
+      # Lift when local development is on Node 24.
+      - dependency-name: "testcontainers"
+        versions: [">12.0.1"]
     commit-message: { prefix: "deps(js)" }
 
   - package-ecosystem: docker # base images in the Dockerfiles

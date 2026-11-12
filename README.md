@@ -27,15 +27,15 @@ Roles are `admin`, `payroll_admin` and `approver`; a user may hold several
 
 ## Prerequisites
 
-| Tool          | Version                                                                           | Where it is pinned                                       |
-| ------------- | --------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| uv            | 0.12.13                                                                           | `UV_VERSION` in `.github/workflows/ci.yml`               |
-| Python        | 3.14 (uv installs 3.14.x: `uv python install`)                                    | `.python-version`, `requires-python` in `pyproject.toml` |
-| Node.js       | 24 (CI); `>=22` is accepted locally                                               | `.nvmrc`, `engines` in `package.json`                    |
-| pnpm          | 10.34.9, through corepack (`corepack enable`)                                     | `packageManager` in `package.json`                       |
-| Docker        | Docker Engine or Desktop with Compose v2 (`up --wait`)                            | —                                                        |
-| OpenSSL 3     | needed by `scripts/dev-env.sh` for Ed25519 keys (macOS: `brew install openssl@3`) | —                                                        |
-| k6 (optional) | 1.8.2; `scripts/ci/k6.sh` falls back to the `grafana/k6` image                    | `.github/workflows/ci.yml`                               |
+| Tool          | Version                                                                              | Where it is pinned                                       |
+| ------------- | ------------------------------------------------------------------------------------ | -------------------------------------------------------- |
+| uv            | 0.12.13                                                                              | `UV_VERSION` in `.github/workflows/ci.yml`               |
+| Python        | 3.14 (uv installs 3.14.x: `uv python install`)                                       | `.python-version`, `requires-python` in `pyproject.toml` |
+| Node.js       | 24 (CI and recommended locally); `^22.22.2`, `^24.15.0` or `>=26` (jsdom 30); not 23 | `.nvmrc`, `engines` in `package.json`                    |
+| pnpm          | 10.34.9, through corepack (`corepack enable`)                                        | `packageManager` in `package.json`                       |
+| Docker        | Docker Engine or Desktop with Compose v2 (`up --wait`)                               | —                                                        |
+| OpenSSL 3     | needed by `scripts/dev-env.sh` for Ed25519 keys (macOS: `brew install openssl@3`)    | —                                                        |
+| k6 (optional) | 1.8.2; `scripts/ci/k6.sh` falls back to the `grafana/k6` image                       | `.github/workflows/ci.yml`                               |
 
 ## Quick start
 
@@ -178,7 +178,7 @@ scripts/ci/security.sh   # pip-audit, pnpm audit, gitleaks (GITLEAKS_BASE=<sha> 
 - [`docs/RUNBOOK.md`](docs/RUNBOOK.md): operating the stack, alerts and runbooks, common operations.
 - [`docs/plan/architecture-plan.md`](docs/plan/architecture-plan.md): the architecture plan.
 - [`docs/specs/payrun-0.1/`](docs/specs/payrun-0.1/README.md): requirements, designs, tasks and the
-  decision tables (R1–R37, C1–C78).
+  decision tables (R1–R37, C1–C79).
 - [`docs/adr/`](docs/adr/): ADRs 0001–0013.
 - [`docs/runbooks/`](docs/runbooks/): one runbook per alert.
 - [`SECURITY_DEPENDENCIES.md`](SECURITY_DEPENDENCIES.md): accepted dependency and image CVEs.
