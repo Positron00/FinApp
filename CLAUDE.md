@@ -81,7 +81,7 @@ Details and per-suite pytest commands: [docs/TESTING.md](docs/TESTING.md).
 
 ## Toolchain pins and quirks
 
-- **Two-week rule:** `pyproject.toml` `[tool.uv] exclude-newer` and `pnpm-workspace.yaml`
+- **Two-week rule:** `pyproject.toml` `[tool.uv] exclude-newer` (`"14 days"`, rolling; C80) and `pnpm-workspace.yaml`
   `minimumReleaseAge` only allow releases at least 14 days old.
 - **pnpm 10.34.9**, not 12: corepack 0.31 can't load pnpm 12's ES-module entry point.
 - **TypeScript 6.0.3**, not 7: typescript-eslint 8.72 requires TypeScript below 6.1.
@@ -109,6 +109,6 @@ Details and per-suite pytest commands: [docs/TESTING.md](docs/TESTING.md).
 ## Where the status lives
 
 - Task status: [docs/specs/payrun-0.1/tasks.md](docs/specs/payrun-0.1/tasks.md) (Status column).
-- Decisions and measurements: the C and R tables in the spec README (latest: C79).
+- Decisions and measurements: the C and R tables in the spec README (latest: C80).
 - Plan status line and dated checks: [docs/plan/architecture-plan.md](docs/plan/architecture-plan.md) §18.
 - Release notes: [CHANGELOG.md](CHANGELOG.md).
