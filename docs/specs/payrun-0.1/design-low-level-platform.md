@@ -103,7 +103,7 @@ requires-python = ">=3.14,<3.15"
 [tool.uv]
 package = false
 default-groups = ["dev"]
-exclude-newer = "2026-10-28T00:00:00Z"   # the two-week rule, enforced by the resolver (C58)
+exclude-newer = "14 days"   # the two-week rule, enforced by the resolver (C58); a rolling span (C80)
 
 [tool.uv.workspace]
 members = ["libs/*", "services/*"]

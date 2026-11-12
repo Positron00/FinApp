@@ -11,12 +11,14 @@ All notable changes to PayRun are documented in this file. The format is based o
 - `@types/node` follows the Node 24 runtime (24.19.2). Dependabot groups the OpenTelemetry JS packages
   into one PR and holds OpenTelemetry JS 3.x, TypeScript 7, `@types/node` above 24 and
   `testcontainers` above 12.0.1 until their blockers clear (C79).
+- The Python two-week rule is a rolling 14-day window (`exclude-newer = "14 days"`) instead of a
+  fixed date, so Dependabot's Python updates can resolve again (C80).
 
 ## [0.1.0] - 2026-11-11
 
 The first release of PayRun: payroll for small and medium businesses, with journeys J1–J5
 end to end. Decisions are recorded in the spec README
-(`docs/specs/payrun-0.1/README.md`, R1–R37 and C1–C79) and ADRs 0001–0013.
+(`docs/specs/payrun-0.1/README.md`, R1–R37 and C1–C80) and ADRs 0001–0013.
 
 ### Added
 
