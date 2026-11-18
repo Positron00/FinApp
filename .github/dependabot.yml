@@ -20,6 +20,10 @@ updates:
     groups:
       python-minor-patch: { update-types: [minor, patch] }
     commit-message: { prefix: "deps(py)" }
+    ignore:
+      # Workspace member, not the unrelated "pycommon" on PyPI; Dependabot tried to "update" it to
+      # PyPI's 0.3.6 and the uv job failed to resolve (C81).
+      - dependency-name: pycommon
 
   - package-ecosystem: npm # pnpm workspace (pnpm-lock.yaml)
     directory: /
