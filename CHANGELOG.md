@@ -14,6 +14,15 @@ All notable changes to PayRun are documented in this file. The format is based o
 - The Python two-week rule is a rolling 14-day window (`exclude-newer = "14 days"`) instead of a
   fixed date, so Dependabot's Python updates can resolve again (C80).
 
+### Security
+
+- `dnspython` 2.9.2 (CVE-2026-128089) and OpenTelemetry Python 1.45.2 / 0.66b2 (CVE-2026-126360) (C81).
+
+### Fixed
+
+- A pycommon gauge unit test no longer depends on garbage-collection timing, and Dependabot no longer
+  mistakes the `pycommon` workspace member for a PyPI package (C81).
+
 ## [0.1.0] - 2026-11-11
 
 The first release of PayRun: payroll for small and medium businesses, with journeys J1–J5

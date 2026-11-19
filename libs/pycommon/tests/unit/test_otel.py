@@ -279,7 +279,10 @@ def test_pycommon_gauges_have_no_ratio_unit(otel_memory: OtelMemory) -> None:
     from pycommon.http import CircuitBreaker  # noqa: PLC0415
 
     breaker = CircuitBreaker("unit-check", failures=5, reset_s=30)
-    assert otel_memory.metric_points("circuit_breaker_state") == [({"target": "unit-check"}, 0)]
+    # Filter by target: breakers from earlier tests sit in a WeakSet until cyclic GC collects
+    # them, so whether they still report depends on GC timing (it failed on CI with "bank").
+    points = otel_memory.metric_points("circuit_breaker_state")
+    assert [v for a, v in points if a["target"] == "unit-check"] == [0]
     assert breaker.state == 0
     assert otel_memory.metric_unit("circuit_breaker_state") == "{state}"
 
