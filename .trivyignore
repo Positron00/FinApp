@@ -17,3 +17,6 @@ CVE-2026-78408 # reason: no Debian fix yet: mount and nsenter tools need privile
 CVE-2026-78409 # reason: no Debian fix yet: mount and nsenter tools need privileges the pods drop (non-root, no capabilities) and are never run; owner: @Positron00; exp:2027-01-10
 CVE-2026-78410 # reason: no Debian fix yet: mount and nsenter tools need privileges the pods drop (non-root, no capabilities) and are never run; owner: @Positron00; exp:2027-01-10
 CVE-2026-9538 # reason: Debian fix deferred: perl Archive::Tar is never run in the containers; owner: @Positron00; exp:2027-01-10
+# Accepted 2026-11-25 (C82): OpenSSL QUIC findings published after the C78 review; no Debian 13 fix.
+CVE-2026-107494 # reason: no Debian 13 fix yet: QUIC-only denial of service in OpenSSL, and no service uses QUIC or HTTP/3 (Python ssl and Node TLS run over TCP); owner: @Positron00; exp:2026-12-31
+CVE-2026-124709 # reason: no Debian 13 fix yet: QUIC-only denial of service in OpenSSL, and no service uses QUIC or HTTP/3 (Python ssl and Node TLS run over TCP); owner: @Positron00; exp:2026-12-31
