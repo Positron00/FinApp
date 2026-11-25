@@ -17,6 +17,8 @@ All notable changes to PayRun are documented in this file. The format is based o
 ### Security
 
 - `dnspython` 2.9.2 (CVE-2026-128089) and OpenTelemetry Python 1.45.2 / 0.66b2 (CVE-2026-126360) (C81).
+- Two Debian 13 OpenSSL QUIC findings with no fixed version (CVE-2026-107494, CVE-2026-124709) are
+  accepted for the image gate until 2026-12-31; no service uses QUIC (C82).
 
 ### Fixed
 

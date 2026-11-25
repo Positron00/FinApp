@@ -23,7 +23,8 @@ the web image moved from Debian 12 (`node:24.22.0-slim`) to Debian 13 (`node:24.
 the Python images (`python:3.14.9-slim-trixie`). That removed six findings, including the only CRITICAL one
 (zlib CVE-2023-45853, CVE-2026-76844 and CVE-2026-85091; gzip CVE-2026-41992; util-linux CVE-2026-53613
 and CVE-2026-53615). All five images now carry the same 11 HIGH findings, each a Debian 13 package for which
-Debian has no fixed version. Findings that do have a fix (apt,
+Debian has no fixed version. On 2026-11-25 (C82), two OpenSSL QUIC findings published after that review
+were accepted on the same terms, with a shorter expiry. Findings that do have a fix (apt,
 zlib in Debian 13, pip's and npm's vendored packages) are not accepted: the Dockerfiles take the
 Debian updates and drop pip, npm and corepack from the runtime images.
 
@@ -40,6 +41,8 @@ Debian updates and drop pip, npm and corepack from the runtime images.
 | CVE-2026-78409  | bsdutils, libblkid1, liblastlog2-2, libmount1, libsmartcols1, libuuid1, login, mount, util-linux (python services and web (Debian 13))                   | HIGH     | affected: no Debian fix yet: mount and nsenter tools need privileges the pods drop (non-root, no capabilities) and are never run                                                          | @Positron00 | 2027-01-10 |
 | CVE-2026-78410  | bsdutils, libblkid1, liblastlog2-2, libmount1, libsmartcols1, libuuid1, login, mount, util-linux, util-linux-extra (python services and web (Debian 13)) | HIGH     | affected: no Debian fix yet: mount and nsenter tools need privileges the pods drop (non-root, no capabilities) and are never run                                                          | @Positron00 | 2027-01-10 |
 | CVE-2026-9538   | perl-base (python services and web (Debian 13))                                                                                                          | HIGH     | fix_deferred: Debian fix deferred: perl Archive::Tar is never run in the containers                                                                                                       | @Positron00 | 2027-01-10 |
+| CVE-2026-107494 | libssl3t64, openssl, openssl-provider-legacy (python services and web (Debian 13))                                                                       | HIGH     | affected: no Debian 13 fix yet (trixie and trixie-security vulnerable, 2026-11-25): QUIC-only denial of service; no service uses QUIC or HTTP/3, Python `ssl` and Node TLS run over TCP   | @Positron00 | 2026-12-31 |
+| CVE-2026-124709 | libssl3t64, openssl, openssl-provider-legacy (python services and web (Debian 13))                                                                       | HIGH     | affected: no Debian 13 fix yet (trixie and trixie-security vulnerable, 2026-11-25): QUIC-only denial of service; no service uses QUIC or HTTP/3, Python `ssl` and Node TLS run over TCP   | @Positron00 | 2026-12-31 |
 
 ## pip-audit (Python)
 
