@@ -13,6 +13,6 @@
     "test": "pnpm -r --if-present test"
   },
   "devDependencies": {
-    "prettier": "3.9.10"
+    "prettier": "3.10.0"
   }
 }
